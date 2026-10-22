@@ -85,7 +85,7 @@ def check_order_change(order, new_status, new_payment_status, is_office_admin):
     return None
 
 
-def change_order(pk, new_status, new_payment_status, is_office_admin, actor=None):
+def change_order(pk, new_status, new_payment_status, is_office_admin, actor=None, when=None):
     """Apply a staff status change under a row lock. Returns (order, error message or None)."""
     # Locked so two staff (or staff and the PayMongo webhook) can't change it at once
     with transaction.atomic():
@@ -101,7 +101,7 @@ def change_order(pk, new_status, new_payment_status, is_office_admin, actor=None
                 paymongo.release_stock(order)
             order.status = new_status
             if new_status == 'Delivered':
-                order.delivered_at = timezone.now()
+                order.delivered_at = when or timezone.now()   # a delivery marked offline keeps its real time
                 order.delivered_by = actor  # who handed it over (and holds any COD cash)
                 if order.payment_method == 'cod':
                     order.payment_status = 'Paid'  # our crew collected the cash

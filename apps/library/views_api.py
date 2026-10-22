@@ -115,7 +115,7 @@ from django.utils import timezone
 from rest_framework_simplejwt.views import TokenObtainPairView
 
 from .portfolio import create_portfolio_draft, sanitize_image
-from . import activity, cash, field_work, inventory, notifications, paymongo, work_queues
+from . import activity, cash, field_work, inventory, notifications, offline, paymongo, work_queues
 from .emails import send_payment_request_email
 
 from .models import (
@@ -659,6 +659,7 @@ class ServiceBookingViewSet(viewsets.ModelViewSet):
         note = str(request.data.get('note') or '').strip()[:500]
         if not reason:
             return Response({'error': 'Say what went wrong.'}, status=status.HTTP_400_BAD_REQUEST)
+        note = (note + offline.delay_note(request)).strip()
         tracker = getattr(booking, 'tracker', None)
         if tracker:
             ProjectHistoryLog.objects.create(
@@ -1545,7 +1546,8 @@ class OrderViewSet(viewsets.ReadOnlyModelViewSet):
             return Response({'error': f"Invalid status: {request.data.get('status')}"}, status=status.HTTP_400_BAD_REQUEST)
 
         order, error = work_queues.change_order(
-            order.pk, new_status, new_payment_status, IsOfficeAdmin().has_permission(request, self), actor=request.user)
+            order.pk, new_status, new_payment_status, IsOfficeAdmin().has_permission(request, self), actor=request.user,
+            when=offline.action_time(request))
         if error:
             return Response({'error': error}, status=status.HTTP_400_BAD_REQUEST)
         return Response(OrderSerializer(order, context={'request': request}).data, status=status.HTTP_200_OK)
@@ -1628,7 +1630,7 @@ class OrderViewSet(viewsets.ReadOnlyModelViewSet):
         note = str(request.data.get('note') or '').strip()[:500]
         if not reason:
             return Response({'error': 'Say what went wrong.'}, status=status.HTTP_400_BAD_REQUEST)
-        notifications.delivery_problem(order, request.user, reason, note)
+        notifications.delivery_problem(order, request.user, reason, (note + offline.delay_note(request)).strip())
         return Response({'ok': True})
 
     @action(detail=False, methods=['get'])
@@ -2289,7 +2291,7 @@ class AttendanceViewSet(viewsets.ModelViewSet):
                 attendance = Attendance(
                     staff=user,
                     booking_id=booking_id,
-                    clock_in_time=timezone.now(),
+                    clock_in_time=offline.action_time(request),   # when they tapped it, even if sent later
                     latitude=latitude,
                     longitude=longitude,
                     clock_in_address=address
@@ -2351,7 +2353,8 @@ class AttendanceViewSet(viewsets.ModelViewSet):
                 except (ValueError, TypeError):
                     pass
 
-                active_session.clock_out_time = timezone.now()
+                # When they tapped it (sent later if the phone was offline), never before clocking in
+                active_session.clock_out_time = max(offline.action_time(request), active_session.clock_in_time)
                 active_session.clock_out_address = address
 
                 if photo_data:

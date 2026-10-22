@@ -80,13 +80,17 @@ MIDDLEWARE = [
     'django.middleware.common.CommonMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',
     'django.contrib.auth.middleware.AuthenticationMiddleware',
+    'apps.library.offline.IdempotencyMiddleware',   # crew actions sent twice are done once
     'django.contrib.messages.middleware.MessageMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
 ]
 
 CORS_ALLOW_ALL_ORIGINS = True
 # Let the frontend read download file names (CSV exports, job sheet PDFs)
-CORS_EXPOSE_HEADERS = ['Content-Disposition']
+CORS_EXPOSE_HEADERS = ['Content-Disposition', 'Idempotent-Replayed']
+# Crew actions queued offline carry these (apps/library/offline.py)
+from corsheaders.defaults import default_headers  # noqa: E402
+CORS_ALLOW_HEADERS = (*default_headers, 'idempotency-key', 'x-action-time')
 
 ROOT_URLCONF = 'config.urls'
 

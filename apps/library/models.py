@@ -956,3 +956,18 @@ class ProjectPayment(models.Model):
 
     def __str__(self):
         return f'₱{self.amount:,.2f} on project #{self.project_id} ({self.method})'
+
+
+class IdempotentRequest(models.Model):
+    """One crew action, by its Idempotency-Key, so a retried request is done once (offline.py)."""
+    key = models.CharField(max_length=64, unique=True)
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='+')
+    method = models.CharField(max_length=8)
+    path = models.CharField(max_length=255)
+    status_code = models.PositiveSmallIntegerField(default=0)   # 0 = still being processed
+    content_type = models.CharField(max_length=100, blank=True, default='')
+    body = models.TextField(blank=True, default='')
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+
+    def __str__(self):
+        return f'{self.method} {self.path} [{self.key[:8]}…]'

@@ -2704,3 +2704,89 @@ class ModelSizeTests(MoneyControlBase):
         # The backend reads it as plant height: 1.8 m is a mid-layer plant
         from apps.library.pricing import layer_of
         self.assertEqual(layer_of(item), 'mid')
+
+
+class OfflineCrewActionTests(MoneyControlBase):
+    """Crew actions sent late from a phone that was offline: real times, and never done twice."""
+
+    def setUp(self):
+        super().setUp()
+        from django.utils import timezone
+        from apps.library.models import ServiceBooking
+        self.job = ServiceBooking.objects.create(user=self.customer, service_type='Softscape', status='Preparing',
+                                                 scheduled_date=timezone.localdate())
+        self.job.assigned_crew.add(self.crew)
+
+    def _post(self, url, body=None, key=None, at=None):
+        extra = {}
+        if key:
+            extra['HTTP_IDEMPOTENCY_KEY'] = key
+        if at:
+            extra['HTTP_X_ACTION_TIME'] = at.isoformat()
+        return self.client.post(url, body or {}, format='json', **extra)
+
+    def test_clock_in_and_out_keep_the_real_times(self):
+        from datetime import timedelta
+        from django.utils import timezone
+        from apps.library.models import Attendance
+        self._as(self.crew)
+        started = timezone.now() - timedelta(minutes=40)
+        r = self._post('/api/attendance/clock_in/', {'booking_id': self.job.id}, key='k' * 20, at=started)
+        self.assertEqual(r.status_code, 201, r.data)
+        a = Attendance.objects.get()
+        self.assertLess(abs((a.clock_in_time - started).total_seconds()), 1)
+        r = self._post('/api/attendance/clock_out/', {}, key='o' * 20, at=started + timedelta(minutes=30))
+        self.assertEqual(r.status_code, 200, r.data)
+        a.refresh_from_db()
+        self.assertEqual(round(a.total_hours, 2), 0.5)
+
+    def test_unbelievable_times_fall_back_to_now(self):
+        from datetime import timedelta
+        from django.utils import timezone
+        from apps.library.models import Attendance
+        self._as(self.crew)
+        self._post('/api/attendance/clock_in/', {'booking_id': self.job.id}, at=timezone.now() + timedelta(hours=3))
+        self.assertLess(abs((Attendance.objects.get().clock_in_time - timezone.now()).total_seconds()), 5)
+        Attendance.objects.all().delete()
+        self._post('/api/attendance/clock_in/', {'booking_id': self.job.id}, at=timezone.now() - timedelta(days=3))
+        self.assertLess(abs((Attendance.objects.get().clock_in_time - timezone.now()).total_seconds()), 5)
+
+    def test_same_action_sent_twice_is_done_once(self):
+        from apps.library.models import Attendance
+        self._as(self.crew)
+        first = self._post('/api/attendance/clock_in/', {'booking_id': self.job.id}, key='retry-key-123456')
+        again = self._post('/api/attendance/clock_in/', {'booking_id': self.job.id}, key='retry-key-123456')
+        self.assertEqual((first.status_code, again.status_code), (201, 201))       # not "already clocked in"
+        self.assertEqual(again['Idempotent-Replayed'], 'true')
+        self.assertEqual(again.json()['id'], first.json()['id'])
+        self.assertEqual(Attendance.objects.count(), 1)
+        # Without a key the normal rule applies
+        self.assertEqual(self._post('/api/attendance/clock_in/', {'booking_id': self.job.id}).status_code, 400)
+        # Someone else can't replay this crew member's answer
+        self._as(self.office)
+        self.assertEqual(self._post('/api/attendance/clock_in/', {'booking_id': self.job.id}, key='retry-key-123456').status_code, 422)
+
+    def test_delivery_marked_offline_keeps_its_time_and_problem_says_when(self):
+        from datetime import timedelta
+        from django.utils import timezone
+        from apps.library.models import Notification, Order
+        order = Order.objects.create(user=self.customer, customer_name='Ana', customer_email='a@x.com', total_price=800,
+                                     payment_method='cod', status='Out for Delivery', delivery_crew=self.crew)
+        self._as(self.crew)
+        handed = timezone.now() - timedelta(hours=2)
+        r = self.client.patch(f'/api/orders/{order.id}/update_status/', {'status': 'Delivered'}, format='json',
+                              HTTP_IDEMPOTENCY_KEY='deliver-key-12345', HTTP_X_ACTION_TIME=handed.isoformat())
+        self.assertEqual(r.status_code, 200, r.data)
+        order.refresh_from_db()
+        self.assertLess(abs((order.delivered_at - handed).total_seconds()), 1)
+        self._post(f'/api/bookings/{self.job.id}/report_problem/', {'reason': 'Customer not home'},
+                   key='problem-key-12345', at=timezone.now() - timedelta(minutes=50))
+        self.assertTrue(Notification.objects.filter(kind='job_problem', message__contains='sent when the signal came back').exists())
+
+    def test_phone_may_send_the_headers_cross_site(self):
+        r = self.client.options('/api/attendance/clock_in/', HTTP_ORIGIN='https://shimereyslandscaping.vercel.app',
+                                HTTP_ACCESS_CONTROL_REQUEST_METHOD='POST',
+                                HTTP_ACCESS_CONTROL_REQUEST_HEADERS='authorization,content-type,idempotency-key,x-action-time')
+        allowed = r.get('Access-Control-Allow-Headers', '')
+        self.assertIn('idempotency-key', allowed)
+        self.assertIn('x-action-time', allowed)
