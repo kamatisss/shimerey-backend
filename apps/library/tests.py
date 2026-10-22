@@ -2790,3 +2790,55 @@ class OfflineCrewActionTests(MoneyControlBase):
         allowed = r.get('Access-Control-Allow-Headers', '')
         self.assertIn('idempotency-key', allowed)
         self.assertIn('x-action-time', allowed)
+
+
+from django.test import TransactionTestCase  # noqa: E402
+
+
+class BackupTests(TransactionTestCase):
+    """manage.py backup_db / daily_maintenance: a compressed, checked copy; only the newest kept.
+    (No wrapping transaction: SQLite can't snapshot a database another transaction holds locked.)"""
+
+    def setUp(self):
+        from apps.library.models import StaffProfile
+        User.objects.create_superuser(username='owner', password='pw', email='o@example.com')
+        self.crew = User.objects.create_user(username='crew', password='pw', is_staff=True)
+        StaffProfile.objects.create(user=self.crew, role='FIELD_CREW')
+
+    def test_backup_is_a_working_copy_and_old_ones_are_pruned(self):
+        import gzip
+        import sqlite3
+        import tempfile
+        from pathlib import Path
+        from apps.library.backups import backup_database
+        dest = Path(tempfile.mkdtemp())
+        for day in ('2026-10-01', '2026-10-02', '2026-10-03'):
+            (dest / f'db-{day}.sqlite3.gz').write_bytes(b'old')
+        path = backup_database(dest, keep=2)
+        self.assertTrue(path.name.startswith('db-') and path.name.endswith('.sqlite3.gz'))
+        self.assertEqual(sorted(p.name for p in dest.glob('db-*.gz')), sorted([path.name, 'db-2026-10-03.sqlite3.gz']))
+        restored = dest / 'restored.sqlite3'
+        restored.write_bytes(gzip.decompress(path.read_bytes()))
+        db = sqlite3.connect(restored)
+        users = db.execute('select username from auth_user order by username').fetchall()
+        db.close()
+        self.assertIn(('owner',), users)                     # the data really is in the copy
+
+    def test_daily_maintenance_runs_every_step(self):
+        import io
+        import tempfile
+        from datetime import timedelta
+        from unittest import mock
+        from django.core.management import call_command
+        from django.utils import timezone
+        from apps.library.models import IdempotentRequest
+        old = IdempotentRequest.objects.create(key='old-key-1234567890', user=self.crew, method='POST', path='/api/x/', status_code=200)
+        IdempotentRequest.objects.filter(pk=old.pk).update(created_at=timezone.now() - timedelta(days=5))
+        IdempotentRequest.objects.create(key='new-key-1234567890', user=self.crew, method='POST', path='/api/x/', status_code=200)
+        out = io.StringIO()
+        with mock.patch.dict('os.environ', {'BACKUP_DIR': tempfile.mkdtemp()}):
+            call_command('daily_maintenance', stdout=out)
+        text = out.getvalue()
+        for step in ('Backup:', 'Unpaid orders:', 'Retry keys: 1 removed'):
+            self.assertIn(step, text)
+        self.assertEqual(IdempotentRequest.objects.count(), 1)

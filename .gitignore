@@ -17,3 +17,6 @@ staticfiles/
 
 # Downloaded model caches
 .cache/
+
+# Database backups (manage.py backup_db / daily_maintenance)
+backups/
