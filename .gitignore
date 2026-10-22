@@ -1,0 +1,19 @@
+# Python environment
+venv/
+env/
+__pycache__/
+*.pyc
+
+# Secrets — never commit (copy .env.example instead)
+.env
+
+# Data: the database, its backups and uploaded files hold customers' personal details
+*.sqlite3
+*.sqlite3-journal
+*.bak
+media/
+media_backup/
+staticfiles/
+
+# Downloaded model caches
+.cache/

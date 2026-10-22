@@ -1,0 +1,19 @@
+Hi {{ first_name }},
+
+Here is the payment request for your {{ service|lower }} project (Booking #{{ booking_id }}).
+
+  For:           {{ label }}
+  Amount due:    {{ amount }}
+  Project price: {{ project_total }}
+  Balance:       {{ project_balance }}
+
+Pay online with QR Ph, GCash, Maya or card:
+{{ pay_url }}
+
+You pay on PayMongo's secure page; we never see your card or e-wallet details.
+If you have questions, just reply to this email.
+
+Thank you,
+{{ business.name }}{% if business.phone %}
+{{ business.phone }}{% endif %}{% if business.email %}
+{{ business.email }}{% endif %}

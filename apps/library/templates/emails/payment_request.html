@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Payment request</title>
+</head>
+<!-- Email clients ignore <style> blocks and modern CSS: tables and inline styles only -->
+<body style="margin:0;padding:0;background:#f1f5f9;font-family:Inter,Segoe UI,Arial,sans-serif;color:#0f172a;">
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#f1f5f9;padding:24px 12px;">
+    <tr>
+      <td align="center">
+        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:520px;background:#ffffff;border-radius:16px;overflow:hidden;border:1px solid #e2e8f0;">
+          <tr>
+            <td style="background:#059669;padding:28px 28px 24px;color:#ffffff;">
+              <div style="font-size:14px;font-weight:700;letter-spacing:.3px;opacity:.9;">🌿 {{ business.name }}</div>
+              <div style="font-size:24px;font-weight:800;margin-top:10px;">Payment request</div>
+              <div style="font-size:14px;margin-top:6px;opacity:.9;">Hi {{ first_name }}, here is the payment for your {{ service|lower }} project.</div>
+            </td>
+          </tr>
+          <tr>
+            <td style="padding:24px 28px 8px;">
+              <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="font-size:14px;border:1px dashed #cbd5e1;border-radius:12px;background:#f8fafc;">
+                <tr><td style="padding:12px 16px 6px;color:#64748b;">For</td><td align="right" style="padding:12px 16px 6px;font-weight:700;">{{ label }}</td></tr>
+                <tr><td style="padding:6px 16px;color:#64748b;">Project</td><td align="right" style="padding:6px 16px;font-weight:700;">{{ service }} · Booking #{{ booking_id }}</td></tr>
+                <tr><td style="padding:6px 16px;color:#64748b;">Project price</td><td align="right" style="padding:6px 16px;font-weight:700;">{{ project_total }}</td></tr>
+                <tr><td style="padding:6px 16px 12px;color:#64748b;">Balance</td><td align="right" style="padding:6px 16px 12px;font-weight:700;">{{ project_balance }}</td></tr>
+              </table>
+              <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin-top:16px;background:#ecfdf5;border:1px solid #a7f3d0;border-radius:12px;">
+                <tr>
+                  <td style="padding:16px;font-size:13px;font-weight:800;color:#065f46;text-transform:uppercase;letter-spacing:.5px;">Amount due</td>
+                  <td align="right" style="padding:16px;font-size:24px;font-weight:800;color:#059669;">{{ amount }}</td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+          <tr>
+            <td align="center" style="padding:20px 28px 8px;">
+              <a href="{{ pay_url }}" style="display:inline-block;background:#059669;color:#ffffff;text-decoration:none;font-weight:700;font-size:16px;padding:14px 32px;border-radius:12px;">Pay {{ amount }} now</a>
+              <div style="font-size:12px;color:#64748b;margin-top:10px;">QR Ph · GCash · Maya · Card</div>
+            </td>
+          </tr>
+          <tr>
+            <td style="padding:16px 28px 24px;font-size:12px;color:#94a3b8;line-height:1.6;">
+              Button not working? Open this link:<br>
+              <a href="{{ pay_url }}" style="color:#059669;word-break:break-all;">{{ pay_url }}</a><br><br>
+              You pay on PayMongo's secure page; we never see your card or e-wallet details.
+              If you have questions, just reply to this email.
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>

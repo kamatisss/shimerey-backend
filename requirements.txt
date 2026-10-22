@@ -1,0 +1,22 @@
+# Garden Studio backend — production dependencies (pinned, ~260 MB installed).
+# The old MiDaS depth model (torch, torchvision, timm, scipy, matplotlib…, ~770 MB) was removed:
+# "Upload Photo" makes the same terrain with OpenCV alone.
+Django==6.0.3
+djangorestframework==3.17.1
+djangorestframework_simplejwt==5.5.1
+django-cors-headers==4.9.0
+python-dotenv==1.2.2
+tzdata==2025.3
+requests==2.34.0
+# Images: uploads, photo → 3D terrain, PDF job sheets
+pillow==12.1.1
+numpy==2.4.3
+opencv-python-headless==4.13.0.92
+reportlab==5.0.0
+# AI Designer (Gemini)
+google-genai==2.10.0
+pydantic==2.13.4
+# Crew phone alerts (Web Push)
+pywebpush==2.5.0
+# Only for hosts that run gunicorn (Railway/Render); PythonAnywhere does not need it
+gunicorn==26.0.0
