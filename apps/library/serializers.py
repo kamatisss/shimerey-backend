@@ -143,6 +143,12 @@ class InventoryItemSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError('Pick one of the 3D models in the list.')
         return value
 
+    def validate_real_world_size(self, value):
+        # Metres: height for plants/furniture, longest side for hardscape (frontend data/modelSizing.js)
+        if value is None or not (0.05 <= float(value) <= 30):
+            raise serializers.ValidationError('Enter a size between 0.05 and 30 metres.')
+        return round(float(value), 2)
+
     def validate_unit_price(self, value):
         if value is None or value <= 0:
             raise serializers.ValidationError('Enter a price above ₱0.')

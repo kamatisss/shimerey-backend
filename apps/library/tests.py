@@ -2685,3 +2685,22 @@ class SecurityTests(MoneyControlBase):
         self.assertFalse(prod.CORS_ALLOW_ALL_ORIGINS)
         self.assertEqual(prod.CORS_ALLOWED_ORIGINS, ['https://shop.example.com'])
         self.assertEqual(prod.ALLOWED_HOSTS, ['x.example.com'])
+
+
+class ModelSizeTests(MoneyControlBase):
+    """real_world_size: metres at established size (height for plants/furniture, longest side for hardscape)."""
+
+    def test_size_is_editable_and_checked(self):
+        from apps.library.models import InventoryItem
+        item = InventoryItem.objects.create(name='Heliconia', category='plant', unit_price=400, stock_quantity=5)
+        self._as(self.office)
+        url = f'/api/inventory/{item.id}/'
+        self.assertEqual(self.client.patch(url, {'real_world_size': 0}, format='json').status_code, 400)
+        self.assertEqual(self.client.patch(url, {'real_world_size': 80}, format='json').status_code, 400)
+        r = self.client.patch(url, {'real_world_size': '1.8'}, format='json')
+        self.assertEqual(r.status_code, 200, r.data)
+        item.refresh_from_db()
+        self.assertEqual(item.real_world_size, 1.8)
+        # The backend reads it as plant height: 1.8 m is a mid-layer plant
+        from apps.library.pricing import layer_of
+        self.assertEqual(layer_of(item), 'mid')

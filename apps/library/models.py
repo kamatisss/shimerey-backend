@@ -19,7 +19,7 @@ class InventoryItem(models.Model):
     # A bundled 3D model's file name (e.g. "bamboo.glb"): the models ship with the frontend
     # (public/models/<category>/, data/modelCatalog.js). Blank = sold in the shop, not placeable in 3D.
     model_file = models.CharField(max_length=100, blank=True, default='')
-    real_world_size = models.FloatField(default=1.0, help_text="Target size/height of the model in meters")
+    real_world_size = models.FloatField(default=1.0, help_text="Metres at established size (1–2 years after planting): height for plants and furniture, longest side for hardscape")
     spacing_cm = models.IntegerField(
         null=True, blank=True,
         help_text="Recommended on-center planting spacing in centimetres (e.g. 45 = 45 cm OC)"
