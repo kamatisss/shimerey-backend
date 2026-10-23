@@ -747,7 +747,7 @@ class ServiceBookingViewSet(viewsets.ModelViewSet):
                 return Response({'error': 'The office confirms the design and contract.'}, status=status.HTTP_403_FORBIDDEN)
             if phase not in field_work.CREW_STAGES:
                 return Response({'error': 'That stage is not used any more.'}, status=status.HTTP_400_BAD_REQUEST)
-            if not field_work.is_clocked_in_to(request.user, booking):
+            if not field_work.is_clocked_in_to(request.user, booking, at=offline.action_time(request)):
                 return Response({'error': f'Start booking #{booking.id} (clock in) before updating its stages.'},
                                 status=status.HTTP_400_BAD_REQUEST)
             if pct == 100 and not proof_photo_url_direct:

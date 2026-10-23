@@ -9,6 +9,7 @@ Field-work rules for crew jobs — one place, used by the views (and mirrored in
   Sign-off         = crew may submit "For Review" only when every crew stage is done and at least one
                      After photo exists (final inspection's proof is an After photo).
 """
+from django.db.models import Q
 from django.utils import timezone
 
 from collections import Counter
@@ -41,8 +42,12 @@ def start_job_error(booking, today=None):
     return None
 
 
-def is_clocked_in_to(user, booking):
-    return Attendance.objects.filter(staff=user, booking=booking, clock_out_time__isnull=True).exists()
+def is_clocked_in_to(user, booking, at=None):
+    """On this job now, or (at=) at that moment: a stage photo taken offline may arrive after clock-out."""
+    shifts = Attendance.objects.filter(staff=user, booking=booking)
+    if at is None:
+        return shifts.filter(clock_out_time__isnull=True).exists()
+    return shifts.filter(clock_in_time__lte=at).filter(Q(clock_out_time__isnull=True) | Q(clock_out_time__gte=at)).exists()
 
 
 def sign_off_blockers(booking):

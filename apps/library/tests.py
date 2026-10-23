@@ -2783,6 +2783,37 @@ class OfflineCrewActionTests(MoneyControlBase):
                    key='problem-key-12345', at=timezone.now() - timedelta(minutes=50))
         self.assertTrue(Notification.objects.filter(kind='job_problem', message__contains='sent when the signal came back').exists())
 
+    def test_stage_photo_taken_offline_counts_after_clock_out(self):
+        from datetime import timedelta
+        from django.utils import timezone
+        from apps.library.models import Attendance, ProjectMilestone, ProjectProgressMedia
+        self._as(self.crew)
+        start = timezone.now() - timedelta(hours=2)
+        Attendance.objects.create(staff=self.crew, booking=self.job, clock_in_time=start,
+                                  clock_out_time=start + timedelta(hours=1))
+        taken = start + timedelta(minutes=45)
+        with self.settings(MEDIA_ROOT=TEMP_MEDIA):
+            def upload():
+                return self.client.post(f'/api/bookings/{self.job.id}/progress-media/',
+                                        {'construction_phase': 'DURING', 'file': _photo_with_gps()}, format='multipart',
+                                        HTTP_IDEMPOTENCY_KEY='photo-key-123456', HTTP_X_ACTION_TIME=taken.isoformat())
+            first, again = upload(), upload()
+        self.assertEqual((first.status_code, again.status_code), (201, 201), first.data)
+        self.assertEqual(ProjectProgressMedia.objects.count(), 1)              # the resend didn't upload it twice
+
+        def finish(at, key):
+            return self.client.patch(f'/api/bookings/{self.job.id}/update_milestone/',
+                                     {'phase': 'site_prep', 'completion_pct': 100, 'proof_photo_url': first.json()['file_url']},
+                                     format='json', HTTP_IDEMPOTENCY_KEY=key, HTTP_X_ACTION_TIME=at.isoformat())
+        # Taken after the shift ended (or with no time at all): not on the job
+        self.assertEqual(finish(start + timedelta(minutes=90), 'stage-key-late-1').status_code, 400)
+        self.assertEqual(self.client.patch(f'/api/bookings/{self.job.id}/update_milestone/',
+                                           {'phase': 'site_prep', 'completion_pct': 100, 'proof_photo_url': 'x'},
+                                           format='json').status_code, 400)
+        r = finish(taken, 'stage-key-123456')
+        self.assertEqual(r.status_code, 200, r.data)
+        self.assertEqual(ProjectMilestone.objects.get(booking=self.job, phase='site_prep').completion_pct, 100)
+
     def test_phone_may_send_the_headers_cross_site(self):
         r = self.client.options('/api/attendance/clock_in/', HTTP_ORIGIN='https://shimereyslandscaping.vercel.app',
                                 HTTP_ACCESS_CONTROL_REQUEST_METHOD='POST',
