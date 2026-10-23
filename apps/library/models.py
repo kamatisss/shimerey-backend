@@ -971,3 +971,20 @@ class IdempotentRequest(models.Model):
 
     def __str__(self):
         return f'{self.method} {self.path} [{self.key[:8]}…]'
+
+
+class PrivacyConsent(models.Model):
+    """
+    A customer agreed to the privacy notice (Data Privacy Act, RA 10173): which version and when,
+    so the business can show that consent was given. Written at sign-up; never edited.
+    """
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='privacy_consents')
+    policy_version = models.CharField(max_length=20)
+    accepted_at = models.DateTimeField(auto_now_add=True)
+    source = models.CharField(max_length=20, default='sign_up')
+
+    class Meta:
+        ordering = ['-accepted_at']
+
+    def __str__(self):
+        return f'{self.user_id} accepted privacy notice {self.policy_version}'

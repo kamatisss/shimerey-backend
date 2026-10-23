@@ -2609,12 +2609,27 @@ class SecurityTests(MoneyControlBase):
         self.assertEqual(codes[-1], 429)
 
     def test_sign_up_needs_a_real_password(self):
-        weak = self.client.post('/api/register/', {'username': 'newbie', 'email': 'n@example.com', 'password': '1234'})
+        weak = self.client.post('/api/register/', {'username': 'newbie', 'email': 'n@example.com', 'password': '1234',
+                                                   'accept_privacy': True})
         self.assertEqual(weak.status_code, 400)
         self.assertIn('password', weak.data)
-        ok = self.client.post('/api/register/', {'username': 'newbie', 'email': 'n@example.com', 'password': 'Garden-Path-77'})
+        ok = self.client.post('/api/register/', {'username': 'newbie', 'email': 'n@example.com', 'password': 'Garden-Path-77',
+                                                 'accept_privacy': True})
         self.assertEqual(ok.status_code, 201)
         self.assertFalse(User.objects.get(username='newbie').is_staff)
+
+    def test_sign_up_records_privacy_consent(self):
+        from apps.library.models import PrivacyConsent
+        from apps.library.serializers import PRIVACY_POLICY_VERSION
+        form = {'username': 'maria', 'email': 'm@example.com', 'password': 'Garden-Path-77'}
+        for refused in ({}, {'accept_privacy': False}):
+            r = self.client.post('/api/register/', {**form, **refused})
+            self.assertEqual(r.status_code, 400)
+            self.assertIn('accept_privacy', r.data)
+        self.assertFalse(User.objects.filter(username='maria').exists())       # no account without consent
+        self.assertEqual(self.client.post('/api/register/', {**form, 'accept_privacy': True}).status_code, 201)
+        consent = PrivacyConsent.objects.get(user__username='maria')
+        self.assertEqual(consent.policy_version, PRIVACY_POLICY_VERSION)
 
     def test_design_image_upload_only_takes_images(self):
         import io

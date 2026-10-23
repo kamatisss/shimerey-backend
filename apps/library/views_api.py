@@ -90,16 +90,6 @@ class IsOfficeAdmin(BasePermission):
         except Exception:
             pass
 
-        # ── DEBUG: print exactly what the permission class sees ──────────────
-        print(
-            f"DEBUG assign_crew permission | "
-            f"email={user.email!r} "
-            f"is_staff={user.is_staff} "
-            f"user.role (direct attr)={getattr(user, 'role', 'NO_ROLE')!r} "
-            f"resolved_role (staff_profile.role)={resolved_role!r}"
-        )
-        # ─────────────────────────────────────────────────────────────────────
-
         # FIELD_CREW is staff but must never be able to assign crew
         if resolved_role == 'FIELD_CREW':
             return False
@@ -130,6 +120,7 @@ from .serializers import (
     GardenDesignSerializer,
     GardenDesignListSerializer,
     UserSerializer,
+    RegisterSerializer,
     CustomTokenObtainPairSerializer,
     BlackoutDateSerializer,
     ServiceBookingSerializer,
@@ -157,7 +148,7 @@ class CustomTokenObtainPairView(TokenObtainPairView):
 class RegisterView(generics.CreateAPIView):
     queryset = User.objects.all()
     permission_classes = (AllowAny,)
-    serializer_class = UserSerializer
+    serializer_class = RegisterSerializer
     throttle_classes = [ScopedRateThrottle]
     throttle_scope = 'register'
 

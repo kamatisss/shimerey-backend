@@ -100,6 +100,32 @@ class UserSerializer(serializers.ModelSerializer):
         return user
 
 
+# Change this (and the date on the frontend's /privacy page) whenever the privacy notice changes
+PRIVACY_POLICY_VERSION = '2026-10-23'
+
+
+class RegisterSerializer(UserSerializer):
+    """Public sign-up: the customer must agree to the privacy notice, and that agreement is recorded."""
+    accept_privacy = serializers.BooleanField(write_only=True, required=True)
+
+    class Meta(UserSerializer.Meta):
+        fields = UserSerializer.Meta.fields + ('accept_privacy',)
+
+    def validate_accept_privacy(self, value):
+        if not value:
+            raise serializers.ValidationError('Please read and agree to the Privacy Notice to create an account.')
+        return value
+
+    def create(self, validated_data):
+        from django.db import transaction
+        from .models import PrivacyConsent
+        validated_data.pop('accept_privacy')
+        with transaction.atomic():
+            user = super().create(validated_data)
+            PrivacyConsent.objects.create(user=user, policy_version=PRIVACY_POLICY_VERSION)
+        return user
+
+
 
 
 class InventoryItemSerializer(serializers.ModelSerializer):

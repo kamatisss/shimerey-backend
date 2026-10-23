@@ -3,7 +3,7 @@ from django import forms
 from django.contrib.auth.admin import UserAdmin as BaseUserAdmin
 from django.contrib.auth.models import User
 from django.contrib.auth.forms import UserChangeForm
-from .models import InventoryItem, GardenDesign, GardenImage, Attendance, StaffProfile
+from .models import InventoryItem, GardenDesign, GardenImage, Attendance, StaffProfile, PrivacyConsent
 
 
 @admin.register(InventoryItem)
@@ -30,6 +30,20 @@ class AttendanceAdmin(admin.ModelAdmin):
     list_display = ['staff', 'booking', 'clock_in_time', 'clock_out_time', 'latitude', 'longitude']
     list_filter = ['clock_in_time', 'staff']
     search_fields = ['staff__username', 'booking__service_type']
+
+
+@admin.register(PrivacyConsent)
+class PrivacyConsentAdmin(admin.ModelAdmin):
+    """Proof of who agreed to which privacy notice, and when. Read-only: consent is never edited."""
+    list_display = ['user', 'policy_version', 'accepted_at', 'source']
+    list_filter = ['policy_version']
+    search_fields = ['user__username', 'user__email']
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_change_permission(self, request, obj=None):
+        return False
 
 
 class CustomUserChangeForm(UserChangeForm):
