@@ -1687,10 +1687,25 @@ class StaffWorkQueueTests(APITestCase):
         r = self.client.get('/api/bookings/', {'from': str(today), 'to': str(today), 'page': 1})
         self.assertEqual(r.data['count'], 2)
         self.assertEqual(self.client.get('/api/bookings/', {'q': 'maria', 'page': 1}).data['count'], 6)
-
         self._as(self.crew)  # crew counts only cover their own jobs
         self.assertEqual(self.client.get('/api/bookings/counts/').data['all'], 1)
         self.assertIsInstance(self.client.get('/api/bookings/').data, list)
+
+    def test_startable_lists_only_jobs_that_can_be_clocked_in_to(self):
+        from django.utils import timezone
+        from apps.library.models import ServiceBooking
+        today = timezone.localdate()
+
+        def make(status, days=0):
+            return ServiceBooking.objects.create(user=self.customer, service_type='Softscape', status=status,
+                                                 scheduled_date=today + timedelta(days=days))
+        due = make('Preparing')
+        late = make('Preparing', -2)
+        going = make('Installing', 3)
+        for status, days in (('Preparing', 1), ('Pending', 0), ('For Review', 0), ('Finished', 0), ('Cancelled', 0)):
+            make(status, days)
+        ids = {b['id'] for b in self.client.get('/api/bookings/', {'startable': '1'}).data}
+        self.assertEqual(ids, {due.id, late.id, going.id})      # the same rule as field_work.start_job_error
 
     def test_dispatch_schedule_shows_who_is_where(self):
         from apps.library.models import ServiceBooking
@@ -2431,6 +2446,19 @@ class BusinessProfileTests(MoneyControlBase):
 
 
 class ActivityLogTests(MoneyControlBase):
+    def test_owner_cannot_lock_themselves_out(self):
+        self._as(self.owner)
+        me = f'/api/users/{self.owner.id}/'
+        for body in ({'is_active': False}, {'role': 'OFFICE_ADMIN'}, {'input_role': 'customer'}):
+            r = self.client.patch(me, body, format='json')
+            self.assertEqual(r.status_code, 400, body)
+            self.assertIn('your own account', str(r.data))
+        self.assertEqual(self.client.delete(me).status_code, 400)
+        self.owner.refresh_from_db()
+        self.assertTrue(self.owner.is_active and self.owner.is_superuser)
+        # Other accounts are managed as before
+        self.assertEqual(self.client.patch(f'/api/users/{self.crew.id}/', {'is_active': False}, format='json').status_code, 200)
+
     def test_prices_roles_and_refunds_are_logged(self):
         from apps.library.models import ActivityLog, InventoryItem, Order
         item = InventoryItem.objects.create(name='Fern', category='plant', unit_price=50, stock_quantity=3)
@@ -2828,6 +2856,23 @@ class OfflineCrewActionTests(MoneyControlBase):
         r = finish(taken, 'stage-key-123456')
         self.assertEqual(r.status_code, 200, r.data)
         self.assertEqual(ProjectMilestone.objects.get(booking=self.job, phase='site_prep').completion_pct, 100)
+
+    def test_attendance_list_by_period(self):
+        from datetime import timedelta
+        from django.utils import timezone
+        from apps.library.models import Attendance
+        now = timezone.now()
+        old = Attendance.objects.create(staff=self.crew, clock_in_time=now - timedelta(days=20), clock_out_time=now - timedelta(days=20, hours=-8))
+        recent = Attendance.objects.create(staff=self.crew, clock_in_time=now - timedelta(hours=3))
+        other = Attendance.objects.create(staff=self.office, clock_in_time=now - timedelta(hours=2))
+        week_ago = str(timezone.localdate() - timedelta(days=7))
+        self._as(self.owner)
+        self.assertEqual({a['id'] for a in self.client.get('/api/attendance/').data}, {old.id, recent.id, other.id})
+        r = self.client.get('/api/attendance/', {'from': week_ago, 'to': str(timezone.localdate())})
+        self.assertEqual({a['id'] for a in r.data}, {recent.id, other.id})
+        self.assertEqual(self.client.get('/api/attendance/', {'from': 'last week'}).status_code, 400)
+        self._as(self.crew)   # crew still see only their own shifts
+        self.assertEqual({a['id'] for a in self.client.get('/api/attendance/', {'from': week_ago}).data}, {recent.id})
 
     def test_phone_may_send_the_headers_cross_site(self):
         r = self.client.options('/api/attendance/clock_in/', HTTP_ORIGIN='https://shimereyslandscaping.vercel.app',

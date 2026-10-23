@@ -677,7 +677,7 @@ class ServiceBookingViewSet(viewsets.ModelViewSet):
         ).first()
         if active_att is None:
             return Response(
-                {'error': f'You are not clocked in. Clock in to Booking #{booking.id} via Attendance Tracking first.'},
+                {'error': f'You are not clocked in. Clock in to Booking #{booking.id} on the Attendance page first.'},
                 status=status.HTTP_400_BAD_REQUEST,
             )
         if active_att.booking_id != booking.id:
@@ -2062,7 +2062,18 @@ class UserViewSet(viewsets.ModelViewSet):
         activity.record(self.request.user, 'people', 'user_added',
                         f'Added {activity.name_of(user)} as {activity.role_of(user)}', link='/manage-users', user=user.id)
 
+    def _not_yourself(self, instance, what):
+        # The owner can't lock themselves out: another owner account has to do it
+        if instance.pk == self.request.user.pk:
+            from rest_framework.exceptions import ValidationError
+            raise ValidationError({'error': f"You can't {what} your own account."})
+
     def perform_update(self, serializer):
+        data = self.request.data
+        if 'is_active' in data and str(data['is_active']).lower() in ('false', '0', ''):
+            self._not_yourself(serializer.instance, 'deactivate')
+        if (data.get('role') and data['role'] != 'SUPER_ADMIN') or (data.get('input_role') and data['input_role'] != 'admin'):
+            self._not_yourself(serializer.instance, 'remove the owner role from')
         before = User.objects.select_related('staff_profile').get(pk=serializer.instance.pk)
         old_role, was_active = activity.role_of(before), before.is_active
         user = User.objects.select_related('staff_profile').get(pk=serializer.save().pk)
@@ -2079,6 +2090,7 @@ class UserViewSet(viewsets.ModelViewSet):
                             link='/manage-users', user=user.id)
 
     def perform_destroy(self, instance):
+        self._not_yourself(instance, 'delete')
         summary = f'Deleted the account of {activity.name_of(instance)} ({activity.role_of(instance)})'
         instance.delete()
         activity.record(self.request.user, 'people', 'user_deleted', summary, link='/manage-users')
@@ -2208,9 +2220,22 @@ class AttendanceViewSet(viewsets.ModelViewSet):
         return super().get_permissions()
 
     def get_queryset(self):
-        if self.request.user.is_superuser:
-            return Attendance.objects.all().order_by('-clock_in_time')
-        return Attendance.objects.filter(staff=self.request.user).order_by('-clock_in_time')
+        qs = Attendance.objects.select_related('staff', 'booking', 'booking__user').order_by('-clock_in_time')
+        if not self.request.user.is_superuser:
+            qs = qs.filter(staff=self.request.user)
+        if self.action == 'list':
+            # ?from=&to= (YYYY-MM-DD, the shift's start day): the owner's screen asks for one period at a time
+            # instead of every shift ever recorded. Without them, the whole list as before.
+            params = self.request.query_params
+            try:
+                if params.get('from'):
+                    qs = qs.filter(clock_in_time__date__gte=datetime.date.fromisoformat(params['from']))
+                if params.get('to'):
+                    qs = qs.filter(clock_in_time__date__lte=datetime.date.fromisoformat(params['to']))
+            except ValueError:
+                from rest_framework.exceptions import ValidationError
+                raise ValidationError({'error': 'Dates must look like 2026-10-23.'})
+        return qs
 
     @action(detail=False, methods=['get'])
     def current(self, request):

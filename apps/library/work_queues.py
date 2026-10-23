@@ -221,6 +221,9 @@ def filter_bookings(qs, params):
         qs = qs.filter(status=params['status'])
     if params.get('service') in dict(ServiceBooking.SERVICE_CHOICES):
         qs = qs.filter(service_type=params['service'])
+    if params.get('startable') == '1':
+        # Jobs that can be clocked in to today (the rule in field_work.start_job_error)
+        qs = qs.filter(Q(status='Installing') | Q(status='Preparing', scheduled_date__lte=timezone.localdate()))
     query = (params.get('q') or '').strip().lstrip('#')
     if query:
         if query.isdigit():  # a number means a booking number or a phone number
