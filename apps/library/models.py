@@ -30,6 +30,30 @@ class InventoryItem(models.Model):
     # At or below this many units the item counts as low stock (cheap plants and benches differ)
     reorder_level = models.PositiveIntegerField(default=10)
 
+    # Botanical compatibility attributes (used by AI Designer & 3D Studio to warn about companion conflicts)
+    SUNLIGHT_CHOICES = [
+        ('full_sun', 'Full Sun'),
+        ('partial_shade', 'Partial Shade'),
+        ('full_shade', 'Full Shade'),
+    ]
+    WATER_CHOICES = [
+        ('low', 'Low / Drought Tolerant'),
+        ('moderate', 'Moderate Moisture'),
+        ('high', 'High Moisture'),
+    ]
+    sunlight = models.CharField(max_length=20, choices=SUNLIGHT_CHOICES, default='full_sun', blank=True)
+    water_need = models.CharField(max_length=20, choices=WATER_CHOICES, default='moderate', blank=True)
+    is_invasive = models.BooleanField(
+        default=False,
+        help_text="True if species has aggressive rhizomatous/root spread requiring isolation (e.g. Bamboo)"
+    )
+    # Growth: real_world_size is the ESTABLISHED height (~2 years after planting, what the 3D view and
+    # the AI layout use). These two put it in context for the customer (Studio height label).
+    planting_height = models.FloatField(null=True, blank=True,
+                                        help_text="Metres tall when we plant it (nursery size). Plants only.")
+    mature_height = models.FloatField(null=True, blank=True,
+                                      help_text="Metres tall when fully grown, in a home garden. Plants only.")
+
     class Meta:
         ordering = ['category', 'name']
 

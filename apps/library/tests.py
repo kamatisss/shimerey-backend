@@ -1,3 +1,4 @@
+import math
 import os
 import json
 from datetime import timedelta
@@ -186,19 +187,174 @@ class GenerateLayoutsViewTests(APITestCase):
         import random
         from apps.library import layout_engine as E
         rng = random.Random(42)
-        base = [('1', 'Oak', 1000, 4.0), ('2', 'Fern', 500, 1.0), ('3', 'Palm', 800, 5.0), ('4', 'Rose', 200, 0.5)]
+        # Growing needs that clash: Fern (high water) vs Rose (low water), Bamboo (aggressive roots),
+        # Rose is a low sun-lover next to tall canopy — the engine must keep the companion gaps too
+        base = [('1', 'Oak', 1000, 4.0, 'full_sun', 'moderate', False),
+                ('2', 'Fern', 500, 1.0, 'full_shade', 'high', False),
+                ('3', 'Bamboo', 800, 5.0, 'full_sun', 'moderate', True),
+                ('4', 'Rose', 200, 0.5, 'full_sun', 'low', False)]
         for case in range(60):
-            specs = [E.PlantSpec(i, n, p, rng.randint(1, 30), h, E.spacing_for(h)) for i, n, p, h in base]
+            specs = [E.PlantSpec(i, n, p, rng.randint(1, 30), h, E.spacing_for(h), sun, water, inv)
+                     for i, n, p, h, sun, water, inv in base]
             site = E.Site(rng.uniform(3, 25), rng.uniform(3, 25),
                           E.zone_cells(rng.sample(list(E.ZONES), rng.randint(0, 3))))
             budget = rng.choice([800, 3000, 9000, 30000])
+            # Garden features on some cases: a seat or two and a rock group
+            seat = E.PlantSpec('s', 'Bench', 300, rng.randint(0, 3), 0.8, E.SEAT_PAD, kind='seat')
+            rock = E.PlantSpec('r', 'Rock', 150, rng.randint(0, 9), 0.6, 0.8, kind='rock')
+            features = [(seat, rng.randint(1, 2)), (rock, rng.randint(1, 6))] if case % 2 else []
+            every = specs + [f for f, _ in features]
             for style in E.STYLES:
-                d = E.generate(style, specs, site, budget, seed=case)
-                self.assertEqual(E.check(d['plants'], specs, site, budget), [], (case, style))
-            messy = [{'plant_id': rng.choice(['1', '2', '3', '4', '999']), 'x': rng.uniform(-2, 27),
+                d = E.generate(style, specs, site, budget, seed=case, features=features)
+                self.assertEqual(E.check(d['plants'], every, site, budget), [], (case, style))
+            messy = [{'plant_id': rng.choice(['1', '2', '3', '4', '999', 's']), 'x': rng.uniform(-2, 27),
                       'z': rng.uniform(-2, 27), 'rotation': 0} for _ in range(rng.randint(0, 40))]
-            fixed, _ = E.repair(messy, specs, site, budget, seed=case)
-            self.assertEqual(E.check(fixed, specs, site, budget), [], (case, 'repair'))
+            fixed, _ = E.repair(messy, specs, site, budget, seed=case, features=features)
+            self.assertEqual(E.check(fixed, every, site, budget), [], (case, 'repair'))
+
+    # ── botanical compatibility ──────────────────────────────────────────────
+    def test_companion_gap_rules(self):
+        from apps.library import layout_engine as E
+        spec = lambda h, sun='full_sun', water='moderate', inv=False: E.PlantSpec('x', 'x', 1, 1, h, 1.0, sun, water, inv)
+        self.assertEqual(E.companion_gap(spec(1), spec(1)), 0)
+        self.assertEqual(E.companion_gap(spec(1, water='low'), spec(1, water='high')), E.HYDROZONE_GAP)
+        self.assertEqual(E.companion_gap(spec(1, water='low'), spec(1, water='moderate')), 0)
+        self.assertEqual(E.companion_gap(spec(5, inv=True), spec(1)), E.ROOT_BARRIER_GAP)
+        self.assertEqual(E.companion_gap(spec(5, inv=True), spec(5, inv=True)), 0)
+        self.assertEqual(E.companion_gap(spec(4), spec(0.4)), E.CANOPY_GAP)
+        self.assertEqual(E.companion_gap(spec(4), spec(0.4, sun='full_shade')), 0)  # shade plants belong there
+        self.assertEqual(E.min_distance(spec(1, water='low'), spec(1, water='high')), 1.0 + E.HYDROZONE_GAP)
+
+    # ── the customer's plant choice is binding ───────────────────────────────
+    @patch.dict(os.environ, {'GEMINI_API_KEY': 'test_api_key'})
+    @patch('google.genai.Client')
+    def test_designs_use_only_the_chosen_plants(self, mock_client_class):
+        mock_client = MagicMock()
+        mock_client_class.return_value = mock_client
+        # The AI slips in a palm (3) and a rose (4) the customer didn't choose
+        mock_client.models.generate_content.return_value = self._ai_design(
+            [('1', 3, 3), ('2', 10, 10), ('3', 15, 3), ('4', 8, 17)])
+        r = self.client.post(self.url, {**self.valid, 'preferred_plant_ids': ['1', '2']}, format='json')
+        self.assertEqual(r.status_code, 200, r.data)
+        self.assertEqual(r.data['ai_status'], 'ok')
+        prompt = mock_client.models.generate_content.call_args.kwargs['contents']
+        self.assertIn("ID '1'", prompt)
+        self.assertNotIn("ID '3'", prompt)   # the AI is only shown the chosen plants
+        for d in r.data['designs']:
+            used = {p['plant_id'] for p in d['plants'] if not p.get('is_existing')}
+            self.assertTrue(used, d['design_name'])
+            self.assertLessEqual(used, {'1', '2'}, d['design_name'])
+
+    def test_no_choice_means_the_whole_catalog(self):
+        r = self.client.post(self.url, {**self.valid, 'preferred_plant_ids': []}, format='json')
+        self.assertEqual(r.status_code, 200, r.data)
+        used = {p['plant_id'] for d in r.data['designs'] for p in d['plants'] if not p.get('is_existing')}
+        self.assertGreater(len(used), 2)
+
+    def test_chosen_plants_that_are_sold_out(self):
+        from apps.library.models import InventoryItem
+        InventoryItem.objects.filter(id=2).update(stock_quantity=0)
+        r = self.client.post(self.url, {**self.valid, 'preferred_plant_ids': ['1', '2']}, format='json')
+        self.assertEqual(r.status_code, 200, r.data)
+        for d in r.data['designs']:
+            self.assertIn('Left out Fern: not available right now', ' '.join(d['adjustments']), d['design_name'])
+            self.assertLessEqual({p['plant_id'] for p in d['plants'] if not p.get('is_existing')}, {'1'})
+        InventoryItem.objects.filter(id=1).update(stock_quantity=0)
+        r = self.client.post(self.url, {**self.valid, 'preferred_plant_ids': ['1', '2'], 'seed': 2}, format='json')
+        self.assertEqual(r.status_code, 400)
+        self.assertIn('None of the plants you chose are available', r.data['error'])
+
+    # ── garden features (seating, accent rocks) ───────────────────────────────
+    def _features_setup(self):
+        from apps.library.models import InventoryItem
+        InventoryItem.objects.create(id=50, name='Outdoor bench', category='furniture', unit_price=3000,
+                                     stock_quantity=4, real_world_size=0.8, model_file='outdoor_bench.glb')
+        InventoryItem.objects.create(id=51, name='Volcanic rock', category='hardscape', unit_price=500,
+                                     stock_quantity=20, real_world_size=0.6, model_file='volcanic_rock.glb')
+
+    @patch.dict(os.environ, {'GEMINI_API_KEY': 'your_gemini_api_key_here'})
+    def test_features_are_placed_priced_and_keep_a_walkway(self):
+        from dataclasses import replace
+        from apps.library import layout_engine as E
+        from apps.library.models import InventoryItem, PricingSettings
+        from apps.library.pricing import installed_price, plant_budget_from_all_in
+        self._features_setup()
+        r = self.client.post(self.url, {**self.valid, 'features': [{'id': 50, 'quantity': 2}, {'id': 51, 'quantity': 3}]},
+                             format='json')
+        self.assertEqual(r.status_code, 200, r.data)
+        ps = PricingSettings.current()
+        items = list(InventoryItem.objects.filter(category='plant'))
+        feats = list(InventoryItem.objects.filter(id__in=[50, 51]))
+        specs = [replace(s, price=installed_price(ps, i)) for s, i in zip(E.specs_from_inventory(items), items)]
+        specs += [replace(s, price=installed_price(ps, i)) for s, i in zip(E.feature_specs_from_inventory(feats), feats)]
+        site = E.Site(10, 12)
+        for d in r.data['designs']:
+            plants = [p for p in d['plants'] if not p.get('is_existing')]
+            ids = [p['plant_id'] for p in plants]
+            self.assertEqual((ids.count('50'), ids.count('51')), (2, 3), d['design_name'])
+            self.assertEqual(E.check(plants, specs, site, plant_budget_from_all_in(80000, 120, ps)), [], d['design_name'])
+            rows = {row['plant_id']: row for row in d['plant_breakdown']}
+            self.assertEqual(rows['50']['quantity'], 2)
+            self.assertEqual(rows['50']['category'], 'furniture')
+            order = [row['category'] for row in d['plant_breakdown']]
+            self.assertEqual(order, sorted(order, key=['plant', 'hardscape', 'furniture'].index))
+            self.assertEqual(rows['51']['subtotal'], 1500)
+            self.assertLessEqual(d['cost_breakdown']['total'], 80000 + 2)
+
+    def test_feature_requests_are_validated(self):
+        self._features_setup()
+        for features, msg in [([{'id': 50, 'quantity': 3}], 'at most 2 seats'),
+                              ([{'id': 1, 'quantity': 1}], 'no longer available'),   # a plant isn't a feature
+                              ([{'id': 51, 'quantity': 10}], 'between 1 and 9'),
+                              ([{'quantity': 1}], 'numeric id')]:
+            r = self.client.post(self.url, {**self.valid, 'features': features}, format='json')
+            self.assertEqual(r.status_code, 400, features)
+            self.assertIn(msg, r.data['error'])
+
+    def test_features_that_dont_fit_are_reported(self):
+        from apps.library import layout_engine as E
+        plants = [E.PlantSpec('p', 'Palm', 500, 20, 4.0, E.spacing_for(4.0))]
+        seat = E.PlantSpec('s', 'Bench', 300, 5, 0.8, E.SEAT_PAD, kind='seat')
+        d = E.generate('Lush / Organic', plants, E.Site(3, 3), 5000, features=[(seat, 2)])
+        self.assertEqual(sum(p['plant_id'] == 's' for p in d['plants']), 1)   # a 3 m lot fits one seat
+        self.assertIn('Left out 1 garden feature (Bench)', d['feature_notes'][0])
+
+    def test_shade_plants_are_planted_in_shade(self):
+        from apps.library import layout_engine as E
+        specs = [E.PlantSpec('palm', 'Palm', 500, 20, 4.0, E.spacing_for(4.0)),
+                 E.PlantSpec('lily', 'Peace Lily', 250, 40, 0.6, 0.45, 'full_shade', 'high')]
+        site = E.Site(10, 12)
+        for style in E.STYLES:
+            plants = E.generate(style, specs, site, 30000, ['lily'], seed=3)['plants']
+            lilies = [p for p in plants if p['plant_id'] == 'lily']
+            self.assertTrue(lilies, style)
+            # Not in the sunny front border: (nearly) every shade plant sits beside a tall plant
+            palms = [p for p in plants if p['plant_id'] == 'palm']
+            shaded = [q for q in lilies if any(math.hypot(q['x'] - t['x'], q['z'] - t['z']) <= 3.0 for t in palms)]
+            self.assertGreaterEqual(len(shaded), 0.8 * len(lilies), style)
+
+    def test_compatibility_warnings(self):
+        from apps.library.compatibility import evaluate_plant_compatibility, format_compatibility_prompt_note
+        plants = [{'id': 1, 'name': 'Plumeria', 'water_need': 'low', 'real_world_size': 2.0},
+                  {'id': 2, 'name': 'Banana', 'water_need': 'high', 'real_world_size': 3.5},
+                  {'id': 3, 'name': 'Bamboo', 'is_invasive': True, 'real_world_size': 5.0},
+                  {'id': 4, 'name': 'Geranium', 'water_need': 'low', 'real_world_size': 0.4},
+                  {'id': 5, 'name': 'Fern', 'sunlight': 'full_shade', 'real_world_size': 1.0}]
+        ids = {w['id'] for w in evaluate_plant_compatibility(plants)}
+        self.assertEqual(ids, {'moisture_conflict', 'sunlight_conflict', 'invasive_roots', 'canopy_shading'})
+        self.assertEqual(evaluate_plant_compatibility(plants[:1]), [])
+        self.assertEqual(evaluate_plant_compatibility([plants[0], plants[3]]), [])  # both low water: fine
+        self.assertIn('Banana', format_compatibility_prompt_note(evaluate_plant_compatibility(plants[:2])))
+
+    @patch.dict(os.environ, {'GEMINI_API_KEY': 'your_gemini_api_key_here'})
+    def test_conflicting_preferred_plants_still_generate_with_warnings(self):
+        from apps.library.models import InventoryItem
+        InventoryItem.objects.filter(id=2).update(water_need='high')
+        InventoryItem.objects.filter(id=4).update(water_need='low')
+        r = self.client.post(self.url, {**self.valid, 'preferred_plant_ids': ['2', '4']}, format='json')
+        self.assertEqual(r.status_code, 200, r.data)
+        self.assertEqual([w['id'] for w in r.data['compatibility_warnings']], ['moisture_conflict'])
+        self._assert_three_valid_designs(r.data)  # check() includes the watering-zone gap
 
     @patch.dict(os.environ, {'GEMINI_API_KEY': 'your_gemini_api_key_here'})
     def test_budget_too_small_for_the_site_says_what_it_takes(self):
@@ -701,7 +857,11 @@ class ProjectHubTests(APITestCase):
     def test_track_record_counts_real_jobs_and_hides_private_credentials(self):
         import datetime
         from apps.library.models import BusinessCredential
-        self._sign_off()
+        project = self._sign_off()
+        design = project.booking.design
+        design.plant_breakdown = design.plant_breakdown + [   # a bench isn't a plant installed
+            {'plant_id': '998', 'name': 'Outdoor bench', 'quantity': 2, 'category': 'furniture'}]
+        design.save(update_fields=['plant_breakdown'])
         today = datetime.date.today()
         BusinessCredential.objects.create(kind='permit', title="Mayor's Permit", issuer='City of Lucena',
                                           reference_no='MP-123', expires_on=today + datetime.timedelta(days=200))
@@ -1762,6 +1922,27 @@ class InventoryUploadTests(APITestCase):
         self.item.refresh_from_db()
         self.assertTrue(self.item.thumbnail and self.item.model_file)
         self.assertEqual(self.item.stock_quantity, 10)
+
+    def test_growth_heights_are_checked(self):
+        self._as(self.office)
+        self.item.real_world_size = 3.5
+        self.item.save()
+        ok = self.client.patch(self.url, {'planting_height': '1.2', 'mature_height': '4'}, format='multipart')
+        self.assertEqual(ok.status_code, 200, ok.data)
+        self.assertEqual((ok.data['planting_height'], ok.data['mature_height']), (1.2, 4.0))
+        # Empty = unknown
+        cleared = self.client.patch(self.url, {'planting_height': ''}, format='multipart')
+        self.assertEqual(cleared.status_code, 200, cleared.data)
+        self.assertIsNone(cleared.data['planting_height'])
+        # At planting can't be taller than at 2 years; fully grown can't be shorter
+        bad = self.client.patch(self.url, {'planting_height': 5, 'mature_height': 2}, format='json')
+        self.assertEqual(bad.status_code, 400)
+        self.assertEqual(set(bad.data), {'planting_height', 'mature_height'})
+        self.assertEqual(self.client.patch(self.url, {'mature_height': 99}, format='json').status_code, 400)
+        # Not a plant: growth heights don't apply
+        r = self.client.patch(self.url, {'category': 'furniture', 'mature_height': 6}, format='json')
+        self.assertEqual(r.status_code, 200, r.data)
+        self.assertIsNone(r.data['mature_height'])
 
     def test_bad_models_and_files_are_rejected(self):
         self._as(self.office)

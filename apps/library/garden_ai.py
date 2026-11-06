@@ -154,7 +154,7 @@ class ZoneScanThrottle(StaffExemptThrottle):
 # Gemini call
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _system_instruction(specs, keep_clear_cells):
+def _system_instruction(specs, keep_clear_cells, has_features=False):
     instruction = (
         "You are an expert tropical landscape architect. Your primary goal is to maximise plant density "
         "within the user's budget — treat the budget as a TARGET, not a ceiling. Aim for at least 75% of it "
@@ -164,13 +164,19 @@ def _system_instruction(specs, keep_clear_cells):
         f"Use integer grid indices: gx 0..{GRID_COLS - 1} (left → right), gz 0..{GRID_ROWS - 1} where "
         "gz 0 is the BACK of the garden (furthest from the viewer) and gz 19 the FRONT. Put tall plants "
         "towards the back and low plants towards the front.\n"
+        "COMPATIBILITY: keep low-water and high-water plants in separate beds, keep aggressive spreaders "
+        "(AGGRESSIVE ROOTS, e.g. bamboo) at the back with a buffer around them, and keep low full-sun plants "
+        "out from under tall plants. Shade-loving plants go beside or under taller plants.\n"
         "SPACING: keep plants at least their listed spacing apart (centre to centre) and never stack two "
         "plants in one cell. STOCK: never use more of a plant than its stock.\n"
         "Rotation must be between 0 and 360 degrees.\n\n"
     )
     if keep_clear_cells:
         cells = ', '.join(f'({gx},{gz})' for gx, gz in sorted(keep_clear_cells))
-        instruction += (f"KEEP-CLEAR CELLS — existing paths, pools or structures, DO NOT PLANT HERE: {cells}\n\n")
+        instruction += (f"KEEP-CLEAR CELLS — existing paths, pools or structures"
+                        + (", plus the customer's seating spot, its walkway and accent rocks (already placed)"
+                           if has_features else '')
+                        + f", DO NOT PLANT HERE: {cells}\n\n")
     instruction += (
         "REASONING (MANDATORY): 1-2 sentences on plant choice, layout, spacing and budget.\n"
         "COST BREAKDOWN (MANDATORY): plant_id, name, quantity, unit_price, subtotal; subtotals sum to total_cost.\n"
@@ -179,10 +185,12 @@ def _system_instruction(specs, keep_clear_cells):
     return instruction
 
 
-def _user_prompt(specs, catalog_items, plant_budget, lot_w, lot_l, preferred_ids, site_features, installed=True):
+def _user_prompt(specs, catalog_items, plant_budget, lot_w, lot_l, preferred_ids, site_features, installed=True,
+                 compat_note=''):
     desc = {str(i.id): i.description for i in catalog_items}
     catalog = '\n'.join(
-        f"- ID '{s.id}': {s.name} — ₱{s.price}{' installed' if installed else ''}, height {s.height:g} m ({s.layer}), "
+        f"- ID '{s.id}': {s.name} — ₱{s.price}{' installed' if installed else ''}, height {s.height:g} m now, {s.grown:g} m fully grown ({s.layer}), "
+        f"sun: {s.sunlight}, water: {s.water_need}{', AGGRESSIVE ROOTS' if s.is_invasive else ''}, "
         f"spacing {s.spacing:g} m, stock {s.stock}" + (f" ({desc[s.id]})" if desc.get(s.id) else '')
         for s in specs
     )
@@ -193,8 +201,10 @@ def _user_prompt(specs, catalog_items, plant_budget, lot_w, lot_l, preferred_ids
         + (f"Planting budget (installed prices, i.e. plant + planting labour): " if installed else "Plant budget: ")
         + f"spend between ₱{floor} and ₱{plant_budget}.\n"
         f"Lot: {lot_w:g} m wide × {lot_l:g} m deep; one grid cell is {cell_w:.2f} m × {cell_l:.2f} m.\n"
-        f"Preferred plant IDs (prioritise): {json.dumps([str(p) for p in preferred_ids])}\n"
+        + ("The customer chose every plant in this catalog: use ONLY these plant IDs, no others.\n"
+           if preferred_ids else "Choose freely from the catalog.\n")
         + (f"Site features from the customer's photo: {site_features}.\n" if site_features else '')
+        + compat_note
         + f"Generate exactly ONE '{AI_STYLE}' design. Set design_name to '{AI_STYLE}'."
     )
 
@@ -277,6 +287,48 @@ def _cache_key(*parts):
     return 'layouts:' + hashlib.md5(json.dumps(parts, sort_keys=True, default=str).encode()).hexdigest()
 
 
+FEATURE_CATEGORIES = ('furniture', 'hardscape')
+MAX_SEATS, MAX_ROCKS, MAX_FEATURE_KINDS = 2, 9, 4
+
+
+def _parse_features(value):
+    """[{id, quantity}] → {id: quantity}. Raises ValueError with a customer-readable message."""
+    out = {}
+    for entry in _parse_list(value, 'features'):
+        try:
+            fid, qty = str(int(entry['id'])), int(entry.get('quantity', 1))
+        except (KeyError, TypeError, ValueError):
+            raise ValueError('Each garden feature needs a numeric id and quantity.')
+        if not 1 <= qty <= MAX_ROCKS:
+            raise ValueError(f'Garden feature quantities must be between 1 and {MAX_ROCKS}.')
+        out[fid] = qty
+    if len(out) > MAX_FEATURE_KINDS:
+        raise ValueError(f'Choose at most {MAX_FEATURE_KINDS} kinds of garden features.')
+    return out
+
+
+def _feature_cells(specs, site, plant_budget, seed, features):
+    """Grid cells the features of the AI design will take (seat pads, walkway, rocks) — for the prompt."""
+    if not features:
+        return set()
+    layout = engine.Layout(site, list(specs) + [f for f, _ in features])
+    engine.place_features(layout, features, plant_budget, AI_STYLE, seed)
+    cells = set()
+    for p in layout.plants:
+        r = layout.specs[p['plant_id']].spacing / 2
+        gx0, gz0 = site.cell_of(max(0, p['x'] - r), max(0, p['z'] - r))
+        gx1, gz1 = site.cell_of(min(site.width - 1e-6, p['x'] + r), min(site.length - 1e-6, p['z'] + r))
+        cells.update((gx, gz) for gx in range(gx0, gx1 + 1) for gz in range(gz0, gz1 + 1))
+    if layout.path:
+        x0, x1, z0, z1 = layout.path
+        z = z0
+        while z < z1:
+            for x in (x0, (x0 + x1) / 2, x1):
+                cells.add(site.cell_of(min(site.width - 1e-6, max(0, x)), min(site.length - 1e-6, z)))
+            z += site.cell_l / 2
+    return cells
+
+
 def _parse_list(value, name):
     if value in (None, ''):
         return []
@@ -299,9 +351,12 @@ class GenerateLayoutsView(APIView):
     """
     POST /api/generate-layouts/
       budget (int, required), lot_width / lot_length (m, required),
-      preferred_plant_ids (list), keep_clear_zones (list of zone ids, confirmed by the customer),
+      preferred_plant_ids (list: when given, the designs use ONLY these plants — the customer's choice
+      is binding; empty = we choose from the whole catalog), keep_clear_zones (list of zone ids, confirmed by the customer),
       seed (int, optional — "show me other variations"), image (optional legacy: scanned for zones
-      only when keep_clear_zones isn't sent).
+      only when keep_clear_zones isn't sent),
+      features (optional list of {id, quantity}: seating from furniture, accent rocks from hardscape;
+      placed first, paid for first, at most MAX_SEATS seats and MAX_ROCKS rocks of each kind).
     Always returns 3 designs unless the request is invalid or the anti-abuse limit is hit.
     """
     permission_classes = [IsAuthenticated]
@@ -337,6 +392,7 @@ class GenerateLayoutsView(APIView):
         try:
             preferred = [str(p) for p in _parse_list(data.get('preferred_plant_ids'), 'preferred_plant_ids')]
             confirmed_zones = [str(z) for z in _parse_list(data.get('keep_clear_zones'), 'keep_clear_zones')]
+            feature_qty = _parse_features(data.get('features'))
         except ValueError as e:
             return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
         try:
@@ -347,19 +403,56 @@ class GenerateLayoutsView(APIView):
         area = lot_w * lot_l
         catalog_items = list(InventoryItem.objects.filter(category='plant', is_active=True))
         items_by_id = {str(i.id): i for i in catalog_items}
+        feature_items = {str(i.id): i for i in InventoryItem.objects.filter(
+            id__in=[int(k) for k in feature_qty], category__in=FEATURE_CATEGORIES, is_active=True).exclude(model_file='')}
+        missing = [k for k in feature_qty if k not in feature_items]
+        if missing:
+            return Response({'error': 'Some garden features are no longer available. Please pick them again.'},
+                            status=status.HTTP_400_BAD_REQUEST)
+        if sum(q for k, q in feature_qty.items() if feature_items[k].category == 'furniture') > MAX_SEATS:
+            return Response({'error': f'Choose at most {MAX_SEATS} seats for one seating spot.'},
+                            status=status.HTTP_400_BAD_REQUEST)
+        items_by_id.update(feature_items)
         if installed:
             # All-in budget: VAT, design fee, site prep, materials and mobilisation come off first;
             # the rest pays for plants *installed* (plant + planting labour).
             specs = [replace(s, price=installed_price(ps, items_by_id[s.id]))
                      for s in engine.specs_from_inventory(catalog_items)]
+            fspecs = [replace(s, price=installed_price(ps, items_by_id[s.id]))
+                      for s in engine.feature_specs_from_inventory(feature_items.values())]
 
             def to_plants(b):
                 return plant_budget_from_all_in(b, area, ps)
         else:
             specs = engine.specs_from_inventory(catalog_items)
+            fspecs = engine.feature_specs_from_inventory(feature_items.values())
 
             def to_plants(b):
                 return max(0, int(b - ps.shipping_fee))
+
+        # The customer's plant choice is binding: designs use only the chosen plants (engine, AI and repair
+        # all work from `specs`). Chosen plants that are sold out or archived are reported on every design.
+        selection_notes = []
+        if preferred:
+            chosen = [s for s in specs if s.id in set(preferred)]
+            unavailable = [items_by_id[pid].name if pid in items_by_id else None for pid in preferred
+                           if pid not in {s.id for s in chosen}]
+            if not chosen:
+                return Response({'error': 'None of the plants you chose are available right now. '
+                                          'Pick other plants, or clear your selection and we will choose for you.'},
+                                status=status.HTTP_400_BAD_REQUEST)
+            specs = chosen
+            named = sorted(n for n in unavailable if n)
+            if unavailable:
+                selection_notes.append(
+                    f"Left out {', '.join(named) if named else 'a plant you chose'}: not available right now. "
+                    "This design uses your other chosen plants.")
+
+        # Out-of-stock features drop out here (and are reported by the engine as left out)
+        features = [(f, feature_qty[f.id]) for f in fspecs]
+        features += [(engine.PlantSpec(k, i.name, int(i.unit_price) or 1, 0, 1.0, 1.0,
+                                       kind='seat' if i.category == 'furniture' else 'rock'), feature_qty[k])
+                     for k, i in feature_items.items() if k not in {f.id for f in fspecs}]
 
         # Good / better / best across the range: Minimalist at the low end, Lush at the top
         targets = {'Minimalist': budget_min, 'Symmetrical': (budget_min + budget_max) // 2, AI_STYLE: budget_max}
@@ -389,6 +482,11 @@ class GenerateLayoutsView(APIView):
                                   'Consider increasing your budget or choosing low-cost flora.')
         plant_budgets = {style: to_plants(t) for style, t in targets.items()}
 
+        # 1b. Botanical compatibility audit for preferred flora selections
+        from .compatibility import evaluate_plant_compatibility, format_compatibility_prompt_note
+        preferred_items = [items_by_id[pid] for pid in preferred if pid in items_by_id]
+        compat_warnings = evaluate_plant_compatibility(preferred_items)
+
         # 2. Keep-clear zones: the customer's confirmed choice wins; an image is scanned only as a fallback
         image = request.FILES.get('image')
         zone_scan, detected = ('customer', [{'zone': z, 'label': z} for z in confirmed_zones if z in engine.ZONES])
@@ -406,7 +504,7 @@ class GenerateLayoutsView(APIView):
 
         # 3. Anti-abuse limit, then the cache (a cached answer costs nothing)
         key = _cache_key(budget_min, budget_max, installed, round(lot_w, 1), round(lot_l, 1), sorted(preferred),
-                         sorted(keep_clear), seed, ps.updated_at)  # new rates → new estimates
+                         sorted(keep_clear), seed, ps.updated_at, sorted(feature_qty.items()))  # new rates → new estimates
         cached = cache.get(key)
         if cached is not None:
             self._log(request, 'cached', zone_scan, 0, started)
@@ -419,30 +517,38 @@ class GenerateLayoutsView(APIView):
         # 4. Engine designs (always) …
         designs = {}
         for style in ('Symmetrical', 'Minimalist'):
-            d = engine.generate(style, specs, site, plant_budgets[style], preferred, seed)
-            designs[style] = {**d, 'source': 'engine', 'adjustments': []}
+            d = engine.generate(style, specs, site, plant_budgets[style], preferred, seed, features)
+            designs[style] = {**d, 'source': 'engine', 'adjustments': selection_notes + d['feature_notes']}
 
         # … and the AI signature design when everything allows it
         ai_status, adjustments = self._ai_status(request), 0
         if ai_status == 'ok':
             try:
-                raw = call_gemini(gemini_api_key(), _system_instruction(specs, keep_clear),
+                taken = _feature_cells(specs, site, plant_budgets[AI_STYLE], seed, features)
+                raw = call_gemini(gemini_api_key(), _system_instruction(specs, keep_clear | taken, bool(features)),
                                   _user_prompt(specs, catalog_items, plant_budgets[AI_STYLE], lot_w, lot_l, preferred,
                                                ', '.join(f"{z.get('label')} ({z['zone']})" for z in detected),
-                                               installed))
+                                               installed, format_compatibility_prompt_note(compat_warnings)))
                 plants = expand_grid_coords(raw.get('plants') or [], lot_w, lot_l)
-                fixed, notes = engine.repair(plants, specs, site, plant_budgets[AI_STYLE], preferred, seed)
+                fixed, notes = engine.repair(plants, specs, site, plant_budgets[AI_STYLE], preferred, seed,
+                                             features, AI_STYLE)
                 adjustments = len(notes)
                 designs[AI_STYLE] = {
                     'design_name': AI_STYLE, 'reasoning': raw.get('reasoning', ''), 'plants': fixed,
-                    'source': 'ai', 'adjustments': notes, 'budget_note': None,
+                    'source': 'ai', 'adjustments': selection_notes + notes, 'budget_note': None,
                 }
             except Exception as e:  # noqa: BLE001
                 ai_status = trip_breaker(e)
                 ai_status = 'quota' if ai_status == 'quota' else 'error'
         if AI_STYLE not in designs:
-            d = engine.generate(AI_STYLE, specs, site, plant_budgets[AI_STYLE], preferred, seed)
-            designs[AI_STYLE] = {**d, 'source': 'engine', 'adjustments': []}
+            d = engine.generate(AI_STYLE, specs, site, plant_budgets[AI_STYLE], preferred, seed, features)
+            designs[AI_STYLE] = {**d, 'source': 'engine', 'adjustments': selection_notes + d['feature_notes']}
+
+        if preferred:
+            for d in designs.values():
+                if (d.get('budget_note') or '').startswith('Limited stock'):
+                    d['budget_note'] = ('We used all the stock of the plants you chose. Add more plants to your '
+                                        'selection for a fuller design, or our team can source more.')
 
         # 5. Price everything from the real price list, add the hidden obstacle markers
         markers = _existing_markers(detected, lot_w, lot_l)
@@ -460,6 +566,7 @@ class GenerateLayoutsView(APIView):
             'detected_zones': [{'zone': z['zone'], 'label': z.get('label', '')} for z in detected],
             'budget_range': {'min': budget_min, 'max': budget_max},
             'install': installed,
+            'compatibility_warnings': compat_warnings,
         }
         cache.set(key, payload, _CACHE_TTL)
         self._log(request, ai_status, zone_scan, adjustments, started)

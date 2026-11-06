@@ -79,6 +79,14 @@ def installed_price(ps, item):
     return int(item.unit_price + labour_rate(ps, layer_of(item)))
 
 
+CATEGORY_ORDER = {'plant': 0, 'hardscape': 1, 'furniture': 2}
+
+
+def _ordered(lines):
+    """Plants first, then garden features (rocks, then seating) — how every list shows them."""
+    return sorted(lines, key=lambda l: CATEGORY_ORDER.get(l.get('category'), 3))
+
+
 def project_estimate(counts, items_by_id, area_sqm, ps=None):
     """
     counts: {item_id(str): quantity}; items_by_id: {str(id): InventoryItem}.
@@ -94,7 +102,7 @@ def project_estimate(counts, items_by_id, area_sqm, ps=None):
             continue
         plants += item.unit_price * qty
         labour += labour_rate(ps, layer_of(item)) * qty
-        plant_lines.append({'plant_id': str(item.id), 'name': item.name, 'quantity': qty,
+        plant_lines.append({'plant_id': str(item.id), 'name': item.name, 'quantity': qty, 'category': item.category,
                             'unit_price': _peso(item.unit_price), 'subtotal': _peso(item.unit_price * qty)})
     area_d = Decimal(str(area))
     lines = [
@@ -120,7 +128,7 @@ def project_estimate(counts, items_by_id, area_sqm, ps=None):
     spread = float(ps.estimate_range_percent) / 100
     return {
         'lines': lines,
-        'plant_breakdown': plant_lines,
+        'plant_breakdown': _ordered(plant_lines),
         'plant_cost': _peso(plants),
         'total': total,
         # Ranges rounded to ₱100: an estimate shouldn't look more precise than it is
@@ -141,13 +149,15 @@ def plants_only_estimate(counts, items_by_id, ps=None):
         if item is None or qty <= 0:
             continue
         plants += item.unit_price * qty
-        plant_lines.append({'plant_id': str(item.id), 'name': item.name, 'quantity': qty,
+        plant_lines.append({'plant_id': str(item.id), 'name': item.name, 'quantity': qty, 'category': item.category,
                             'unit_price': _peso(item.unit_price), 'subtotal': _peso(item.unit_price * qty)})
-    lines = [{'key': 'plants', 'label': 'Plants from our nursery', 'amount': _peso(plants)},
+    has_features = any(l['category'] != 'plant' for l in plant_lines)
+    lines = [{'key': 'plants', 'label': 'Plants & garden features from our nursery' if has_features
+              else 'Plants from our nursery', 'amount': _peso(plants)},
              {'key': 'delivery', 'label': 'Delivery', 'amount': _peso(ps.shipping_fee)}]
     total = sum(l['amount'] for l in lines)
     # Catalog prices are exact, so there is no range to show
-    return {'lines': lines, 'plant_breakdown': plant_lines, 'plant_cost': _peso(plants), 'total': total,
+    return {'lines': lines, 'plant_breakdown': _ordered(plant_lines), 'plant_cost': _peso(plants), 'total': total,
             'low': total, 'high': total, 'is_sample_rates': ps.is_sample, 'rates': rate_snapshot(ps)}
 
 

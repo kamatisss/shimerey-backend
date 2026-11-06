@@ -142,7 +142,8 @@ class InventoryItemSerializer(serializers.ModelSerializer):
         model = InventoryItem
         fields = ['id', 'name', 'category', 'description', 'stock_quantity',
                   'unit_price', 'image_url', 'model_file', 'thumbnail', 'real_world_size', 'spacing_cm',
-                  'is_active', 'reorder_level', 'is_low_stock', 'avg_rating', 'review_count']
+                  'is_active', 'reorder_level', 'is_low_stock', 'avg_rating', 'review_count',
+                  'sunlight', 'water_need', 'is_invasive', 'planting_height', 'mature_height']
         read_only_fields = ['is_active']   # archive / restore have their own actions
 
     def get_avg_rating(self, obj):
@@ -179,6 +180,37 @@ class InventoryItemSerializer(serializers.ModelSerializer):
         if value is None or value <= 0:
             raise serializers.ValidationError('Enter a price above ₱0.')
         return value
+
+    def _height(self, value):
+        if value in (None, ''):
+            return None
+        if not (0.05 <= float(value) <= 40):
+            raise serializers.ValidationError('Enter a height between 0.05 and 40 metres, or leave it empty.')
+        return round(float(value), 2)
+
+    def validate_planting_height(self, value):
+        return self._height(value)
+
+    def validate_mature_height(self, value):
+        return self._height(value)
+
+    def validate(self, attrs):
+        # Growth heights belong to plants and must read: at planting ≤ established ≤ fully grown
+        inst = self.instance
+        category = attrs.get('category', getattr(inst, 'category', 'plant'))
+        if category != 'plant':
+            attrs['planting_height'] = attrs['mature_height'] = None
+            return attrs
+        get = lambda k: attrs[k] if k in attrs else getattr(inst, k, None)
+        planting, established, mature = get('planting_height'), get('real_world_size'), get('mature_height')
+        errors = {}
+        if planting is not None and established and planting > float(established):
+            errors['planting_height'] = 'Should be no taller than the height after about 2 years.'
+        if mature is not None and established and mature < float(established):
+            errors['mature_height'] = 'Should be at least the height after about 2 years.'
+        if errors:
+            raise serializers.ValidationError(errors)
+        return attrs
 
     def update(self, instance, validated_data):
         # Stock only changes through adjust_stock (recorded, locked); an edit form must never overwrite it

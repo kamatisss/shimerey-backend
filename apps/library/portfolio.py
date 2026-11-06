@@ -291,6 +291,8 @@ def build_track_record():
                 pass
         for row in breakdown if isinstance(breakdown, list) else []:
             try:
+                if row.get('category', 'plant') != 'plant':
+                    continue   # benches and rocks aren't plants planted
                 plants += max(0, int(row.get('quantity') or 0))
             except (AttributeError, TypeError, ValueError):
                 pass
@@ -482,7 +484,7 @@ class PortfolioPublicDetailSerializer(PortfolioPublicListSerializer):
         if not design:
             return []
         request = self.context.get('request')
-        items = list(InventoryItem.objects.only('id', 'name', 'unit_price', 'image_url', 'thumbnail', 'stock_quantity'))
+        items = list(InventoryItem.objects.only('id', 'name', 'category', 'unit_price', 'image_url', 'thumbnail', 'stock_quantity'))
         by_id = {i.id: i for i in items}
         by_name = {i.name.lower(): i for i in items}
         plants = []
@@ -500,6 +502,7 @@ class PortfolioPublicDetailSerializer(PortfolioPublicListSerializer):
             plants.append({
                 'name': name,
                 'quantity': row.get('quantity'),
+                'category': item.category if item else row.get('category', 'plant'),
                 'product_id': item.id if item else None,
                 # Shop the look — current catalog price, not what this customer paid
                 'product': {

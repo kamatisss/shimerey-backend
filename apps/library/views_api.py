@@ -1261,9 +1261,11 @@ class ServiceBookingViewSet(viewsets.ModelViewSet):
                 plant_ids = [int(r['plant_id']) for r in bom if r.get('plant_id')]
                 if plant_ids:
                     from .models import InventoryItem as _Inv
-                    for inv in _Inv.objects.filter(id__in=plant_ids).values('id', 'spacing_cm', 'real_world_size'):
+                    for inv in _Inv.objects.filter(id__in=plant_ids).values('id', 'spacing_cm', 'real_world_size', 'category'):
                         pid_int = inv['id']
-                        if inv['spacing_cm']:
+                        if inv['category'] != 'plant':
+                            spacing_map[pid_int] = '—'   # seating and rocks have no planting spacing
+                        elif inv['spacing_cm']:
                             cm_val = abs(int(inv['spacing_cm']))
                             spacing_map[pid_int] = f"{cm_val} cm OC"
                         elif str(pid_int) in nn_spacing:
@@ -1276,7 +1278,9 @@ class ServiceBookingViewSet(viewsets.ModelViewSet):
                                 spacing_map[pid_int] = f"{cm_val} cm OC"
 
                 # ── BOM table — columns: No. | Plant / Item | Qty | Spacing | Unit | Total ──
-                story.append(Paragraph('PLANT BILL OF MATERIALS', H2))
+                has_features = any(r.get('category', 'plant') != 'plant' for r in bom)
+                story.append(Paragraph('BILL OF MATERIALS — PLANTS & GARDEN FEATURES' if has_features
+                                       else 'PLANT BILL OF MATERIALS', H2))
                 # Width proportions: No.(0.05) | Name(0.33) | Qty(0.08) | Spacing(0.18) | Unit(0.18) | Total(0.18)
                 cw = [col_full * r for r in (0.05, 0.33, 0.08, 0.18, 0.18, 0.18)]
                 bom_headers = [
