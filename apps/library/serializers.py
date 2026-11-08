@@ -101,7 +101,7 @@ class UserSerializer(serializers.ModelSerializer):
 
 
 # Change this (and the date on the frontend's /privacy page) whenever the privacy notice changes
-PRIVACY_POLICY_VERSION = '2026-10-23'
+PRIVACY_POLICY_VERSION = '2026-11-07.2'   # + live crew location on shift (change with PrivacyPolicy.jsx PRIVACY_UPDATED)
 
 
 class RegisterSerializer(UserSerializer):
@@ -143,7 +143,8 @@ class InventoryItemSerializer(serializers.ModelSerializer):
         fields = ['id', 'name', 'category', 'description', 'stock_quantity',
                   'unit_price', 'image_url', 'model_file', 'thumbnail', 'real_world_size', 'spacing_cm',
                   'is_active', 'reorder_level', 'is_low_stock', 'avg_rating', 'review_count',
-                  'sunlight', 'water_need', 'is_invasive', 'planting_height', 'mature_height']
+                  'sunlight', 'water_need', 'is_invasive', 'planting_height', 'mature_height',
+                  'planting_spread', 'established_spread', 'mature_spread']
         read_only_fields = ['is_active']   # archive / restore have their own actions
 
     def get_avg_rating(self, obj):
@@ -194,12 +195,29 @@ class InventoryItemSerializer(serializers.ModelSerializer):
     def validate_mature_height(self, value):
         return self._height(value)
 
+    def _spread(self, value):
+        if value in (None, ''):
+            return None
+        if not (0.05 <= float(value) <= 40):
+            raise serializers.ValidationError('Enter a width between 0.05 and 40 metres, or leave it empty.')
+        return round(float(value), 2)
+
+    def validate_planting_spread(self, value):
+        return self._spread(value)
+
+    def validate_established_spread(self, value):
+        return self._spread(value)
+
+    def validate_mature_spread(self, value):
+        return self._spread(value)
+
     def validate(self, attrs):
         # Growth heights belong to plants and must read: at planting ≤ established ≤ fully grown
         inst = self.instance
         category = attrs.get('category', getattr(inst, 'category', 'plant'))
         if category != 'plant':
             attrs['planting_height'] = attrs['mature_height'] = None
+            attrs['planting_spread'] = attrs['established_spread'] = attrs['mature_spread'] = None
             return attrs
         get = lambda k: attrs[k] if k in attrs else getattr(inst, k, None)
         planting, established, mature = get('planting_height'), get('real_world_size'), get('mature_height')
@@ -208,6 +226,14 @@ class InventoryItemSerializer(serializers.ModelSerializer):
             errors['planting_height'] = 'Should be no taller than the height after about 2 years.'
         if mature is not None and established and mature < float(established):
             errors['mature_height'] = 'Should be at least the height after about 2 years.'
+        # Width reads the same way: at planting ≤ after 2 years ≤ fully grown
+        ps, es, ms = get('planting_spread'), get('established_spread'), get('mature_spread')
+        if ps is not None and es is not None and ps > es:
+            errors['planting_spread'] = 'Should be no wider than the width after about 2 years.'
+        if ms is not None and es is not None and ms < es:
+            errors['mature_spread'] = 'Should be at least the width after about 2 years.'
+        if (ps is not None or ms is not None) and es is None:
+            errors['established_spread'] = 'Needed with the other widths: the 3D view grows from this one.'
         if errors:
             raise serializers.ValidationError(errors)
         return attrs
@@ -311,6 +337,9 @@ class ServiceBookingSerializer(serializers.ModelSerializer):
         many=True,
         required=False,
     )
+    # The site address goes in as one structured, pinned `address` (addresses.clean_address) and comes
+    # back as service_address (text) + site_lat/site_lng + address_detail, which are never written directly
+    address = serializers.JSONField(write_only=True, required=False)
 
     class Meta:
         model = ServiceBooking
@@ -318,17 +347,17 @@ class ServiceBookingSerializer(serializers.ModelSerializer):
             'id', 'user', 'customer_name', 'customer_email',
             'service_type', 'scheduled_date', 'status',
             'contact_number', 'preferred_time', 'service_address', 'notes',
-            'site_lat', 'site_lng',
+            'site_lat', 'site_lng', 'address', 'address_detail',
             'assigned_crew', 'assigned_crew_names',
             'design', 'design_details', 'clock_out_photo_url',
             'milestones', 'progress_pct', 'staff_notes',
-            'project_milestones', 'tracker', 'sign_off_blockers', 'materials', 'crew_on_way_at',
+            'project_milestones', 'tracker', 'sign_off_blockers', 'materials', 'crew_on_way_at', 'crew_arrived_at',
             'created_at', 'updated_at',
         ]
         read_only_fields = [
             'id', 'user', 'customer_name', 'customer_email',
             'assigned_crew_names', 'created_at', 'updated_at',
-            'crew_on_way_at',
+            'crew_on_way_at', 'crew_arrived_at', 'service_address', 'site_lat', 'site_lng', 'address_detail',
             'design_details', 'clock_out_photo_url', 'tracker',
         ]
 
@@ -377,9 +406,32 @@ class ServiceBookingSerializer(serializers.ModelSerializer):
                         pass
                 if not is_authorized:
                     raise serializers.ValidationError({"assigned_crew": "Only Office Admins can assign or change crew."})
+        from . import addresses
+        if 'address' in attrs:
+            try:
+                attrs['address'] = addresses.clean_address(attrs['address'])
+            except addresses.AddressError as e:
+                raise serializers.ValidationError({'address': str(e)})
+        elif self.instance is None:
+            # A new booking needs a pinned site: the crew navigates to it and checks in against it
+            raise serializers.ValidationError({'address': 'Choose your town and barangay, and pin your location on the map.'})
         return super().validate(attrs)
 
+    def create(self, validated_data):
+        from . import addresses
+        detail = validated_data.pop('address')
+        booking = ServiceBooking(**{k: v for k, v in validated_data.items() if k != 'assigned_crew'})
+        addresses.apply_to_booking(booking, detail)
+        booking.save()
+        if validated_data.get('assigned_crew'):
+            booking.assigned_crew.set(validated_data['assigned_crew'])
+        return booking
+
     def update(self, instance, validated_data):
+        from . import addresses
+        detail = validated_data.pop('address', None)
+        if detail is not None:
+            addresses.apply_to_booking(instance, detail)
         assigned_crew = validated_data.pop('assigned_crew', None)
         instance = super().update(instance, validated_data)
         if assigned_crew is not None:
@@ -474,10 +526,12 @@ class OrderSerializer(serializers.ModelSerializer):
     class Meta:
         model = Order
         fields = ['id', 'customer_name', 'customer_email', 'customer_phone', 'customer_address',
+                  'delivery_lat', 'delivery_lng', 'address_detail', 'crew_arrived_at',
                   'booking_date', 'total_price', 'payment_method', 'status', 'payment_status', 'created_at', 'items',
                   'next_statuses', 'needs_refund',
                   'delivery_crew', 'delivery_crew_name', 'delivered_by_name', 'delivered_at']
-        read_only_fields = ['delivery_crew', 'delivered_at']
+        read_only_fields = ['delivery_crew', 'delivered_at', 'customer_address', 'delivery_lat', 'delivery_lng',
+                            'address_detail', 'crew_arrived_at']
 
     def get_next_statuses(self, obj):
         return order_next_statuses(obj)
@@ -671,6 +725,11 @@ class AttendanceSerializer(serializers.ModelSerializer):
     staff_name = serializers.SerializerMethodField(read_only=True)
     booking_label = serializers.SerializerMethodField(read_only=True)
     total_hours = serializers.ReadOnlyField()
+    # Set when the owner closed a shift the crew member forgot to end (AttendanceViewSet.close_shift)
+    closed_by_name = serializers.SerializerMethodField(read_only=True)
+
+    def get_closed_by_name(self, obj):
+        return (obj.closed_by.get_full_name() or obj.closed_by.username) if obj.closed_by_id else ''
 
     class Meta:
         model = Attendance
@@ -679,9 +738,9 @@ class AttendanceSerializer(serializers.ModelSerializer):
             'clock_in_time', 'clock_out_time',
             'clock_in_photo_url', 'clock_out_photo_url',
             'latitude', 'longitude', 'total_hours',
-            'clock_in_address', 'clock_out_address'
+            'clock_in_address', 'clock_out_address', 'closed_by_name', 'close_note',
         ]
-        read_only_fields = ['id', 'staff', 'clock_in_time', 'clock_out_time']
+        read_only_fields = ['id', 'staff', 'clock_in_time', 'clock_out_time', 'close_note']
 
     def get_staff_name(self, obj):
         if obj.staff:

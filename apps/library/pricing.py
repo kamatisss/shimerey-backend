@@ -3,12 +3,15 @@ Rate-card pricing — one place that turns a garden into a price.
 
   GET   /api/pricing/            anyone: current rates (shop delivery fee, estimate basis)
   PATCH /api/pricing/            office admin: update rates (clears the "sample rates" flag)
-  POST  /api/pricing/estimate/   anyone: {items: [{product_id, quantity}], area_sqm} → estimate
+  POST  /api/pricing/estimate/   anyone: {items: [{product_id, quantity}], area_sqm, lawn_sqm?, new_lawn?, scope?, install?} → estimate
   GET   /api/pricing/quick/      anyone: ?area_sqm&fullness&mode → estimate for a typical planting of that yard
 
 An estimate is built from transparent lines:
   plants (catalog prices) + planting/placing labour (per item, by size)
-  + site preparation and materials (per m²) + mobilisation
+  + ground work, by scope:
+      makeover  the full garden: site preparation (per m²), soil & mulch on the beds, turf on a new lawn
+      existing  planting into the customer's existing garden: compost & soil per planting hole, no ground work
+  + mobilisation
   → subtotal + design & project management fee (%) → minimum project charge → VAT (if registered)
 Shown as a range (± estimate_range_percent): the final price is confirmed after site inspection.
 """
@@ -25,9 +28,11 @@ from .models import InventoryItem, PricingSettings
 
 RATE_FIELDS = [
     'planting_tall', 'planting_mid', 'planting_low', 'install_other', 'site_prep_per_sqm', 'materials_per_sqm',
-    'mobilization_fee', 'design_fee_percent', 'minimum_project', 'estimate_range_percent', 'vat_percent',
-    'shipping_fee', 'cod_max_amount',
+    'turf_per_sqm', 'compost_per_plant', 'mobilization_fee', 'design_fee_percent', 'minimum_project',
+    'estimate_range_percent', 'vat_percent', 'shipping_fee', 'cod_max_amount',
 ]
+MAKEOVER, EXISTING = 'makeover', 'existing'
+SCOPES = (MAKEOVER, EXISTING)
 PERCENT_FIELDS = {'design_fee_percent', 'estimate_range_percent', 'vat_percent'}
 
 
@@ -55,28 +60,49 @@ def labour_rate(ps, layer):
     return {'tall': ps.planting_tall, 'mid': ps.planting_mid, 'low': ps.planting_low}.get(layer, ps.install_other)
 
 
-def fixed_costs(ps, area_sqm):
-    """Costs that don't depend on what is planted."""
-    area = Decimal(str(max(0.0, float(area_sqm or 0))))
-    return (ps.site_prep_per_sqm + ps.materials_per_sqm) * area + ps.mobilization_fee
+def ground_areas(area_sqm, lawn_sqm=0, new_lawn=True):
+    """
+    (prepared m², bed m², new-turf m²) for a garden of area_sqm with an open lawn of lawn_sqm.
+    Beds get soil, compost and mulch; a new lawn gets turf; keeping the existing grass leaves the
+    lawn untouched (no site preparation or turf there). No lawn: the whole area is beds (as before).
+    """
+    area = max(0.0, float(area_sqm or 0))
+    lawn = min(area, max(0.0, float(lawn_sqm or 0)))
+    beds = area - lawn
+    return (area if new_lawn else beds), beds, (lawn if new_lawn else 0.0)
 
 
-def plant_budget_from_all_in(budget, area_sqm, ps=None):
+def fixed_costs(ps, area_sqm, lawn_sqm=0, new_lawn=True, scope=MAKEOVER):
+    """Costs that don't depend on what is planted. Planting into an existing garden: mobilisation only
+    (its compost is per planting hole, in installed_price)."""
+    if scope == EXISTING:
+        return Decimal(ps.mobilization_fee)
+    prepared, beds, turf = (Decimal(str(round(a, 2))) for a in ground_areas(area_sqm, lawn_sqm, new_lawn))
+    return ps.site_prep_per_sqm * prepared + ps.materials_per_sqm * beds + ps.turf_per_sqm * turf + ps.mobilization_fee
+
+
+def plant_budget_from_all_in(budget, area_sqm, ps=None, lawn_sqm=0, new_lawn=True, scope=MAKEOVER):
     """
     How much of an all-in budget is left for plants *including their planting labour*,
-    after VAT, the design fee, site preparation, materials and mobilisation.
+    after VAT, the design fee, the ground work for this scope, and mobilisation.
     """
     ps = ps or PricingSettings.current()
     budget = Decimal(str(budget))
     if ps.vat_registered:
         budget /= (1 + ps.vat_percent / 100)
     budget /= (1 + ps.design_fee_percent / 100)
-    return max(0, int(budget - fixed_costs(ps, area_sqm)))
+    return max(0, int(budget - fixed_costs(ps, area_sqm, lawn_sqm, new_lawn, scope)))
 
 
-def installed_price(ps, item):
-    """Catalog price + the labour to plant/place it — what one more plant really costs."""
-    return int(item.unit_price + labour_rate(ps, layer_of(item)))
+def compost_for(ps, item, scope):
+    """Compost & soil for one planting hole: plants going into an existing garden (no bed-wide soil)."""
+    return ps.compost_per_plant if scope == EXISTING and item.category == 'plant' else Decimal(0)
+
+
+def installed_price(ps, item, scope=MAKEOVER):
+    """Catalog price + the labour to plant/place it (+ its planting-hole compost when planting into an
+    existing garden) — what one more plant really costs."""
+    return int(item.unit_price + labour_rate(ps, layer_of(item)) + compost_for(ps, item, scope))
 
 
 CATEGORY_ORDER = {'plant': 0, 'hardscape': 1, 'furniture': 2}
@@ -87,14 +113,20 @@ def _ordered(lines):
     return sorted(lines, key=lambda l: CATEGORY_ORDER.get(l.get('category'), 3))
 
 
-def project_estimate(counts, items_by_id, area_sqm, ps=None):
+def project_estimate(counts, items_by_id, area_sqm, ps=None, lawn_sqm=0, new_lawn=True, scope=MAKEOVER):
     """
     counts: {item_id(str): quantity}; items_by_id: {str(id): InventoryItem}.
+    lawn_sqm: the design's open lawn (turf instead of soil & mulch); new_lawn False = keep the existing grass.
+    scope: 'makeover' (the full garden: site prep, bed soil, turf) or 'existing' (planting into an existing
+    garden: compost per planting hole, no ground work).
     Returns lines, totals and the rates used (a snapshot for saving with a design).
     """
     ps = ps or PricingSettings.current()
     area = max(0.0, float(area_sqm or 0))
-    plants = labour = Decimal(0)
+    prepared, beds, turf = ground_areas(area, lawn_sqm, new_lawn)
+    has_lawn = float(lawn_sqm or 0) > 0
+    plants = labour = compost = Decimal(0)
+    holes = 0
     plant_lines = []
     for pid, qty in counts.items():
         item = items_by_id.get(str(pid))
@@ -102,16 +134,29 @@ def project_estimate(counts, items_by_id, area_sqm, ps=None):
             continue
         plants += item.unit_price * qty
         labour += labour_rate(ps, layer_of(item)) * qty
+        compost += compost_for(ps, item, scope) * qty
+        holes += qty if item.category == 'plant' else 0
         plant_lines.append({'plant_id': str(item.id), 'name': item.name, 'quantity': qty, 'category': item.category,
                             'unit_price': _peso(item.unit_price), 'subtotal': _peso(item.unit_price * qty)})
-    area_d = Decimal(str(area))
+    d = lambda v: Decimal(str(round(v, 2)))  # noqa: E731
     lines = [
         {'key': 'plants', 'label': 'Plants & materials from our nursery', 'amount': _peso(plants)},
         {'key': 'labour', 'label': 'Planting & installation labour', 'amount': _peso(labour)},
-        {'key': 'site_prep', 'label': f'Site preparation ({area:g} m²)', 'amount': _peso(ps.site_prep_per_sqm * area_d)},
-        {'key': 'materials', 'label': f'Soil, compost & mulch ({area:g} m²)', 'amount': _peso(ps.materials_per_sqm * area_d)},
-        {'key': 'mobilization', 'label': 'Crew mobilisation & delivery', 'amount': _peso(ps.mobilization_fee)},
     ]
+    if scope == EXISTING:
+        if holes:
+            lines.append({'key': 'compost', 'label': f'Compost & soil for each planting hole ({holes} plants)',
+                          'amount': _peso(compost)})
+    else:
+        lines += [
+            {'key': 'site_prep', 'label': f'Site preparation ({prepared:g} m²)', 'amount': _peso(ps.site_prep_per_sqm * d(prepared))},
+            {'key': 'materials', 'label': f"Soil, compost & mulch{' for the beds' if has_lawn else ''} ({round(beds, 1):g} m²)",
+             'amount': _peso(ps.materials_per_sqm * d(beds))},
+        ]
+    if turf and scope != EXISTING:
+        lines.append({'key': 'turf', 'label': f'New lawn: grass laid ({round(turf, 1):g} m²)',
+                      'amount': _peso(ps.turf_per_sqm * d(turf))})
+    lines.append({'key': 'mobilization', 'label': 'Crew mobilisation & delivery', 'amount': _peso(ps.mobilization_fee)})
     subtotal = sum(Decimal(l['amount']) for l in lines)
     fee = subtotal * ps.design_fee_percent / 100
     lines.append({'key': 'design_fee', 'label': f'Design & project management ({float(ps.design_fee_percent):g}%)',
@@ -136,6 +181,7 @@ def project_estimate(counts, items_by_id, area_sqm, ps=None):
         'high': int(round(total * (1 + spread), -2)),
         'is_sample_rates': ps.is_sample,
         'rates': rate_snapshot(ps),
+        'scope': scope,
     }
 
 
@@ -185,7 +231,7 @@ def _round_to(value, step, up):
     return int((math.ceil if up else math.floor)(value / step) * step)
 
 
-def suggest_range(area_sqm, installed=True, ps=None):
+def suggest_range(area_sqm, installed=True, ps=None, scope=MAKEOVER):
     """
     A realistic budget range for a garden of this size, from the rate card and catalog:
     a light planting (~0.25 plants/m², cheaper plants) to a full one (~0.6 plants/m²).
@@ -195,12 +241,12 @@ def suggest_range(area_sqm, installed=True, ps=None):
     if not plants:
         return None
     area = max(1.0, float(area_sqm))
-    unit = sorted(float(installed_price(ps, i) if installed else i.unit_price) for i in plants)
+    unit = sorted(float(installed_price(ps, i, scope) if installed else i.unit_price) for i in plants)
     cheap = unit[: max(1, len(unit) // 2)]
     light = area * 0.25 * cheap[len(cheap) // 2]
     full = area * 0.6 * (sum(unit) / len(unit))
     if installed:
-        base = float(fixed_costs(ps, area))
+        base = float(fixed_costs(ps, area, scope=scope))
         low = float(_apply_fee_vat(base + light, ps))
         high = float(_apply_fee_vat(base + full, ps))
         floor = float(ps.minimum_project) * (1 + float(ps.vat_percent) / 100 if ps.vat_registered else 1)
@@ -254,19 +300,90 @@ def _apply_fee_vat(amount, ps):
 # Views
 # ─────────────────────────────────────────────────────────────────────────────
 
+
+CAPACITY_CACHE_S = 600
+
+
+def yard_capacity(width, length, installed=True, scope=MAKEOVER, new_lawn=True, ps=None):
+    """
+    What this yard's planting beds can hold at healthy spacing, and what that costs: the layout engine
+    plants each style with no budget limit and keeps the fullest (the open lawn stays open). A budget above this can't
+    be spent on plants — the designs stop when the beds are full. Returns
+    {plants, plant_cost, total} (total: all-in when installed, plants + delivery when not), or None.
+    """
+    from django.core.cache import cache
+    from . import layout_engine as engine
+    ps = ps or PricingSettings.current()
+    items = [i for i in InventoryItem.objects.filter(category='plant', is_active=True, stock_quantity__gt=0) if i.unit_price > 0]
+    if not items:
+        return None
+    import hashlib
+    raw = '|'.join(map(str, (round(width, 1), round(length, 1), installed, scope, new_lawn, ps.updated_at,
+                             sorted((i.id, str(i.unit_price), i.stock_quantity) for i in items))))
+    key = 'capacity:' + hashlib.md5(raw.encode()).hexdigest()   # short and safe for any cache backend
+    hit = cache.get(key)
+    if hit is not None:
+        return hit
+    by_id = {str(i.id): i for i in items}
+    specs = [s for s in engine.specs_from_inventory(items)]
+    if installed:
+        from dataclasses import replace
+        specs = [replace(s, price=installed_price(ps, by_id[s.id], scope)) for s in specs]
+    site = engine.Site(width, length)
+    # The fullest of the three styles (the most the yard's beds can take in pesos)
+    best = None
+    for style in engine.STYLES:
+        design = engine.generate(style, specs, site, 10_000_000)
+        counts = {}
+        for p in design['plants']:
+            counts[p['plant_id']] = counts.get(p['plant_id'], 0) + 1
+        cost = sum(float(by_id[pid].unit_price) * n for pid, n in counts.items())
+        if best is None or cost > best[2]:
+            best = (style, counts, cost)
+    style, counts, plant_cost = best
+    if installed:
+        lawn = engine.garden_plan(style, site, specs).lawn_area()
+        est = project_estimate(counts, by_id, width * length, ps, lawn, new_lawn, scope)
+        total = est['total']
+    else:
+        total = plant_cost + float(ps.shipping_fee)
+    out = {'plants': sum(counts.values()), 'plant_cost': _peso(plant_cost), 'total': _peso(total)}
+    cache.set(key, out, CAPACITY_CACHE_S)
+    return out
+
+
 @api_view(['GET'])
 @permission_classes([AllowAny])
 def budget_suggestion(request):
-    """GET /api/pricing/suggest/?area_sqm=120&mode=install|plants → bands + a suggested range for the yard."""
-    installed = request.query_params.get('mode', 'install') != 'plants'
+    """
+    GET /api/pricing/suggest/?area_sqm=120&mode=install|plants[&width=&length=&scope=makeover|existing&lawn=new|keep]
+    → bands + a suggested range for the yard. With width and length, also `capacity`: what the beds can hold
+    (yard_capacity), and the suggested range never goes above it.
+    """
+    params = request.query_params
+    installed = params.get('mode', 'install') != 'plants'
+    scope = params.get('scope', MAKEOVER) if params.get('scope') in SCOPES else MAKEOVER
+    new_lawn = params.get('lawn', 'new') != 'keep' and scope != EXISTING
     try:
-        area = float(request.query_params.get('area_sqm', 100))
+        area = float(params.get('area_sqm', 100))
         if not 0 < area <= 40000:
             raise ValueError
+        width = float(params['width']) if params.get('width') else None
+        length = float(params['length']) if params.get('length') else None
+        if width is not None and not (0 < width <= 200 and 0 < (length or 0) <= 200):
+            raise ValueError
     except (TypeError, ValueError):
-        return Response({'error': 'area_sqm must be a number between 0 and 40000.'}, status=status.HTTP_400_BAD_REQUEST)
-    return Response({'bands': BUDGET_BANDS if installed else PLANTS_ONLY_BANDS,
-                     'suggested': suggest_range(area, installed)})
+        return Response({'error': 'area_sqm must be a number between 0 and 40000 (width and length up to 200 m).'},
+                        status=status.HTTP_400_BAD_REQUEST)
+    suggested = suggest_range(area, installed, scope=scope)
+    capacity = yard_capacity(width, length, installed, scope, new_lawn) if width and length else None
+    if suggested and capacity:
+        # Never suggest more than the beds can hold
+        step = 1_000 if capacity['total'] < 20_000 else 5_000
+        top = _round_to(capacity['total'], step, up=True)
+        suggested = {'low': min(suggested['low'], top), 'high': min(suggested['high'], top)}
+    return Response({'bands': BUDGET_BANDS if installed else PLANTS_ONLY_BANDS, 'suggested': suggested,
+                     'capacity': capacity})
 
 class EstimateThrottle(AnonRateThrottle):
     scope = 'estimates'
@@ -337,8 +454,24 @@ def pricing_estimate(request):
             raise ValueError
     except (TypeError, ValueError):
         return Response({'error': 'area_sqm must be a number between 0 and 40000.'}, status=status.HTTP_400_BAD_REQUEST)
+    # A design with an open lawn (AI Designer): turf on the lawn, soil & mulch on the beds
+    try:
+        lawn = float(request.data.get('lawn_sqm') or 0)
+        if not 0 <= lawn <= area:
+            raise ValueError
+    except (TypeError, ValueError):
+        return Response({'error': 'lawn_sqm must be a number between 0 and area_sqm.'}, status=status.HTTP_400_BAD_REQUEST)
+    new_lawn = str(request.data.get('new_lawn', 'true')).strip().lower() not in ('false', '0', 'no')
+    # Priced the way the AI Designer priced the design, so an edited design keeps the same terms:
+    # install false = plants only (catalog + delivery); scope = makeover | existing garden
+    installed = str(request.data.get('install', 'true')).strip().lower() not in ('false', '0', 'no')
+    scope = request.data.get('scope') or MAKEOVER
+    if scope not in SCOPES:
+        return Response({'error': f"scope must be one of {', '.join(SCOPES)}."}, status=status.HTTP_400_BAD_REQUEST)
     items = {str(i.id): i for i in InventoryItem.objects.filter(id__in=counts.keys())}
-    return Response(project_estimate(counts, items, area))
+    if not installed:
+        return Response(plants_only_estimate(counts, items))
+    return Response(project_estimate(counts, items, area, lawn_sqm=lawn, new_lawn=new_lawn, scope=scope))
 
 
 @api_view(['GET'])

@@ -9,6 +9,8 @@ Field-work rules for crew jobs — one place, used by the views (and mirrored in
   Sign-off         = crew may submit "For Review" only when every crew stage is done and at least one
                      After photo exists (final inspection's proof is an After photo).
 """
+import datetime
+
 from django.db.models import Q
 from django.utils import timezone
 
@@ -40,6 +42,21 @@ def start_job_error(booking, today=None):
     if booking.status == 'Preparing' and booking.scheduled_date and booking.scheduled_date > today:
         return f'Booking #{booking.id} is scheduled for {_day(booking.scheduled_date)}. You can start it that day.'
     return None
+
+
+OPEN_SHIFT_MAX_HOURS = 16   # a shift still open after this was forgotten, not worked
+
+
+def current_shifts():
+    """Shifts genuinely under way: clocked in, not out, and started within OPEN_SHIFT_MAX_HOURS."""
+    since = timezone.now() - datetime.timedelta(hours=OPEN_SHIFT_MAX_HOURS)
+    return Attendance.objects.filter(clock_in_time__isnull=False, clock_out_time__isnull=True, clock_in_time__gte=since)
+
+
+def forgotten_shifts():
+    """Still open long after any real shift would have ended: the crew member forgot to clock out."""
+    since = timezone.now() - datetime.timedelta(hours=OPEN_SHIFT_MAX_HOURS)
+    return Attendance.objects.filter(clock_in_time__isnull=False, clock_out_time__isnull=True, clock_in_time__lt=since)
 
 
 def is_clocked_in_to(user, booking, at=None):

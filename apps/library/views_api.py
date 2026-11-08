@@ -105,7 +105,7 @@ from django.utils import timezone
 from rest_framework_simplejwt.views import TokenObtainPairView
 
 from .portfolio import create_portfolio_draft, sanitize_image
-from . import activity, cash, field_work, inventory, notifications, offline, paymongo, work_queues
+from . import activity, addresses, cash, field_work, inventory, notifications, offline, paymongo, work_queues
 from .emails import send_payment_request_email
 
 from .models import (
@@ -460,6 +460,10 @@ class ServiceBookingViewSet(viewsets.ModelViewSet):
         if not (user.is_staff or user.is_superuser):
             for field in self.CUSTOMER_LOCKED:
                 serializer.validated_data.pop(field, None)
+            if 'address' in serializer.validated_data and booking.status not in ('Pending', 'Preparing'):
+                # The crew navigates to and checks in at this pin: once work has started, call the office
+                from rest_framework.exceptions import ValidationError as DRFValidationError
+                raise DRFValidationError({'address': 'Work has started at this address; contact us to change it.'})
         booking = serializer.save()
         if booking.scheduled_date != old_date:
             notifications.booking_rescheduled(booking, old_date)
@@ -1663,7 +1667,6 @@ def checkout(request):
     customer_name = data.get('customer_name')
     customer_email = data.get('customer_email')
     customer_phone = data.get('customer_phone', '')
-    customer_address = data.get('customer_address')
     payment_method = data.get('payment_method', 'online')
     items_data = data.get('items', [])
     # Any client-sent total_price is ignored: the server prices the order from the catalog.
@@ -1684,8 +1687,13 @@ def checkout(request):
             return Response({'error': 'Quantities must be between 1 and 999.'}, status=status.HTTP_400_BAD_REQUEST)
         quantities[item_id] = quantities.get(item_id, 0) + quantity
 
-    if not customer_name or not customer_email or not customer_address:
-        return Response({'error': 'Name, email and delivery address are required.'}, status=status.HTTP_400_BAD_REQUEST)
+    if not customer_name or not customer_email:
+        return Response({'error': 'Name and email are required.'}, status=status.HTTP_400_BAD_REQUEST)
+    # The delivery address: town and barangay in Quezon, street, and a map pin the rider navigates to
+    try:
+        delivery = addresses.address_from_request(data)
+    except addresses.AddressError as e:
+        return Response({'error': str(e), 'field': 'address'}, status=status.HTTP_400_BAD_REQUEST)
     # The rider calls this number on delivery
     customer_phone = normalize_ph_mobile(customer_phone)
     if not customer_phone:
@@ -1700,16 +1708,17 @@ def checkout(request):
     shipping_fee = pricing.shipping_fee
     try:
         with transaction.atomic():
-            order = Order.objects.create(
+            order = Order(
                 user=request.user if request.user.is_authenticated else None,
                 customer_name=customer_name,
                 customer_email=customer_email,
                 customer_phone=customer_phone,
-                customer_address=customer_address,
                 payment_method=payment_method,
                 receipt_token=secrets.token_urlsafe(32),
                 total_price=0,
             )
+            addresses.apply_to_order(order, delivery)
+            order.save()
 
             subtotal = 0
             for item_id, quantity in quantities.items():
@@ -2061,6 +2070,40 @@ class UserViewSet(viewsets.ModelViewSet):
         self.permission_classes = [IsSuperUser]
         return super().get_permissions()
 
+    USER_GROUPS = {
+        'staff': Q(is_staff=True) | Q(is_superuser=True),
+        'customers': Q(is_staff=False, is_superuser=False),
+        'all': Q(),
+    }
+    USERS_PAGE = 30
+
+    def list(self, request, *args, **kwargs):
+        """
+        ?page=N (with ?group=staff|customers|all and ?q=): one page of accounts plus each group's count,
+        so the User accounts screen doesn't download every customer. Without ?page: the whole list.
+        """
+        params = request.query_params
+        if 'page' not in params:
+            return super().list(request, *args, **kwargs)
+        qs = self.get_queryset().select_related('staff_profile')
+        query = (params.get('q') or '').strip()
+        if query:
+            qs = qs.filter(Q(username__icontains=query) | Q(email__icontains=query) | Q(first_name__icontains=query)
+                           | Q(last_name__icontains=query))
+        counts = {key: qs.filter(rule).count() for key, rule in self.USER_GROUPS.items()}
+        group = params.get('group') if params.get('group') in self.USER_GROUPS else 'staff'
+        try:
+            page = max(1, int(params.get('page')))
+        except (TypeError, ValueError):
+            page = 1
+        rows = qs.filter(self.USER_GROUPS[group])
+        start = (page - 1) * self.USERS_PAGE
+        chunk = list(rows[start:start + self.USERS_PAGE + 1])
+        return Response({
+            'results': self.get_serializer(chunk[:self.USERS_PAGE], many=True).data,
+            'counts': counts, 'group': group, 'page': page, 'has_more': len(chunk) > self.USERS_PAGE,
+        })
+
     def perform_create(self, serializer):
         user = serializer.save()
         activity.record(self.request.user, 'people', 'user_added',
@@ -2239,7 +2282,48 @@ class AttendanceViewSet(viewsets.ModelViewSet):
             except ValueError:
                 from rest_framework.exceptions import ValidationError
                 raise ValidationError({'error': 'Dates must look like 2026-10-23.'})
+            if params.get('forgotten') == '1':
+                # Shifts nobody clocked out of (open longer than any real shift): the owner closes them
+                qs = qs.filter(pk__in=field_work.forgotten_shifts().values('pk'))
         return qs
+
+    @action(detail=True, methods=['post'])
+    def close_shift(self, request, pk=None):
+        """
+        Owner: end a shift the crew member forgot to clock out of, at the real end time.
+        {clock_out_time: ISO datetime, note?} — after the clock-in, not in the future, at most
+        OPEN_SHIFT_MAX_HOURS long. The shift keeps who closed it and why; the activity log too.
+        """
+        if not request.user.is_superuser:
+            return Response({'error': 'Only the owner can close a shift for someone else.'}, status=status.HTTP_403_FORBIDDEN)
+        shift = self.get_object()
+        if shift.clock_out_time is not None:
+            return Response({'error': 'This shift is already closed.'}, status=status.HTTP_400_BAD_REQUEST)
+        from django.utils import timezone
+        from django.utils.dateparse import parse_datetime
+        end = parse_datetime(str(request.data.get('clock_out_time') or ''))
+        if end is None:
+            return Response({'error': 'Pick the time the shift really ended.'}, status=status.HTTP_400_BAD_REQUEST)
+        if timezone.is_naive(end):
+            end = timezone.make_aware(end, timezone.get_current_timezone())
+        longest = datetime.timedelta(hours=field_work.OPEN_SHIFT_MAX_HOURS)
+        if not (shift.clock_in_time < end <= timezone.now()):
+            return Response({'error': 'The end time must be after the clock-in and not in the future.'},
+                            status=status.HTTP_400_BAD_REQUEST)
+        if end - shift.clock_in_time > longest:
+            return Response({'error': f'A shift can be at most {field_work.OPEN_SHIFT_MAX_HOURS} hours. Check the end time.'},
+                            status=status.HTTP_400_BAD_REQUEST)
+        note = ' '.join(str(request.data.get('note') or '').split())[:200]
+        shift.clock_out_time = end
+        shift.closed_by = request.user
+        shift.close_note = note or 'Forgot to clock out'
+        shift.save(update_fields=['clock_out_time', 'closed_by', 'close_note'])
+        who = shift.staff.get_full_name() or shift.staff.username
+        activity.record(request.user, 'people', 'shift_closed',
+                        f"Closed {who}'s shift from {timezone.localtime(shift.clock_in_time):%b %d %I:%M %p} at "
+                        f"{timezone.localtime(end):%I:%M %p} ({shift.total_hours} h): {shift.close_note}",
+                        link='/admin-attendance', shift=shift.id)
+        return Response(AttendanceSerializer(shift, context={'request': request}).data)
 
     @action(detail=False, methods=['get'])
     def current(self, request):

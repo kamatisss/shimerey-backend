@@ -246,6 +246,71 @@ def crew_report(start, end):
     return {'from': start, 'to': end, 'crew': out}
 
 
+# ── Where our customers are (by town) ────────────────────────────────────────
+
+def _town_matcher():
+    """Older orders / bookings have only typed text: find a Quezon town name in it (longest names
+    first, so 'San Francisco' wins over shorter names). The municipality called 'Quezon' is never
+    matched from text: every address ends with the province, 'Quezon'."""
+    import re
+    from .addresses import areas
+    towns = sorted(areas()['cities'], key=lambda c: -len(c['name']))
+    patterns = []
+    for c in towns:
+        base = c['name'].removesuffix(' City')
+        if base == 'Quezon':
+            continue
+        patterns.append((re.compile(rf'\b{re.escape(base)}\b', re.IGNORECASE), c['code']))
+
+    def find(detail, text):
+        code = (detail or {}).get('city_code')
+        if code:
+            return code
+        for pattern, code in patterns:
+            if pattern.search(text or ''):
+                return code
+        return None
+    return find
+
+
+def areas_report(start, end):
+    """Orders, bookings and customers per town in the period (for the map in Reports)."""
+    from .addresses import areas
+    lo, hi = _bounds(start, end)
+    find = _town_matcher()
+    towns = {c['code']: {'code': c['code'], 'name': c['name'], 'lat': c['lat'], 'lng': c['lng'], 'orders': 0,
+                         'order_value': Decimal('0'), 'bookings': 0, 'booking_value': Decimal('0'), 'customers': set()}
+             for c in areas()['cities']}
+    unplaced = {'orders': 0, 'bookings': 0}
+    orders = (Order.objects.filter(created_at__gte=lo, created_at__lt=hi).exclude(status='Cancelled')
+              .exclude(payment_method='online', payment_status__in=('Pending', 'Expired')))
+    for o in orders:
+        t = towns.get(find(o.address_detail, o.customer_address))
+        if t is None:
+            unplaced['orders'] += 1
+            continue
+        t['orders'] += 1
+        t['order_value'] += o.total_price
+        t['customers'].add(f'u{o.user_id}' if o.user_id else f'e{o.customer_email.lower()}')
+    jobs = (ServiceBooking.objects.filter(scheduled_date__gte=start, scheduled_date__lte=end).exclude(status='Cancelled')
+            .select_related('tracker', 'design'))
+    for b in jobs:
+        t = towns.get(find(b.address_detail, b.service_address))
+        if t is None:
+            unplaced['bookings'] += 1
+            continue
+        t['bookings'] += 1
+        if b.status in ('Finished', 'Completed'):
+            t['booking_value'] += Decimal(str(_booking_value(b) or 0))
+        t['customers'].add(f'u{b.user_id}')
+    rows = [{**t, 'order_value': _m(t['order_value']), 'booking_value': _m(t['booking_value']),
+             'customers': len(t['customers'])} for t in towns.values() if t['orders'] or t['bookings']]
+    rows.sort(key=lambda r: (-(r['orders'] + r['bookings']), r['name']))
+    return {'from': start, 'to': end, 'towns': rows, 'not_mapped': unplaced,
+            'totals': {'orders': sum(r['orders'] for r in rows), 'bookings': sum(r['bookings'] for r in rows),
+                       'towns_served': len(rows)}}
+
+
 # ── Endpoints ────────────────────────────────────────────────────────────────
 
 def _csv(filename, header, rows):
@@ -301,6 +366,20 @@ def balances(request):
                       f"{r['balance']:.2f}", f"{r['requested']:.2f}", r['last_payment'].date() if r['last_payment'] else '']
                      for r in balance_rows()])
     return Response(balances_report())
+
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+@_owner_only
+def customer_areas(request):
+    start, end = parse_period(request.query_params)
+    data = areas_report(start, end)
+    if _wants_csv(request):
+        return _csv(f'customer-areas_{start}_to_{end}.csv',
+                    ['Town / city', 'Shop orders', 'Order value', 'Bookings', 'Finished job value', 'Customers'],
+                    [[r['name'], r['orders'], f"{r['order_value']:.2f}", r['bookings'], f"{r['booking_value']:.2f}",
+                      r['customers']] for r in data['towns']])
+    return Response(data)
 
 
 @api_view(['GET'])

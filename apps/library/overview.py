@@ -14,9 +14,9 @@ from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
-from . import cash, work_queues
+from . import cash, field_work, work_queues
 from .models import (
-    Attendance, GardenDesign, InventoryItem, Order, ProjectPayment, ProjectTracker, ServiceBooking,
+    GardenDesign, InventoryItem, Order, ProjectPayment, ProjectTracker, ServiceBooking,
 )
 from .views_api import IsOfficeAdmin
 
@@ -42,12 +42,14 @@ def today_numbers():
         'orders_value': _money(placed, 'total_price'),
         'money_received': received,
         'visits': ServiceBooking.objects.filter(scheduled_date=today).exclude(status__in=('Finished', 'Cancelled')).count(),
-        'crew_on_shift': Attendance.objects.filter(clock_out_time__isnull=True).count(),
+        # Not counting shifts left open for days (forgot to clock out): those are in "Needs attention"
+        'crew_on_shift': field_work.current_shifts().values('staff').distinct().count(),
     }
 
 
-def attention():
-    """Waiting work, most urgent first; only what has something in it."""
+def attention(owner=False):
+    """Waiting work, most urgent first; only what has something in it. owner: also what only the owner
+    can fix (shifts someone forgot to end: Attendance → close them with the real end time)."""
     oc = work_queues.order_counts(Order.objects.all())
     bc = work_queues.booking_counts(ServiceBooking.objects.all())
     low = InventoryItem.objects.filter(is_active=True, stock_quantity__lte=F('reorder_level'))
@@ -69,6 +71,11 @@ def attention():
         ('unpaid', 'red', 'Unpaid balances on finished jobs',
          f'₱{_money(unpaid, "remaining_balance"):,.0f} still to collect', unpaid.count(), f'{BOOKINGS}&queue=completed'),
     ]
+    if owner:
+        forgotten = field_work.forgotten_shifts()
+        items.insert(1, ('open_shifts', 'amber', 'Shifts nobody clocked out of',
+                         f'Open for over {field_work.OPEN_SHIFT_MAX_HOURS} hours: set the real end time',
+                         forgotten.count(), '/admin-attendance?forgotten=1'))
     return [{'key': k, 'tone': tone, 'label': label, 'hint': hint, 'count': n, 'link': link}
             for k, tone, label, hint, n, link in items if n]
 
@@ -78,4 +85,4 @@ def attention():
 def business_overview(request):
     if not IsOfficeAdmin().has_permission(request, None):
         return Response({'error': 'Office admins only.'}, status=status.HTTP_403_FORBIDDEN)
-    return Response({'today': today_numbers(), 'attention': attention()})
+    return Response({'today': today_numbers(), 'attention': attention(owner=request.user.is_superuser)})

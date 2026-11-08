@@ -83,8 +83,17 @@ def business_data(bp):
         'name': bp.name, 'tagline': bp.tagline, 'founded_year': bp.founded_year, 'phone': bp.phone,
         'email': bp.email, 'address': bp.address, 'service_area': bp.service_area,
         'social': {k: getattr(bp, k) for k in LINK_FIELDS},
+        'base': {'lat': bp.base_lat, 'lng': bp.base_lng} if bp.base_lat is not None else None,
         'updated_at': bp.updated_at, 'updated_by': _name(bp.updated_by),
     }
+
+
+def _province_box():
+    """The service area's outer box (all of Quezon's towns), with a little room at the edges."""
+    from .addresses import areas
+    boxes = [c['bbox'] for c in areas()['cities']]
+    return (min(b[0] for b in boxes) - 0.05, min(b[1] for b in boxes) - 0.05,
+            max(b[2] for b in boxes) + 0.05, max(b[3] for b in boxes) + 0.05)
 
 
 @api_view(['GET', 'PATCH'])
@@ -95,6 +104,8 @@ def business_profile(request):
         data = business_data(bp)
         if not (request.user.is_authenticated and request.user.is_superuser):
             data.pop('updated_by')
+        if not (request.user.is_authenticated and (request.user.is_staff or request.user.is_superuser)):
+            data.pop('base')   # the crew's starting point is for staff, not the public site
         return Response(data)
 
     if not (request.user.is_authenticated and request.user.is_superuser):
@@ -138,6 +149,19 @@ def business_profile(request):
                 setattr(bp, field, value)
             except ValidationError:
                 errors[field] = f'Paste the full https:// link to your {host} page.'
+    if 'base' in d:
+        base = d['base']
+        if base in (None, ''):
+            bp.base_lat = bp.base_lng = None
+        else:
+            try:
+                lat, lng = float(base['lat']), float(base['lng'])
+                south, west, north, east = _province_box()
+                if not (south <= lat <= north and west <= lng <= east):
+                    raise ValueError
+                bp.base_lat, bp.base_lng = round(lat, 6), round(lng, 6)
+            except (TypeError, KeyError, ValueError):
+                errors['base'] = 'Pin your base (nursery or yard) inside Quezon Province.'
     if errors:
         return Response(errors, status=status.HTTP_400_BAD_REQUEST)
     bp.updated_by = request.user
@@ -145,7 +169,8 @@ def business_profile(request):
     after = business_data(bp)
     changed = [k for k in after if k not in ('updated_at', 'updated_by') and after[k] != before[k]]
     if changed:
-        labels = {'social': 'social links', 'founded_year': 'founded year', 'service_area': 'service area'}
+        labels = {'social': 'social links', 'founded_year': 'founded year', 'service_area': 'service area',
+                  'base': 'crew base location'}
         activity.record(request.user, 'settings', 'business_profile_changed',
                         'Updated the business profile: ' + ', '.join(labels.get(k, k) for k in changed),
                         link='/admin-settings', fields=changed)

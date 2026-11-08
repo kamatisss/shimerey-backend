@@ -53,6 +53,15 @@ class InventoryItem(models.Model):
                                         help_text="Metres tall when we plant it (nursery size). Plants only.")
     mature_height = models.FloatField(null=True, blank=True,
                                       help_text="Metres tall when fully grown, in a home garden. Plants only.")
+    # Width (spread) at the same three stages: plants don't widen at the rate they grow taller (a palm's
+    # crown hardly widens, a plumeria's canopy spreads into an umbrella), so the 3D growth view scales
+    # width and height separately. Plants only; all three empty = width follows height.
+    planting_spread = models.FloatField(null=True, blank=True,
+                                        help_text="Metres wide when we plant it. Plants only.")
+    established_spread = models.FloatField(null=True, blank=True,
+                                           help_text="Metres wide about 2 years after planting. Plants only.")
+    mature_spread = models.FloatField(null=True, blank=True,
+                                      help_text="Metres wide when fully grown, in a home garden. Plants only.")
 
     class Meta:
         ordering = ['category', 'name']
@@ -191,11 +200,16 @@ class ServiceBooking(models.Model):
     notes = models.TextField(blank=True)
     design = models.ForeignKey('GardenDesign', on_delete=models.SET_NULL, null=True, blank=True, related_name='bookings')
 
-    # GPS coordinates of the project site (set by staff for geofenced check-in)
+    # GPS coordinates of the project site: the customer's map pin (addresses.py), used for the crew's
+    # geofenced check-in and navigation. service_address is the same address as readable text.
     site_lat = models.FloatField(null=True, blank=True, help_text="Project site GPS latitude")
     site_lng = models.FloatField(null=True, blank=True, help_text="Project site GPS longitude")
+    # The structured address it came from (town / barangay PSGC codes, street, landmark, pin source)
+    address_detail = models.JSONField(default=dict, blank=True)
     # Last "on my way" sent to the customer by the crew (shown on the job; stops repeat sends)
     crew_on_way_at = models.DateTimeField(null=True, blank=True)
+    # When the crew arrived at the pin (crew_location.arrived — checked against the site pin)
+    crew_arrived_at = models.DateTimeField(null=True, blank=True)
 
     # Multi-crew assignment for capacity planning and RBAC data filtering
     assigned_crew = models.ManyToManyField(
@@ -343,7 +357,13 @@ class Order(models.Model):
     customer_name    = models.CharField(max_length=150)
     customer_email   = models.EmailField()
     customer_phone   = models.CharField(max_length=20, blank=True, default='')
-    customer_address = models.TextField()
+    customer_address = models.TextField()   # readable text of the delivery address (addresses.py formats it)
+    # The delivery pin and the structured address (PSGC town / barangay, street, landmark): a snapshot,
+    # so editing a saved address later never moves an order already placed
+    delivery_lat     = models.FloatField(null=True, blank=True)
+    delivery_lng     = models.FloatField(null=True, blank=True)
+    address_detail   = models.JSONField(default=dict, blank=True)
+    crew_arrived_at  = models.DateTimeField(null=True, blank=True)   # the rider reached the delivery pin
     booking_date     = models.DateField(null=True, blank=True)
     total_price      = models.DecimalField(max_digits=12, decimal_places=2)
     payment_method   = models.CharField(max_length=10, choices=PAYMENT_METHOD_CHOICES, default='online')
@@ -397,6 +417,9 @@ class Attendance(models.Model):
     longitude = models.FloatField(null=True, blank=True)
     clock_in_address = models.CharField(max_length=500, null=True, blank=True)
     clock_out_address = models.CharField(max_length=500, null=True, blank=True)
+    # A shift the crew member forgot to end, closed by the owner with the real end time (and why)
+    closed_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True, related_name='+')
+    close_note = models.CharField(max_length=200, blank=True, default='')
 
     class Meta:
         ordering = ['-clock_in_time']
@@ -736,7 +759,11 @@ class PricingSettings(models.Model):
     site_prep_per_sqm = models.DecimalField(max_digits=10, decimal_places=2, default=150,
                                             help_text='Clearing, levelling, soil preparation')
     materials_per_sqm = models.DecimalField(max_digits=10, decimal_places=2, default=120,
-                                            help_text='Garden soil, compost, mulch')
+                                            help_text='Garden soil, compost, mulch (planting beds)')
+    turf_per_sqm = models.DecimalField(max_digits=10, decimal_places=2, default=180,
+                                       help_text='New lawn: grass sod supplied and laid (the open lawn of a design)')
+    compost_per_plant = models.DecimalField(max_digits=10, decimal_places=2, default=40,
+                                            help_text='Planting into an existing garden: compost & soil for each planting hole')
     # Per project
     mobilization_fee = models.DecimalField(max_digits=10, decimal_places=2, default=1500,
                                            help_text='Crew transport & delivery within the service area')
@@ -911,6 +938,45 @@ class CashHandover(models.Model):
         return f'Cash from {self.crew.username}: ₱{self.counted:,.2f}'
 
 
+class CrewLocation(models.Model):
+    """
+    Where a field crew member's phone was, sent every ~45 s while they are on shift (clocked in, or out
+    on a delivery) and the crew app is open — for the office's live map (crew_location.py). Kept 30 days.
+    """
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='locations')
+    lat = models.FloatField()
+    lng = models.FloatField()
+    accuracy_m = models.FloatField(null=True, blank=True)
+    recorded_at = models.DateTimeField(auto_now_add=True, db_index=True)
+
+    class Meta:
+        ordering = ['-recorded_at']
+        indexes = [models.Index(fields=['user', '-recorded_at'])]
+
+
+class SavedAddress(models.Model):
+    """A customer's address book entry (Quezon Province only, always with a map pin; see addresses.py)."""
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='saved_addresses')
+    label = models.CharField(max_length=40, default='Home')            # Home, Work, Lola's house…
+    contact_name = models.CharField(max_length=150, blank=True, default='')
+    contact_phone = models.CharField(max_length=20, blank=True, default='')
+    city_code = models.CharField(max_length=12)                        # PSGC city / municipality
+    barangay_code = models.CharField(max_length=12)                    # PSGC barangay
+    street = models.CharField(max_length=200)                          # house no., street, purok / sitio
+    landmark = models.CharField(max_length=200, blank=True, default='')
+    lat = models.FloatField()
+    lng = models.FloatField()
+    is_default = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['-is_default', '-updated_at']
+
+    def __str__(self):
+        return f'{self.user} · {self.label}'
+
+
 class BusinessProfile(models.Model):
     """The business's public details (site footer, emails). One row, edited by the owner."""
     name = models.CharField(max_length=80, default='Garden Studio')
@@ -920,6 +986,9 @@ class BusinessProfile(models.Model):
     email = models.EmailField(blank=True, default='')
     address = models.CharField(max_length=200, blank=True, default='')
     service_area = models.CharField(max_length=160, blank=True, default='Quezon Province and nearby areas')
+    # Where the crew set out from (nursery / yard): the start of the suggested stop order. Staff only.
+    base_lat = models.FloatField(null=True, blank=True)
+    base_lng = models.FloatField(null=True, blank=True)
     facebook = models.URLField(blank=True, default='')
     instagram = models.URLField(blank=True, default='')
     tiktok = models.URLField(blank=True, default='')

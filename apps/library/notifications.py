@@ -229,6 +229,25 @@ def crew_on_the_way(booking, crew_user, eta_minutes):
            link=MY_BOOKINGS, alert='Our crew is on the way')
 
 
+def crew_arrived_at_site(booking, crew_user):
+    """The crew reached the site pin (crew_location.arrived)."""
+    if not booking.user:
+        return
+    notify([booking.user], 'crew_arrived',
+           f'{crew_user.first_name or "Our crew"} from {business_name()} has arrived at your address.',
+           link=MY_BOOKINGS, alert='Our crew has arrived')
+
+
+def rider_arrived(order, crew_user):
+    """The rider reached the delivery pin with order #id."""
+    if not order.user:
+        return
+    pay = ' Please have the cash ready.' if order.payment_method == 'cod' and order.payment_status != 'Paid' else ''
+    notify([order.user], 'rider_arrived',
+           f'{crew_user.first_name or "Our rider"} from {business_name()} is at your address with order #{order.id}.{pay}',
+           link=MY_ORDERS, alert='Your order has arrived')
+
+
 def delivery_problem(order, crew_user, reason, note=''):
     notify(office_users(), 'delivery_problem',
            f'Delivery problem on order #{order.id} ({order.customer_name}): {reason}'

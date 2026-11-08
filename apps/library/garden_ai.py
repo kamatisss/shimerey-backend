@@ -18,7 +18,9 @@ Settings: AI_MODE = 'auto' | 'engine_only' (env; 'engine_only' skips Gemini, e.g
 import hashlib
 import json
 import logging
+import math
 import os
+import random
 import time
 from dataclasses import replace
 from datetime import datetime, timedelta
@@ -33,14 +35,16 @@ from google.genai import types
 from pydantic import BaseModel, Field
 from rest_framework import status
 from rest_framework.decorators import api_view, permission_classes, throttle_classes
-from rest_framework.permissions import IsAuthenticated
+from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
-from rest_framework.throttling import UserRateThrottle
+from rest_framework.throttling import AnonRateThrottle, UserRateThrottle
 from rest_framework.views import APIView
 
 from . import layout_engine as engine
 from .models import InventoryItem, LayoutGenerationLog, PricingSettings
-from .pricing import fixed_costs, installed_price, plant_budget_from_all_in, plants_only_estimate, project_estimate
+from .pricing import (
+    EXISTING, MAKEOVER, SCOPES, fixed_costs, installed_price, plant_budget_from_all_in, plants_only_estimate, project_estimate,
+)
 from .utils import scan_image_zones
 
 logger = logging.getLogger(__name__)
@@ -154,16 +158,16 @@ class ZoneScanThrottle(StaffExemptThrottle):
 # Gemini call
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _system_instruction(specs, keep_clear_cells, has_features=False):
+def _system_instruction(specs, keep_clear_cells, has_features=False, lawn_cells=()):
     instruction = (
-        "You are an expert tropical landscape architect. Your primary goal is to maximise plant density "
-        "within the user's budget — treat the budget as a TARGET, not a ceiling. Aim for at least 75% of it "
-        "without going over.\n\n"
+        "You are an expert tropical landscape architect. Design a garden people can live in: planting beds "
+        "around the edges and an open lawn in the middle. Use the user's budget well — treat it as a TARGET, "
+        "not a ceiling; aim for at least 75% of it without going over — but fill the BEDS, never the lawn.\n\n"
         "Generate ONE lush, organic garden layout: layered planting, drifts of the same plant, a tall back "
-        "screen and a dense low border.\n"
+        "screen and a dense low border, all in the beds around an oval lawn.\n"
         f"Use integer grid indices: gx 0..{GRID_COLS - 1} (left → right), gz 0..{GRID_ROWS - 1} where "
-        "gz 0 is the BACK of the garden (furthest from the viewer) and gz 19 the FRONT. Put tall plants "
-        "towards the back and low plants towards the front.\n"
+        "gz 0 is the BACK of the garden (furthest from the viewer) and gz 19 the FRONT. Tall plants (2.5 m+ "
+        f"fully grown) go in the back half only (gz 0..{GRID_ROWS // 2 - 1}); low plants towards the front.\n"
         "COMPATIBILITY: keep low-water and high-water plants in separate beds, keep aggressive spreaders "
         "(AGGRESSIVE ROOTS, e.g. bamboo) at the back with a buffer around them, and keep low full-sun plants "
         "out from under tall plants. Shade-loving plants go beside or under taller plants.\n"
@@ -177,6 +181,9 @@ def _system_instruction(specs, keep_clear_cells, has_features=False):
                         + (", plus the customer's seating spot, its walkway and accent rocks (already placed)"
                            if has_features else '')
                         + f", DO NOT PLANT HERE: {cells}\n\n")
+    if lawn_cells:
+        cells = ', '.join(f'({gx},{gz})' for gx, gz in sorted(lawn_cells))
+        instruction += f"OPEN LAWN CELLS — the lawn and the way in from the house, DO NOT PLANT HERE: {cells}\n\n"
     instruction += (
         "REASONING (MANDATORY): 1-2 sentences on plant choice, layout, spacing and budget.\n"
         "COST BREAKDOWN (MANDATORY): plant_id, name, quantity, unit_price, subtotal; subtotals sum to total_cost.\n"
@@ -236,13 +243,13 @@ def call_gemini(api_key, system_instruction, prompt):
 # Pricing & response shape
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _price(design, items_by_id, area_sqm, ps, installed=True):
+def _price(design, items_by_id, area_sqm, ps, installed=True, lawn_sqm=0.0, new_lawn=True, scope=MAKEOVER):
     """Price a design from the rate card (the AI's own totals are never trusted)."""
     counts = {}
     for p in design['plants']:
         if not p.get('is_existing'):
             counts[p['plant_id']] = counts.get(p['plant_id'], 0) + 1
-    est = (project_estimate(counts, items_by_id, area_sqm, ps) if installed
+    est = (project_estimate(counts, items_by_id, area_sqm, ps, lawn_sqm, new_lawn, scope) if installed
            else plants_only_estimate(counts, items_by_id, ps))
     design['plant_cost'] = est['plant_cost']
     design['total_cost'] = est['total']
@@ -311,7 +318,7 @@ def _feature_cells(specs, site, plant_budget, seed, features):
     """Grid cells the features of the AI design will take (seat pads, walkway, rocks) — for the prompt."""
     if not features:
         return set()
-    layout = engine.Layout(site, list(specs) + [f for f, _ in features])
+    layout = engine.Layout(site, list(specs) + [f for f, _ in features], engine.garden_plan(AI_STYLE, site, specs, seed))
     engine.place_features(layout, features, plant_budget, AI_STYLE, seed)
     cells = set()
     for p in layout.plants:
@@ -327,6 +334,75 @@ def _feature_cells(specs, site, plant_budget, seed, features):
                 cells.add(site.cell_of(min(site.width - 1e-6, max(0, x)), min(site.length - 1e-6, z)))
             z += site.cell_l / 2
     return cells
+
+
+SUN_LEVELS = ('full', 'part', 'shade')            # 6 h+ of direct sun / 3–6 h / under 3 h
+MAINTENANCE_LEVELS = ('low', 'medium', 'high')
+_SUN_WORDS = {'full': 'full sun (6+ hours)', 'part': 'part sun (3–6 hours)', 'shade': 'mostly shade (under 3 hours)'}
+
+
+def _sun_unsuited(spec, sun):
+    return 'needs full sun' if sun == 'shade' and spec.sunlight == 'full_sun' else None
+
+
+def _care_unsuited(spec, maintenance):
+    if maintenance == 'low' and spec.water_need == 'high':
+        return 'needs frequent watering'
+    if maintenance == 'low' and spec.is_invasive:
+        return 'spreads and needs root control'
+    return None
+
+
+def _unsuited(spec, sun, maintenance):
+    """Why a plant doesn't suit this yard (None when it does)."""
+    return _sun_unsuited(spec, sun) or _care_unsuited(spec, maintenance)
+
+
+def _conditions_note(sun, maintenance, cap):
+    """The yard's conditions for the AI prompt ('' when nothing was said)."""
+    parts = []
+    if sun:
+        parts.append(f"The yard gets {_SUN_WORDS[sun]} of direct sun a day: choose plants that thrive in it.")
+    if maintenance == 'low':
+        parts.append(f"The owner wants a LOW-MAINTENANCE garden: fewer, larger plants and generous mulch; "
+                     f"use at most {cap} plants.")
+    elif maintenance == 'high':
+        parts.append("The owner enjoys gardening: richer, more varied planting is welcome.")
+    return ('\n' + ' '.join(parts) + '\n') if parts else ''
+
+
+def suit_conditions(specs, sun, maintenance, chosen):
+    """
+    Match the plants to the yard. The customer's own picks are binding: kept, with a note.
+    Free choice: sun first — the wrong light kills a plant — then the care level, which is a preference:
+    when both together leave no plants, the care level gives way (with a note), never the sun; only when
+    no plant in stock suits the light does the design fall back to the wider catalogue.
+    Returns (specs, notes).
+    """
+    plants = [s for s in specs if s.is_plant]
+    bad = [s for s in plants if _unsuited(s, sun, maintenance)]
+    if not bad:
+        return specs, []
+    if chosen:
+        names = '; '.join(f'{s.name} {_unsuited(s, sun, maintenance)}' for s in bad[:4]) + ('…' if len(bad) > 4 else '')
+        return specs, [f"Heads-up on your picks: {names}. We kept them as you chose; ask us about alternatives."]
+    lit = [s for s in specs if not (s.is_plant and _sun_unsuited(s, sun))]
+    if not any(s.is_plant for s in lit):
+        return specs, ["We don't have plants in stock for that much shade right now, so this design uses our wider "
+                       "catalogue. Our team can suggest shade-tolerant swaps at the site visit."]
+    easy = [s for s in lit if not (s.is_plant and _care_unsuited(s, maintenance))]
+    if not any(s.is_plant for s in easy):
+        return lit, ["The plants we have for your light need a little more care than you asked for (regular "
+                     "watering). Our team can suggest easier-care swaps at the site visit."]
+    return easy, []
+
+
+def _lawn_cells(plan, site):
+    """Grid cells whose centre is on the plan's open lawn or entry — for the prompt (repair enforces the exact shape)."""
+    if not plan.lawn:
+        return set()
+    return {(gx, gz) for gx in range(GRID_COLS) for gz in range(GRID_ROWS)
+            if plan.depth_inside((gx + 0.5) * site.cell_w, (gz + 0.5) * site.cell_l) > 0}
 
 
 def _parse_list(value, name):
@@ -399,6 +475,20 @@ class GenerateLayoutsView(APIView):
             seed = int(data.get('seed') or 0)
         except (TypeError, ValueError):
             seed = 0
+        # The yard: how much sun it gets, how much care the owner wants to give, and the lawn
+        sun = str(data.get('sun') or '').strip().lower() or None
+        maintenance = str(data.get('maintenance') or 'medium').strip().lower()
+        new_lawn = str(data.get('lawn') or 'new').strip().lower() != 'keep'
+        # Installed: a full garden makeover (site prep, bed soil, a lawn) or planting into the customer's
+        # existing garden (compost per planting hole, no ground work)
+        scope = str(data.get('scope') or MAKEOVER).strip().lower()
+        if scope not in SCOPES:
+            return Response({'error': f"scope must be one of {', '.join(SCOPES)}."}, status=status.HTTP_400_BAD_REQUEST)
+        if scope == EXISTING:
+            new_lawn = False   # nothing is laid: the garden is already there
+        if sun not in (None, *SUN_LEVELS) or maintenance not in MAINTENANCE_LEVELS:
+            return Response({'error': f"sun must be one of {', '.join(SUN_LEVELS)}; maintenance one of "
+                                      f"{', '.join(MAINTENANCE_LEVELS)}."}, status=status.HTTP_400_BAD_REQUEST)
         ps = PricingSettings.current()
         area = lot_w * lot_l
         catalog_items = list(InventoryItem.objects.filter(category='plant', is_active=True))
@@ -416,18 +506,18 @@ class GenerateLayoutsView(APIView):
         if installed:
             # All-in budget: VAT, design fee, site prep, materials and mobilisation come off first;
             # the rest pays for plants *installed* (plant + planting labour).
-            specs = [replace(s, price=installed_price(ps, items_by_id[s.id]))
+            specs = [replace(s, price=installed_price(ps, items_by_id[s.id], scope))
                      for s in engine.specs_from_inventory(catalog_items)]
-            fspecs = [replace(s, price=installed_price(ps, items_by_id[s.id]))
+            fspecs = [replace(s, price=installed_price(ps, items_by_id[s.id], scope))
                       for s in engine.feature_specs_from_inventory(feature_items.values())]
 
-            def to_plants(b):
-                return plant_budget_from_all_in(b, area, ps)
+            def to_plants(b, lawn=0.0):
+                return plant_budget_from_all_in(b, area, ps, lawn, new_lawn, scope)
         else:
             specs = engine.specs_from_inventory(catalog_items)
             fspecs = engine.feature_specs_from_inventory(feature_items.values())
 
-            def to_plants(b):
+            def to_plants(b, lawn=0.0):
                 return max(0, int(b - ps.shipping_fee))
 
         # The customer's plant choice is binding: designs use only the chosen plants (engine, AI and repair
@@ -447,6 +537,16 @@ class GenerateLayoutsView(APIView):
                 selection_notes.append(
                     f"Left out {', '.join(named) if named else 'a plant you chose'}: not available right now. "
                     "This design uses your other chosen plants.")
+        # Plants that suit the yard's sun and the care the owner wants to give (picks are kept, with a note)
+        specs, condition_notes = suit_conditions(specs, sun, maintenance, chosen=bool(preferred))
+        selection_notes += condition_notes
+
+        # Each style's beds and lawn: the lawn is priced as turf (or left alone), the beds get soil & mulch,
+        # and a low-maintenance garden plants the beds more sparingly
+        plans = {style: engine.garden_plan(style, engine.Site(lot_w, lot_l), specs, seed) for style in engine.STYLES}
+        lawns = {style: plans[style].lawn_area() if installed else 0.0 for style in engine.STYLES}
+        caps = {style: engine.low_care_cap(engine.Site(lot_w, lot_l), plans[style]) if maintenance == 'low'
+                else engine.MAX_PLANTS for style in engine.STYLES}
 
         # Out-of-stock features drop out here (and are reported by the engine as left out)
         features = [(f, feature_qty[f.id]) for f in fspecs]
@@ -458,29 +558,33 @@ class GenerateLayoutsView(APIView):
         targets = {'Minimalist': budget_min, 'Symmetrical': (budget_min + budget_max) // 2, AI_STYLE: budget_max}
         range_text = f"₱{budget_min:,}" if budget_min == budget_max else f"₱{budget_min:,}–₱{budget_max:,}"
         budget_warning = None
-        if specs:
-            cheapest = min(s.price for s in specs)
+        if any(s.is_plant for s in specs):
+            cheapest = min(s.price for s in specs if s.is_plant)
             if installed:
-                basics = float(fixed_costs(ps, area))
-                smallest = int(_all_in(basics + cheapest * 5, ps)) + 1
+                basics = {style: float(fixed_costs(ps, area, lawns[style], new_lawn, scope)) for style in engine.STYLES}
+                smallest = {style: int(_all_in(b + cheapest * 5, ps)) + 1 for style, b in basics.items()}
             else:
-                smallest = int(cheapest * 5 + float(ps.shipping_fee))
-            if to_plants(budget_max) < cheapest * 5:
+                basics = None
+                smallest = {style: int(cheapest * 5 + float(ps.shipping_fee)) for style in engine.STYLES}
+            if max(to_plants(budget_max, lawns[style]) for style in engine.STYLES) < cheapest * 5:
                 # Not enough for even a small planting: say what it takes instead of returning empty designs
-                needed = int(round(smallest * 1.6, -3)) + 1000
-                why = (f"site preparation, soil and crew mobilisation alone come to about ₱{int(_all_in(basics, ps)):,}"
-                       if installed else f"a small planting starts at about ₱{smallest:,} including delivery")
+                least = min(smallest.values())
+                needed = int(round(least * 1.6, -3)) + 1000
+                basics_text = ("crew mobilisation alone comes to about " if scope == EXISTING else
+                               "site preparation, soil, the lawn and crew mobilisation alone come to about ")
+                why = (basics_text + f"₱{int(_all_in(min(basics.values()), ps)):,}"
+                       if installed else f"a small planting starts at about ₱{least:,} including delivery")
                 return Response({'error': (
                     f"A {range_text} budget doesn't cover the basics for a {lot_w:g} × {lot_l:g} m garden: {why}. "
                     f"Try a budget of at least ₱{needed:,}"
                     + (" or a smaller area." if installed else ".")), 'min_budget': needed},
                     status=status.HTTP_400_BAD_REQUEST)
             # The low end may be too small on its own: lift it to the smallest workable budget
-            targets = {style: max(t, smallest) for style, t in targets.items()}
-            if to_plants(budget_max) < max(5, int(area / 15)) * cheapest:
+            targets = {style: max(t, smallest[style]) for style, t in targets.items()}
+            if to_plants(budget_max, lawns[AI_STYLE]) < max(5, int(area / 15)) * cheapest:
                 budget_warning = ('Budget may be too tight for an area of this size. '
                                   'Consider increasing your budget or choosing low-cost flora.')
-        plant_budgets = {style: to_plants(t) for style, t in targets.items()}
+        plant_budgets = {style: to_plants(t, lawns[style]) for style, t in targets.items()}
 
         # 1b. Botanical compatibility audit for preferred flora selections
         from .compatibility import evaluate_plant_compatibility, format_compatibility_prompt_note
@@ -504,7 +608,8 @@ class GenerateLayoutsView(APIView):
 
         # 3. Anti-abuse limit, then the cache (a cached answer costs nothing)
         key = _cache_key(budget_min, budget_max, installed, round(lot_w, 1), round(lot_l, 1), sorted(preferred),
-                         sorted(keep_clear), seed, ps.updated_at, sorted(feature_qty.items()))  # new rates → new estimates
+                         sorted(keep_clear), seed, ps.updated_at, sorted(feature_qty.items()),  # new rates → new estimates
+                         sun, maintenance, new_lawn, scope)
         cached = cache.get(key)
         if cached is not None:
             self._log(request, 'cached', zone_scan, 0, started)
@@ -517,7 +622,7 @@ class GenerateLayoutsView(APIView):
         # 4. Engine designs (always) …
         designs = {}
         for style in ('Symmetrical', 'Minimalist'):
-            d = engine.generate(style, specs, site, plant_budgets[style], preferred, seed, features)
+            d = engine.generate(style, specs, site, plant_budgets[style], preferred, seed, features, caps[style])
             designs[style] = {**d, 'source': 'engine', 'adjustments': selection_notes + d['feature_notes']}
 
         # … and the AI signature design when everything allows it
@@ -525,23 +630,27 @@ class GenerateLayoutsView(APIView):
         if ai_status == 'ok':
             try:
                 taken = _feature_cells(specs, site, plant_budgets[AI_STYLE], seed, features)
-                raw = call_gemini(gemini_api_key(), _system_instruction(specs, keep_clear | taken, bool(features)),
+                plan = engine.garden_plan(AI_STYLE, site, specs, seed)
+                raw = call_gemini(gemini_api_key(), _system_instruction(specs, keep_clear | taken, bool(features),
+                                                                        _lawn_cells(plan, site) - keep_clear - taken),
                                   _user_prompt(specs, catalog_items, plant_budgets[AI_STYLE], lot_w, lot_l, preferred,
                                                ', '.join(f"{z.get('label')} ({z['zone']})" for z in detected),
-                                               installed, format_compatibility_prompt_note(compat_warnings)))
+                                               installed, format_compatibility_prompt_note(compat_warnings)
+                                               + _conditions_note(sun, maintenance, caps[AI_STYLE])))
                 plants = expand_grid_coords(raw.get('plants') or [], lot_w, lot_l)
                 fixed, notes = engine.repair(plants, specs, site, plant_budgets[AI_STYLE], preferred, seed,
-                                             features, AI_STYLE)
+                                             features, AI_STYLE, caps[AI_STYLE])
                 adjustments = len(notes)
                 designs[AI_STYLE] = {
                     'design_name': AI_STYLE, 'reasoning': raw.get('reasoning', ''), 'plants': fixed,
                     'source': 'ai', 'adjustments': selection_notes + notes, 'budget_note': None,
+                    'garden_plan': plan.to_dict(),
                 }
             except Exception as e:  # noqa: BLE001
                 ai_status = trip_breaker(e)
                 ai_status = 'quota' if ai_status == 'quota' else 'error'
         if AI_STYLE not in designs:
-            d = engine.generate(AI_STYLE, specs, site, plant_budgets[AI_STYLE], preferred, seed, features)
+            d = engine.generate(AI_STYLE, specs, site, plant_budgets[AI_STYLE], preferred, seed, features, caps[AI_STYLE])
             designs[AI_STYLE] = {**d, 'source': 'engine', 'adjustments': selection_notes + d['feature_notes']}
 
         if preferred:
@@ -554,8 +663,18 @@ class GenerateLayoutsView(APIView):
         markers = _existing_markers(detected, lot_w, lot_l)
         ordered = []
         for style in engine.STYLES:
-            design = _price(designs[style], items_by_id, area, ps, installed)
+            design = _price(designs[style], items_by_id, area, ps, installed, lawns[style], new_lawn, scope)
             design['target_budget'] = targets[style]
+            design['budget_use'] = round(design['total_cost'] / targets[style], 2) if targets[style] else None
+            if preferred and (design.get('budget_note') or '').startswith('The planting beds are full'):
+                # The customer's own picks are what's limiting: say which, what the full beds cost, and what helps
+                names = sorted({items_by_id[s.id].name for s in specs if s.is_plant and s.id in items_by_id})
+                listed = ', '.join(names[:3]) + (f' and {len(names) - 3} more' if len(names) > 3 else '')
+                design['budget_note'] = (
+                    f"Your chosen plants ({listed}) fill the planting beds at healthy spacing for "
+                    f"₱{design['total_cost']:,.0f}, so the rest of your ₱{targets[style]:,.0f} isn't needed. "
+                    "To use more of it, add taller or feature plants (they take the back of the beds), "
+                    "or garden features such as benches and rocks.")
             design['plants'] = design['plants'] + markers
             ordered.append(design)
 
@@ -566,6 +685,7 @@ class GenerateLayoutsView(APIView):
             'detected_zones': [{'zone': z['zone'], 'label': z.get('label', '')} for z in detected],
             'budget_range': {'min': budget_min, 'max': budget_max},
             'install': installed,
+            'scope': scope if installed else None,
             'compatibility_warnings': compat_warnings,
         }
         cache.set(key, payload, _CACHE_TTL)
@@ -613,6 +733,123 @@ def scan_zones(request):
     if error:
         return Response({'status': 'failed', 'zones': []})
     return Response({'status': 'ok', 'zones': [z for z in found if z['blocks_planting']]})
+
+
+class LayoutCheckThrottle(UserRateThrottle):
+    scope = 'layout_checks'
+
+
+class LayoutCheckAnonThrottle(AnonRateThrottle):
+    scope = 'layout_checks_anon'
+
+
+MAX_REVIEW_ITEMS = 500
+
+
+def _bad(msg):
+    return Response({'error': msg}, status=status.HTTP_400_BAD_REQUEST)
+
+
+def _layout_request(data, extra_ids=()):
+    """Shared body of the layout-review / layout-place requests → (clean plants, site, plan, specs), or a 400."""
+    plants = data.get('plants')
+    if not isinstance(plants, list) or len(plants) > MAX_REVIEW_ITEMS:
+        return _bad(f'plants must be a list of at most {MAX_REVIEW_ITEMS} items.')
+    try:
+        lot_w, lot_l = float(data.get('lot_width')), float(data.get('lot_length'))
+        if not (0 < lot_w <= 200 and 0 < lot_l <= 200):
+            raise ValueError
+    except (TypeError, ValueError):
+        return _bad('Lot width and lot length must be positive numbers (up to 200 m).')
+    clean = []
+    try:
+        for p in plants:
+            if not isinstance(p, dict):
+                raise ValueError
+            if p.get('is_existing'):
+                clean.append({'is_existing': True})
+                continue
+            x, z = float(p['x']), float(p['z'])
+            if not (math.isfinite(x) and math.isfinite(z)):
+                raise ValueError
+            clean.append({'plant_id': str(int(p['plant_id'])), 'x': x, 'z': z,
+                          'rotation': float(p.get('rotation') or 0), 'uid': p.get('uid')})
+    except (KeyError, TypeError, ValueError):
+        return _bad('Each item needs a numeric plant_id and x / z in metres.')
+    try:
+        zones = [str(z) for z in _parse_list(data.get('keep_clear_zones'), 'keep_clear_zones')]
+        plan = engine.GardenPlan.from_dict(data.get('garden_plan') or None)
+    except (ValueError, KeyError, TypeError):
+        return _bad('keep_clear_zones must be a list and garden_plan a design plan.')
+    ids = {p['plant_id'] for p in clean if 'plant_id' in p} | {str(i) for i in extra_ids}
+    items = list(InventoryItem.objects.filter(id__in=ids))
+    specs = (engine.specs_from_inventory([i for i in items if i.category == 'plant'], keep_all=True)
+             + engine.feature_specs_from_inventory([i for i in items if i.category in ('furniture', 'hardscape')],
+                                                   keep_all=True))
+    return clean, engine.Site(lot_w, lot_l, engine.zone_cells(zones)), plan, specs
+
+
+@api_view(['POST'])
+@permission_classes([AllowAny])
+@throttle_classes([LayoutCheckThrottle, LayoutCheckAnonThrottle])
+def layout_review(request):
+    """
+    POST /api/layout-review/  — designer's notes on a design the customer edited in the 3D view.
+    Body: {plants: [{plant_id, x, z, rotation?, uid?, is_existing?}], lot_width, lot_length,
+           garden_plan?: the design's plan (beds + lawn), keep_clear_zones?: [zone ids], tidy?: bool}
+    → {notes: [{kind, items: [index], uids: [uid], message}]}; with tidy also
+      {moves: [{index, uid, x, z}], tidy_notes: [str]} and notes for the tidied layout.
+    Same rules the engine follows (layout_engine.review / tidy), never blocking: the design is theirs.
+    """
+    parsed = _layout_request(request.data)
+    if isinstance(parsed, Response):
+        return parsed
+    clean, site, plan, specs = parsed
+    uid_of = lambda i: clean[i].get('uid')  # noqa: E731
+    body = {}
+    if str(request.data.get('tidy', '')).strip().lower() in ('true', '1', 'yes'):
+        moved, tidy_notes = engine.tidy(clean, specs, site, plan)
+        for i, (x, z) in moved.items():
+            clean[i] = {**clean[i], 'x': x, 'z': z}
+        body['moves'] = [{'index': i, 'uid': uid_of(i), 'x': x, 'z': z} for i, (x, z) in sorted(moved.items())]
+        body['tidy_notes'] = tidy_notes
+    body['notes'] = [{**n, 'uids': [uid_of(i) for i in n['items']]} for n in engine.review(clean, specs, site, plan)]
+    return Response(body)
+
+
+@api_view(['POST'])
+@permission_classes([AllowAny])
+@throttle_classes([LayoutCheckThrottle, LayoutCheckAnonThrottle])
+def layout_place(request):
+    """
+    POST /api/layout-place/  — the customer adds one item to a design they are editing.
+    Body: the layout-review body + add: catalog id → {plant_id, x, z, rotation} where a designer would
+    put it (layout_engine.place_one); 409 with a plain reason when it is out of stock or has no room.
+    """
+    try:
+        add_id = str(int(request.data.get('add')))
+    except (TypeError, ValueError):
+        return _bad('add must be a catalog item id.')
+    parsed = _layout_request(request.data, extra_ids=[add_id])
+    if isinstance(parsed, Response):
+        return parsed
+    clean, site, plan, specs = parsed
+    item = InventoryItem.objects.filter(id=add_id, is_active=True).first()
+    spec = next((s for s in specs if s.id == add_id), None)
+    if item is None or spec is None or not item.model_file:
+        return Response({'error': "That item can't be added to a design."}, status=status.HTTP_400_BAD_REQUEST)
+    used = sum(1 for p in clean if p.get('plant_id') == add_id)
+    if used >= spec.stock:
+        return Response({'error': f'We have {spec.stock} {item.name} in stock, and this design already uses '
+                                  f"{'it' if spec.stock == 1 else 'them all'}." if spec.stock else
+                                  f'{item.name} is out of stock right now.'},
+                        status=status.HTTP_409_CONFLICT)
+    spot = engine.place_one(clean, specs, site, spec, plan, seed=len(clean))
+    if spot is None:
+        return Response({'error': f'There is no room left for {item.name}. Remove or move something nearby, '
+                                  'then try again.'}, status=status.HTTP_409_CONFLICT)
+    rotation = engine.SEAT_FACING if spec.kind == 'seat' else float(random.Random(len(clean)).randrange(0, 360, 15))
+    return Response({'plant_id': add_id, 'x': spot[0], 'z': spot[1], 'rotation': rotation})
 
 
 @api_view(['GET'])

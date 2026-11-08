@@ -2,13 +2,15 @@ from django.urls import path, include
 from rest_framework import routers
 
 from .views import generate_depth
+from .addresses import SavedAddressViewSet, address_areas
+from .crew_location import arrived, live_locations, report_location
 from .analytics import income_analytics
 from .portfolio import BusinessCredentialViewSet, PortfolioViewSet
 from .funnel import funnel_summary, record_funnel_event
-from .garden_ai import ai_designer_health, scan_zones
+from .garden_ai import ai_designer_health, layout_place, layout_review, scan_zones
 from . import push
 from .overview import business_overview
-from .reports import balances, crew_output, money_in
+from .reports import balances, crew_output, customer_areas, money_in
 from .views_office import activity_list, business_profile, cash_overview, cash_receive
 from .pricing import budget_suggestion, pricing_estimate, pricing_settings, quick_estimate
 from .reviews import moderate_review, review_highlights, review_moderation_list
@@ -35,12 +37,19 @@ router.register(r'product-reviews', ProductReviewViewSet, basename='product-revi
 router.register(r'projects', ProjectTrackerViewSet, basename='project')
 router.register(r'portfolio', PortfolioViewSet, basename='portfolio')
 router.register(r'business-credentials', BusinessCredentialViewSet, basename='business-credential')
+router.register(r'addresses', SavedAddressViewSet, basename='address')
 
 urlpatterns = [
     path('', include(router.urls)),
+    path('address-areas/', address_areas, name='address-areas'),
+    path('crew-location/', report_location, name='crew-location'),
+    path('crew-location/live/', live_locations, name='crew-location-live'),
+    path('crew-location/arrived/', arrived, name='crew-arrived'),
     path('generate-depth/', generate_depth, name='generate-depth'),
     path('generate-layouts/', GenerateLayoutsView.as_view(), name='generate-layouts'),
     path('scan-zones/', scan_zones, name='scan-zones'),
+    path('layout-review/', layout_review, name='layout-review'),
+    path('layout-place/', layout_place, name='layout-place'),
     path('pricing/', pricing_settings, name='pricing'),
     path('pricing/estimate/', pricing_estimate, name='pricing-estimate'),
     path('pricing/suggest/', budget_suggestion, name='pricing-suggest'),
@@ -50,6 +59,7 @@ urlpatterns = [
     path('reports/money/', money_in, name='report-money'),
     path('reports/balances/', balances, name='report-balances'),
     path('reports/crew/', crew_output, name='report-crew'),
+    path('reports/areas/', customer_areas, name='report-areas'),
     path('cash/', cash_overview, name='cash-overview'),
     path('cash/receive/', cash_receive, name='cash-receive'),
     path('business/', business_profile, name='business-profile'),

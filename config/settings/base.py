@@ -208,6 +208,9 @@ REST_FRAMEWORK.setdefault('DEFAULT_THROTTLE_RATES', {}).update({
     'smart_layouts': os.environ.get('SMART_LAYOUTS_PER_DAY', '40') + '/day',
     'zone_scans': os.environ.get('ZONE_SCANS_PER_DAY', '15') + '/day',
     'estimates': '300/hour',  # public price estimates (Studio summary)
+    # Designer's notes / Tidy up while a customer edits an AI design (one call per edit)
+    'layout_checks': '1200/hour',
+    'layout_checks_anon': '300/hour',
     # Slow down password guessing and sign-up / reset spam (per IP address)
     'login': os.environ.get('LOGINS_PER_MINUTE', '10') + '/min',
     'register': '20/hour',
