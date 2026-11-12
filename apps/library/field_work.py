@@ -116,3 +116,32 @@ def materials_for(design):
         })
     order = {'plant': 0, 'hardscape': 1, 'furniture': 2}
     return sorted(rows, key=lambda r: (order.get(r['category'], 3), -r['quantity'], r['name']))
+
+
+def plant_breakdown_for(placed_items, previous=None):
+    """
+    The procurement list ({plant_id, name, category, quantity, unit_price, subtotal}) counted from what's
+    placed. Used when a design is saved without one (the Studio sends only the placed items), so the
+    office's plant list and the customer's review never show the old version's plants.
+    Prices: today's catalog price, else the price the old list had.
+    """
+    counts = Counter()
+    for item in placed_items or []:
+        if not isinstance(item, dict) or item.get('is_existing'):
+            continue
+        pid = item.get('plant_id') or item.get('productId') or item.get('product_id')
+        if pid not in (None, ''):
+            counts[str(pid)] += 1
+    numeric = [int(p) for p in counts if str(p).isdigit()]
+    catalog = {str(i.id): i for i in InventoryItem.objects.filter(id__in=numeric)}
+    old = {str(r.get('plant_id')): r for r in (previous or []) if isinstance(r, dict)}
+    rows = []
+    for pid, qty in counts.items():
+        item, before = catalog.get(pid), old.get(pid, {})
+        name = item.name if item else before.get('name')
+        if not name:
+            continue
+        price = float(item.unit_price) if item else float(before.get('unit_price') or 0)
+        rows.append({'plant_id': pid, 'name': name, 'category': item.category if item else before.get('category', 'plant'),
+                     'quantity': qty, 'unit_price': price, 'subtotal': round(price * qty, 2)})
+    return sorted(rows, key=lambda r: (r['category'] != 'plant', r['name']))

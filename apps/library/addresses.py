@@ -17,9 +17,10 @@ from functools import lru_cache
 from pathlib import Path
 
 from rest_framework import permissions, serializers, status, viewsets
-from rest_framework.decorators import action, api_view, permission_classes
+from rest_framework.decorators import action, api_view, permission_classes, throttle_classes
 from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
+from rest_framework.throttling import ScopedRateThrottle
 
 from .models import SavedAddress
 
@@ -122,6 +123,32 @@ def address_areas(request):
     data = areas()
     response = Response({'province': data['province'], 'sources': data['sources'], 'cities': data['cities']})
     response['Cache-Control'] = 'public, max-age=86400'
+    return response
+
+
+class AddressLocateThrottle(ScopedRateThrottle):
+    scope = 'address_locate'
+
+
+@api_view(['GET'])
+@permission_classes([AllowAny])          # guests check out too
+@throttle_classes([AddressLocateThrottle])
+def address_locate(request):
+    """
+    GET /api/address-locate/?lat=&lng= → which town and barangay the pin is in (geo_lookup.py, official
+    boundaries, looked up on this server). {match: 'inside'|'near', city_code, barangay_code, city_name,
+    barangay_name, distance_m}, or {match: null} outside Quezon Province.
+    """
+    from .geo_lookup import locate
+    try:
+        lat, lng = float(request.query_params.get('lat')), float(request.query_params.get('lng'))
+    except (TypeError, ValueError):
+        return Response({'error': 'lat and lng must be numbers.'}, status=status.HTTP_400_BAD_REQUEST)
+    if not (-90 <= lat <= 90 and -180 <= lng <= 180):
+        return Response({'error': 'That is not a place on Earth.'}, status=status.HTTP_400_BAD_REQUEST)
+    found = locate(lat, lng)
+    response = Response(found or {'match': None})
+    response['Cache-Control'] = 'private, max-age=3600'   # the same pin always gives the same answer
     return response
 
 

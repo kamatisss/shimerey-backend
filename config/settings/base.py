@@ -60,7 +60,8 @@ INSTALLED_APPS = [
 
 REST_FRAMEWORK = {
     'DEFAULT_AUTHENTICATION_CLASSES': (
-        'rest_framework_simplejwt.authentication.JWTAuthentication',
+        # JWT + the account's session version, so "Sign out everywhere" ends every token (signout.py)
+        'apps.library.jwt_session.SessionJWTAuthentication',
     )
 }
 
@@ -211,11 +212,21 @@ REST_FRAMEWORK.setdefault('DEFAULT_THROTTLE_RATES', {}).update({
     # Designer's notes / Tidy up while a customer edits an AI design (one call per edit)
     'layout_checks': '1200/hour',
     'layout_checks_anon': '300/hour',
+    # The shop cart saves itself (debounced) after every change
+    'cart_saves': '600/hour',
+    # Design share links: making/stopping them, and opening one (per user, or per IP for visitors)
+    'design_shares': '60/hour',
+    'shared_design_views': '600/hour',
+    'design_proposals': '30/hour',   # PDF proposals (each one builds a PDF on the server)
     # Slow down password guessing and sign-up / reset spam (per IP address)
     'login': os.environ.get('LOGINS_PER_MINUTE', '10') + '/min',
     'register': '20/hour',
     'password_reset': '5/hour',
     'password_reset_confirm': '20/hour',
+    'account_security': '10/hour',
+    'data_export': '10/hour',
+    'address_locate': '300/hour',    # pin → town & barangay (address form; per user, or per IP for guests)
+    'sun_map': '120/hour',           # Mark your yard → Show sun & shade (a few hundred ms of maths each)
     'funnel_events': '300/hour',
 })
 

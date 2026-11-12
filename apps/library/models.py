@@ -43,6 +43,9 @@ class InventoryItem(models.Model):
     ]
     sunlight = models.CharField(max_length=20, choices=SUNLIGHT_CHOICES, default='full_sun', blank=True)
     water_need = models.CharField(max_length=20, choices=WATER_CHOICES, default='moderate', blank=True)
+    # Groundcover (mani-mani, mondo grass…): planted as a carpet over the beds, not one by one. Priced per m² covered
+    # (unit_price), filled in automatically by the AI Designer; never placed as single plants.
+    is_groundcover = models.BooleanField(default=False)
     is_invasive = models.BooleanField(
         default=False,
         help_text="True if species has aggressive rhizomatous/root spread requiring isolation (e.g. Bamboo)"
@@ -142,6 +145,8 @@ class GardenDesign(models.Model):
         ('rejected', 'Rejected'),
     ]
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='draft')
+    # Goes up on every change, so an approval names the exact version the customer saw (design_review.py)
+    revision = models.PositiveIntegerField(default=1)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -240,6 +245,35 @@ class ServiceBooking(models.Model):
 
     def __str__(self):
         return f"{self.service_type} for {self.user.username} on {self.scheduled_date}"
+
+
+class DesignReview(models.Model):
+    """
+    One step in agreeing the final design of a booking (design_review.py): the office sends the design
+    (after the site visit), the customer approves it or asks for changes, or the office records that the
+    customer approved it in person. Append-only: it's the record of what was agreed, and when.
+    `snapshot` keeps the design exactly as it was at that step.
+    """
+    KIND_CHOICES = [
+        ('sent',      'Sent to the customer'),
+        ('approved',  'Approved by the customer'),
+        ('approved_in_person', 'Approved in person (recorded by the office)'),
+        ('changes',   'Customer asked for changes'),
+    ]
+    booking = models.ForeignKey(ServiceBooking, on_delete=models.CASCADE, related_name='design_reviews')
+    design = models.ForeignKey(GardenDesign, on_delete=models.SET_NULL, null=True, blank=True, related_name='reviews')
+    revision = models.PositiveIntegerField()
+    kind = models.CharField(max_length=20, choices=KIND_CHOICES)
+    note = models.TextField(blank=True, default='')
+    by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True, related_name='design_reviews')
+    snapshot = models.JSONField(default=dict, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['-created_at', '-id']
+
+    def __str__(self):
+        return f'{self.get_kind_display()}: booking #{self.booking_id}, design #{self.design_id} r{self.revision}'
 
 
 class ProjectMilestone(models.Model):
@@ -954,6 +988,23 @@ class CrewLocation(models.Model):
         indexes = [models.Index(fields=['user', '-recorded_at'])]
 
 
+class AccountProfile(models.Model):
+    """What an account holds beyond Django's User (account.py, /api/me/): the person's own mobile number,
+    used to fill in checkout and bookings. One row per user, made on first use."""
+    user = models.OneToOneField(User, on_delete=models.CASCADE, related_name='account_profile')
+    phone = models.CharField(max_length=20, blank=True, default='')   # PH mobile, stored as 09XXXXXXXXX
+    # The customer closed the account (account_privacy.py): personal details erased, business records kept.
+    # The owner sees these under User accounts → Closed; they can't be edited, re-activated or deleted.
+    closed_at = models.DateTimeField(null=True, blank=True)
+    # "Sign out everywhere" (signout.py): every login token carries this number; raising it ends them all
+    session_version = models.PositiveIntegerField(default=0)
+    signed_out_everywhere_at = models.DateTimeField(null=True, blank=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return f'Profile of {self.user}'
+
+
 class SavedAddress(models.Model):
     """A customer's address book entry (Quezon Province only, always with a map pin; see addresses.py)."""
     user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='saved_addresses')
@@ -975,6 +1026,17 @@ class SavedAddress(models.Model):
 
     def __str__(self):
         return f'{self.user} · {self.label}'
+
+
+class SavedCart(models.Model):
+    """A customer's shop cart, kept on the server so it follows them between phone and laptop (cart.py).
+    Only product ids and quantities: prices and stock always come from the catalog."""
+    user = models.OneToOneField(User, on_delete=models.CASCADE, related_name='saved_cart')
+    items = models.JSONField(default=list, blank=True)   # [{"id": <InventoryItem id>, "quantity": n}, …]
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return f'{self.user} · {len(self.items)} line(s)'
 
 
 class BusinessProfile(models.Model):
@@ -1081,3 +1143,21 @@ class PrivacyConsent(models.Model):
 
     def __str__(self):
         return f'{self.user_id} accepted privacy notice {self.policy_version}'
+
+
+class DesignShare(models.Model):
+    """A public link to one saved design (/d/<token>), made by the design's owner so they can send it
+    to family on Messenger etc. Anyone with the link sees a view-only copy (share.py strips the yard
+    photo, photo pins, notes and who made it). Stopping the share sets revoked_at; the link then 404s."""
+    design = models.ForeignKey(GardenDesign, on_delete=models.CASCADE, related_name='shares')
+    created_by = models.ForeignKey(User, on_delete=models.CASCADE, related_name='design_shares')
+    token = models.CharField(max_length=24, unique=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    revoked_at = models.DateTimeField(null=True, blank=True)
+    view_count = models.PositiveIntegerField(default=0)   # opens by anyone but the owner
+
+    class Meta:
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f'Share {self.token} of design #{self.design_id}{" (stopped)" if self.revoked_at else ""}'

@@ -325,3 +325,31 @@ def order_status_changed(order, old, new):
     if msg:
         kind = {'Out for Delivery': 'order_on_the_way', 'Delivered': 'order_delivered', 'Cancelled': 'order_cancelled'}[new]
         notify([order.user], kind, msg, link=MY_ORDERS)
+
+
+# ─── Final design (design_review.py) ─────────────────────────────────────────
+
+def design_review_link(booking):
+    """The customer's booking page with the design review open."""
+    return f'{MY_BOOKINGS}?review={booking.id}'
+
+
+def design_sent(booking, note=''):
+    notify([booking.user], 'design_sent',
+           f'Your final garden design for booking #{booking.id} is ready. Please check it and approve it'
+           + (f'. Our note: {note}' if note else '.'),
+           link=design_review_link(booking), alert='Your final design is ready to approve')
+
+
+def design_approved(booking, in_person=False):
+    how = 'was approved in person' if in_person else f'was approved by {_name(booking.user)}'
+    notify(office_users(), 'design_approved', f'The final design for booking #{booking.id} {how}.',
+           link=lambda u: _office_link(u, booking_office_path(booking.id)))
+    notify(booking.assigned_crew.all(), 'design_approved',
+           f'The design for booking #{booking.id} is final. Build from this version.', link=crew_job_link(booking))
+
+
+def design_changes_requested(booking, note):
+    notify(office_users(), 'design_changes',
+           f'{_name(booking.user)} asked for changes to the design for booking #{booking.id}: {note}',
+           link=lambda u: _office_link(u, booking_office_path(booking.id)))

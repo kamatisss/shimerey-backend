@@ -43,9 +43,11 @@ from rest_framework.views import APIView
 from . import layout_engine as engine
 from .models import InventoryItem, LayoutGenerationLog, PricingSettings
 from .pricing import (
-    EXISTING, MAKEOVER, SCOPES, fixed_costs, installed_price, plant_budget_from_all_in, plants_only_estimate, project_estimate,
+    EXISTING, MAKEOVER, SCOPES, fixed_costs, installed_price, is_small_stone, plant_budget_from_all_in, plants_only_estimate,
+    project_estimate,
 )
 from .utils import scan_image_zones
+from . import groundcover as gcover, site_survey, sun_map
 
 logger = logging.getLogger(__name__)
 
@@ -249,6 +251,8 @@ def _price(design, items_by_id, area_sqm, ps, installed=True, lawn_sqm=0.0, new_
     for p in design['plants']:
         if not p.get('is_existing'):
             counts[p['plant_id']] = counts.get(p['plant_id'], 0) + 1
+    for g in design.get('groundcover') or []:   # groundcover: m² covered (priced per m²)
+        counts[g['plant_id']] = counts.get(g['plant_id'], 0) + int(g['area_sqm'])
     est = (project_estimate(counts, items_by_id, area_sqm, ps, lawn_sqm, new_lawn, scope) if installed
            else plants_only_estimate(counts, items_by_id, ps))
     design['plant_cost'] = est['plant_cost']
@@ -295,7 +299,16 @@ def _cache_key(*parts):
 
 
 FEATURE_CATEGORIES = ('furniture', 'hardscape')
-MAX_SEATS, MAX_ROCKS, MAX_FEATURE_KINDS = 2, 9, 4
+MAX_SEATS, MAX_FEATURE_KINDS = 2, 4
+MAX_FEATURE_QTY = 300   # sanity bound when reading the request; the real limits come from the yard (rock_limits)
+
+
+def rock_limits(area_sqm):
+    """Most of one kind of rock for a yard of this area (m²), mirrored in the AI form (data/pricing.js
+    rockLimits): an accent boulder per ~12 m² (3–30), a small garden stone per m² (24–300). More than that
+    crowds the beds and the design can't place them well."""
+    a = max(0.0, float(area_sqm or 0))
+    return max(3, min(30, round(a / 12))), max(24, min(300, round(a)))
 
 
 def _parse_features(value):
@@ -306,11 +319,28 @@ def _parse_features(value):
             fid, qty = str(int(entry['id'])), int(entry.get('quantity', 1))
         except (KeyError, TypeError, ValueError):
             raise ValueError('Each garden feature needs a numeric id and quantity.')
-        if not 1 <= qty <= MAX_ROCKS:
-            raise ValueError(f'Garden feature quantities must be between 1 and {MAX_ROCKS}.')
+        if not 1 <= qty <= MAX_FEATURE_QTY:   # per-kind limits (seats, by yard size) are checked once the items are known
+            raise ValueError(f'Garden feature quantities must be between 1 and {MAX_FEATURE_QTY}.')
         out[fid] = qty
     if len(out) > MAX_FEATURE_KINDS:
         raise ValueError(f'Choose at most {MAX_FEATURE_KINDS} kinds of garden features.')
+    return out
+
+
+def _parse_plant_qty(value, preferred):
+    """[{id, quantity}] → {id: quantity} for plants the customer picked and gave an amount ("let us decide" =
+    no entry). Raises ValueError with a customer-readable message."""
+    out = {}
+    for entry in _parse_list(value, 'plant_qty'):
+        try:
+            pid, qty = str(int(entry['id'])), int(entry.get('quantity'))
+        except (KeyError, TypeError, ValueError):
+            raise ValueError('Each plant amount needs a numeric id and quantity.')
+        if not 1 <= qty <= engine.MAX_PLANT_QTY:
+            raise ValueError(f'Plant amounts must be between 1 and {engine.MAX_PLANT_QTY}.')
+        if pid not in set(preferred):
+            raise ValueError('Set an amount only for plants you picked.')
+        out[pid] = qty
     return out
 
 
@@ -432,7 +462,7 @@ class GenerateLayoutsView(APIView):
       seed (int, optional — "show me other variations"), image (optional legacy: scanned for zones
       only when keep_clear_zones isn't sent),
       features (optional list of {id, quantity}: seating from furniture, accent rocks from hardscape;
-      placed first, paid for first, at most MAX_SEATS seats and MAX_ROCKS rocks of each kind).
+      placed first, paid for first, at most MAX_SEATS seats and, of each kind of rock, rock_limits(yard area)).
     Always returns 3 designs unless the request is invalid or the anti-abuse limit is hit.
     """
     permission_classes = [IsAuthenticated]
@@ -469,6 +499,11 @@ class GenerateLayoutsView(APIView):
             preferred = [str(p) for p in _parse_list(data.get('preferred_plant_ids'), 'preferred_plant_ids')]
             confirmed_zones = [str(z) for z in _parse_list(data.get('keep_clear_zones'), 'keep_clear_zones')]
             feature_qty = _parse_features(data.get('features'))
+            plant_qty = _parse_plant_qty(data.get('plant_qty'), preferred)
+            # Groundcover over the beds (groundcover.py): on unless the customer switched it off
+            groundcover_on = str(data.get('groundcover', 'auto')).strip().lower() not in ('off', 'false', '0', 'no', 'none')
+            # What the customer marked on their yard (photo or plan): site_survey.py
+            survey = site_survey.parse(data.get('site_survey'), lot_w, lot_l)
         except ValueError as e:
             return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
         try:
@@ -490,9 +525,13 @@ class GenerateLayoutsView(APIView):
             return Response({'error': f"sun must be one of {', '.join(SUN_LEVELS)}; maintenance one of "
                                       f"{', '.join(MAINTENANCE_LEVELS)}."}, status=status.HTTP_400_BAD_REQUEST)
         ps = PricingSettings.current()
-        area = lot_w * lot_l
+        area = site_survey.area(survey, lot_w, lot_l)   # the yard's own shape when it has one
         catalog_items = list(InventoryItem.objects.filter(category='plant', is_active=True))
         items_by_id = {str(i.id): i for i in catalog_items}
+        # Groundcovers the customer picked steer the carpet over the beds; they aren't plants to place one by one
+        gc_ids = {str(i.id) for i in catalog_items if i.is_groundcover}
+        picked_gc = [p for p in preferred if p in gc_ids]
+        preferred = [p for p in preferred if p not in gc_ids]
         feature_items = {str(i.id): i for i in InventoryItem.objects.filter(
             id__in=[int(k) for k in feature_qty], category__in=FEATURE_CATEGORIES, is_active=True).exclude(model_file='')}
         missing = [k for k in feature_qty if k not in feature_items]
@@ -502,6 +541,15 @@ class GenerateLayoutsView(APIView):
         if sum(q for k, q in feature_qty.items() if feature_items[k].category == 'furniture') > MAX_SEATS:
             return Response({'error': f'Choose at most {MAX_SEATS} seats for one seating spot.'},
                             status=status.HTTP_400_BAD_REQUEST)
+        max_boulders, max_stones = rock_limits(area)
+        for k, q in feature_qty.items():
+            item = feature_items[k]
+            if item.category != 'hardscape':
+                continue
+            limit, what = (max_stones, 'small stones') if is_small_stone(item) else (max_boulders, 'boulders')
+            if q > limit:
+                return Response({'error': f'For a {area:g} m² yard, choose at most {limit} {what} of each kind '
+                                          f'({item.name}).'}, status=status.HTTP_400_BAD_REQUEST)
         items_by_id.update(feature_items)
         if installed:
             # All-in budget: VAT, design fee, site prep, materials and mobilisation come off first;
@@ -537,13 +585,18 @@ class GenerateLayoutsView(APIView):
                 selection_notes.append(
                     f"Left out {', '.join(named) if named else 'a plant you chose'}: not available right now. "
                     "This design uses your other chosen plants.")
-        # Plants that suit the yard's sun and the care the owner wants to give (picks are kept, with a note)
+        # Plants that suit the yard's sun and the care the owner wants to give (picks are kept, with a note).
+        # When the customer told us how the yard faces, sun is worked out spot by spot instead (sun_map.py).
+        if survey.get('sun'):
+            sun = None
         specs, condition_notes = suit_conditions(specs, sun, maintenance, chosen=bool(preferred))
         selection_notes += condition_notes
 
         # Each style's beds and lawn: the lawn is priced as turf (or left alone), the beds get soil & mulch,
         # and a low-maintenance garden plants the beds more sparingly
-        plans = {style: engine.garden_plan(style, engine.Site(lot_w, lot_l), specs, seed) for style in engine.STYLES}
+        plans = {style: engine.garden_plan(style, engine.Site(lot_w, lot_l), specs, seed,
+                                           screen=engine.screen_row(specs, plant_qty),
+                                           must=engine.tall_picks(specs, preferred, plant_qty, style)) for style in engine.STYLES}
         lawns = {style: plans[style].lawn_area() if installed else 0.0 for style in engine.STYLES}
         caps = {style: engine.low_care_cap(engine.Site(lot_w, lot_l), plans[style]) if maintenance == 'low'
                 else engine.MAX_PLANTS for style in engine.STYLES}
@@ -554,8 +607,10 @@ class GenerateLayoutsView(APIView):
                                        kind='seat' if i.category == 'furniture' else 'rock'), feature_qty[k])
                      for k, i in feature_items.items() if k not in {f.id for f in fspecs}]
 
-        # Good / better / best across the range: Minimalist at the low end, Lush at the top
-        targets = {'Minimalist': budget_min, 'Symmetrical': (budget_min + budget_max) // 2, AI_STYLE: budget_max}
+        # Three styles for the customer's budget (2026-11-12, was low / middle / top of the range): every design aims
+        # at the top of the range and spends it its own way — Minimalist on bolder blocks of a few plants, Lush on
+        # abundance. Customers compare styles, not price levels.
+        targets = {style: budget_max for style in engine.STYLES}
         range_text = f"₱{budget_min:,}" if budget_min == budget_max else f"₱{budget_min:,}–₱{budget_max:,}"
         budget_warning = None
         if any(s.is_plant for s in specs):
@@ -585,6 +640,27 @@ class GenerateLayoutsView(APIView):
                 budget_warning = ('Budget may be too tight for an area of this size. '
                                   'Consider increasing your budget or choosing low-cost flora.')
         plant_budgets = {style: to_plants(t, lawns[style]) for style, t in targets.items()}
+        # What the customer asked for by name — amounts of a plant, seats and rocks — is in every design: its
+        # installed cost is the least each design's plants get, even past the budget (and the design says so)
+        by_spec = {s.id: s for s in specs if s.is_plant}
+        asked = int(sum(by_spec[k].price * q for k, q in plant_qty.items() if k in by_spec)
+                    + sum(f.price * q for f, q in features))
+        over_notes = {}
+        for style in engine.STYLES:
+            if asked > plant_budgets[style]:
+                over_notes[style] = (f"The plants and features you asked for come to ₱{asked:,} installed, more than this "
+                                     "budget leaves after the site work, so this design goes over your budget to include them.")
+                plant_budgets[style] = asked
+        gc_sun, gc_shade = gcover.items_for(catalog_items, picked_gc) if groundcover_on else (None, None)
+        gc_plan = {}   # style → (bed m², m² to cover)
+        if gc_sun is not None:
+            unit = max(installed_price(ps, i, scope) if installed else int(i.unit_price)
+                       for i in {gc_sun, gc_shade} if i is not None)
+            for style in engine.STYLES:
+                beds = gcover.bed_area(area, plans[style], survey)
+                cover, cost = gcover.reserve(beds, unit, max(0, plant_budgets[style] - asked))   # after their asks
+                gc_plan[style] = (beds, cover)
+                plant_budgets[style] -= cost
 
         # 1b. Botanical compatibility audit for preferred flora selections
         from .compatibility import evaluate_plant_compatibility, format_compatibility_prompt_note
@@ -604,12 +680,31 @@ class GenerateLayoutsView(APIView):
             elif image is not None:
                 zone_scan = 'failed'
         keep_clear = engine.zone_cells([z['zone'] for z in detected])
-        site = engine.Site(lot_w, lot_l, keep_clear)
+        # The engine checks the marked areas, trees, gates, screens and views exactly (SiteRules); Gemini, which
+        # thinks in grid cells, gets the cells they cover
+        site = engine.Site(lot_w, lot_l, keep_clear, site_survey.rules(survey, lot_w, lot_l))
+        if site.rules.sun:
+            share = sun_map.summary(site.rules.sun)
+            selection_notes = selection_notes + [
+                f"Sun and shade worked out for each spot: about {share['full_sun']:.0%} of your yard gets full sun, "
+                f"{share['partial_shade']:.0%} part shade and {share['full_shade']:.0%} shade."]
+            hours = [h for row in site.rules.sun for h in row]
+            homeless = [s.name for s in specs if s.is_plant and s.id in preferred
+                        and not any(sun_map.plant_fits_hours(s.sunlight, h) for h in hours)
+                        and s.sunlight != 'full_shade']
+            if homeless:
+                selection_notes = selection_notes + [
+                    f"{', '.join(homeless)} need{'s' if len(homeless) == 1 else ''} more sun than any spot in your yard gets, "
+                    'so we left them out.']
+        survey_cells = site_survey.keep_clear_cells(survey, site)
+        survey_note = site_survey.note(survey)
+        if survey_note:
+            selection_notes = selection_notes + [survey_note]
 
         # 3. Anti-abuse limit, then the cache (a cached answer costs nothing)
         key = _cache_key(budget_min, budget_max, installed, round(lot_w, 1), round(lot_l, 1), sorted(preferred),
                          sorted(keep_clear), seed, ps.updated_at, sorted(feature_qty.items()),  # new rates → new estimates
-                         sun, maintenance, new_lawn, scope)
+                         sun, maintenance, new_lawn, scope, survey, sorted(plant_qty.items()), groundcover_on, sorted(picked_gc))
         cached = cache.get(key)
         if cached is not None:
             self._log(request, 'cached', zone_scan, 0, started)
@@ -622,17 +717,19 @@ class GenerateLayoutsView(APIView):
         # 4. Engine designs (always) …
         designs = {}
         for style in ('Symmetrical', 'Minimalist'):
-            d = engine.generate(style, specs, site, plant_budgets[style], preferred, seed, features, caps[style])
+            d = engine.generate(style, specs, site, plant_budgets[style], preferred, seed, features, caps[style], plant_qty)
             designs[style] = {**d, 'source': 'engine', 'adjustments': selection_notes + d['feature_notes']}
 
-        # … and the AI signature design when everything allows it
-        ai_status, adjustments = self._ai_status(request), 0
+        # … and the AI signature design when everything allows it. Exact amounts are the engine's job (the AI
+        # can't be held to them), so with amounts set all three designs are the engine's.
+        ai_status = 'disabled' if plant_qty else self._ai_status(request)   # amounts set: no AI call, no quota used
+        adjustments = 0
         if ai_status == 'ok':
             try:
                 taken = _feature_cells(specs, site, plant_budgets[AI_STYLE], seed, features)
                 plan = engine.garden_plan(AI_STYLE, site, specs, seed)
-                raw = call_gemini(gemini_api_key(), _system_instruction(specs, keep_clear | taken, bool(features),
-                                                                        _lawn_cells(plan, site) - keep_clear - taken),
+                raw = call_gemini(gemini_api_key(), _system_instruction(specs, keep_clear | survey_cells | taken, bool(features),
+                                                                        _lawn_cells(plan, site) - keep_clear - survey_cells - taken),
                                   _user_prompt(specs, catalog_items, plant_budgets[AI_STYLE], lot_w, lot_l, preferred,
                                                ', '.join(f"{z.get('label')} ({z['zone']})" for z in detected),
                                                installed, format_compatibility_prompt_note(compat_warnings)
@@ -650,7 +747,8 @@ class GenerateLayoutsView(APIView):
                 ai_status = trip_breaker(e)
                 ai_status = 'quota' if ai_status == 'quota' else 'error'
         if AI_STYLE not in designs:
-            d = engine.generate(AI_STYLE, specs, site, plant_budgets[AI_STYLE], preferred, seed, features, caps[AI_STYLE])
+            d = engine.generate(AI_STYLE, specs, site, plant_budgets[AI_STYLE], preferred, seed, features, caps[AI_STYLE],
+                                plant_qty)
             designs[AI_STYLE] = {**d, 'source': 'engine', 'adjustments': selection_notes + d['feature_notes']}
 
         if preferred:
@@ -659,12 +757,26 @@ class GenerateLayoutsView(APIView):
                     d['budget_note'] = ('We used all the stock of the plants you chose. Add more plants to your '
                                         'selection for a fuller design, or our team can source more.')
 
+        # 4b. Groundcover over each design's beds: the shade one under the crowns of tall plants and kept trees
+        if gc_plan:
+            specs_by_id = {s.id: s for s in specs}
+            spreads = {str(i.id): float(i.mature_spread or i.established_spread or 0) or None for i in catalog_items}
+            for style, d in designs.items():
+                beds, cover = gc_plan.get(style, (0.0, 0.0))
+                d['groundcover'] = gcover.assign(d['plants'] + site_survey.existing_markers(survey), specs_by_id, cover,
+                                                 gc_sun, gc_shade, spreads)
+                line = gcover.note(d['groundcover'], beds)
+                if line:
+                    d['adjustments'] = list(d.get('adjustments') or []) + [line]
+
         # 5. Price everything from the real price list, add the hidden obstacle markers
-        markers = _existing_markers(detected, lot_w, lot_l)
+        markers = _existing_markers(detected, lot_w, lot_l) + site_survey.existing_markers(survey)
         ordered = []
         for style in engine.STYLES:
             design = _price(designs[style], items_by_id, area, ps, installed, lawns[style], new_lawn, scope)
             design['target_budget'] = targets[style]
+            if style in over_notes:
+                design['adjustments'] = [over_notes[style]] + list(design.get('adjustments') or [])
             design['budget_use'] = round(design['total_cost'] / targets[style], 2) if targets[style] else None
             if preferred and (design.get('budget_note') or '').startswith('The planting beds are full'):
                 # The customer's own picks are what's limiting: say which, what the full beds cost, and what helps
@@ -687,6 +799,7 @@ class GenerateLayoutsView(APIView):
             'install': installed,
             'scope': scope if installed else None,
             'compatibility_warnings': compat_warnings,
+            'site_survey': survey,
         }
         cache.set(key, payload, _CACHE_TTL)
         self._log(request, ai_status, zone_scan, adjustments, started)
@@ -781,12 +894,16 @@ def _layout_request(data, extra_ids=()):
         plan = engine.GardenPlan.from_dict(data.get('garden_plan') or None)
     except (ValueError, KeyError, TypeError):
         return _bad('keep_clear_zones must be a list and garden_plan a design plan.')
+    try:
+        survey = site_survey.parse(data.get('site_survey'), lot_w, lot_l)
+    except site_survey.SurveyError as e:
+        return _bad(str(e))
     ids = {p['plant_id'] for p in clean if 'plant_id' in p} | {str(i) for i in extra_ids}
     items = list(InventoryItem.objects.filter(id__in=ids))
     specs = (engine.specs_from_inventory([i for i in items if i.category == 'plant'], keep_all=True)
              + engine.feature_specs_from_inventory([i for i in items if i.category in ('furniture', 'hardscape')],
                                                    keep_all=True))
-    return clean, engine.Site(lot_w, lot_l, engine.zone_cells(zones)), plan, specs
+    return clean, engine.Site(lot_w, lot_l, engine.zone_cells(zones), site_survey.rules(survey, lot_w, lot_l)), plan, specs
 
 
 @api_view(['POST'])

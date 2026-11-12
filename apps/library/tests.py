@@ -312,7 +312,7 @@ class GenerateLayoutsViewTests(APITestCase):
             full = E.generate(style, specs, site, 400000, seed=1)
             easy = E.generate(style, specs, site, 400000, seed=1, max_plants=cap)
             self.assertLessEqual(len(easy['plants']), cap, style)
-            if style == 'Minimalist':                        # already sparser than the cap: unchanged
+            if style == 'Minimalist' and len(full['plants']) <= cap:   # already sparser than the cap: unchanged
                 self.assertEqual(easy['plants'], full['plants'])
                 continue
             self.assertLess(len(easy['plants']), len(full['plants']), style)
@@ -451,11 +451,180 @@ class GenerateLayoutsViewTests(APITestCase):
         self._features_setup()
         for features, msg in [([{'id': 50, 'quantity': 3}], 'at most 2 seats'),
                               ([{'id': 1, 'quantity': 1}], 'no longer available'),   # a plant isn't a feature
-                              ([{'id': 51, 'quantity': 10}], 'between 1 and 9'),
+                              ([{'id': 51, 'quantity': 11}], 'choose at most 10 boulders'),    # 10 × 12 m: 120 m² → 10
+                              ([{'id': 51, 'quantity': 301}], 'between 1 and 300'),
                               ([{'quantity': 1}], 'numeric id')]:
             r = self.client.post(self.url, {**self.valid, 'features': features}, format='json')
             self.assertEqual(r.status_code, 400, features)
             self.assertIn(msg, r.data['error'])
+
+    @patch.dict(os.environ, {'GEMINI_API_KEY': 'your_gemini_api_key_here'})
+    def test_small_garden_stones_come_by_the_dozen_in_clusters_and_cost_less_to_place(self):
+        from apps.library.models import InventoryItem, PricingSettings
+        from apps.library.pricing import installed_price, labour_rate, layer_of
+        stone = InventoryItem.objects.create(id=52, name='River stones (small)', category='hardscape', unit_price=40,
+                                             stock_quantity=200, real_world_size=0.22, model_file='blueish_river_rock.glb')
+        boulder = InventoryItem.objects.create(id=53, name='River rock', category='hardscape', unit_price=500,
+                                               stock_quantity=20, real_world_size=0.6, model_file='blueish_river_rock.glb')
+        ps = PricingSettings.current()
+        self.assertEqual((layer_of(stone), layer_of(boulder)), ('stone', 'other'))
+        self.assertEqual(labour_rate(ps, 'stone'), ps.install_other / 5)          # a fifth of setting a boulder
+        self.assertEqual(installed_price(ps, stone), int(40 + ps.install_other / 5))
+        r = self.client.post(self.url, {**self.valid, 'budget': 150000, 'features': [{'id': 52, 'quantity': 24}]}, format='json')
+        self.assertEqual(r.status_code, 200, r.data)
+        for d in r.data['designs']:
+            stones = [p for p in d['plants'] if p['plant_id'] == '52']
+            self.assertEqual(len(stones), 24, d['design_name'])
+            # in clusters (about seven each), not one long scatter: every stone has a neighbour within 1 m
+            for p in stones:
+                near = min(((p['x'] - q['x']) ** 2 + (p['z'] - q['z']) ** 2) ** 0.5 for q in stones if q is not p)
+                self.assertLess(near, 1.0, (d['design_name'], p))
+
+    def test_every_pick_amount_and_feature_is_in_every_style(self):
+        """The customer's brief comes first in all three styles (2026-11-12: 3 bamboo came out as 2 / 1 / 0, a
+        picked palm vanished without a word, and the stones went missing)."""
+        from apps.library import layout_engine as E
+        specs = [E.PlantSpec('bamboo', 'Bamboo', 650, 50, 5.0, E.spacing_for(8.0, 150), mature=8.0, is_invasive=True),
+                 E.PlantSpec('palm', 'Christmas Palm', 850, 7, 4.0, E.spacing_for(6.5, 250), mature=6.5),
+                 E.PlantSpec('croton', 'Croton', 100, 95, 1.0, E.spacing_for(1.8), mature=1.8),
+                 E.PlantSpec('strelitzia', 'Strelitzia', 400, 34, 1.2, E.spacing_for(1.5), mature=1.5),
+                 E.PlantSpec('geranium', 'Geranium', 85, 64, 0.4, E.spacing_for(0.5), mature=0.5)]
+        bench = E.PlantSpec('bench', 'Bamboo bench', 3500, 5, 0.8, E.SEAT_PAD, kind='seat')
+        stones = E.PlantSpec('stones', 'River stones (small)', 40, 400, 0.22, 0.32, kind='rock')
+        site = E.Site(10, 12)
+        for style in E.STYLES:
+            d = E.generate(style, specs, site, 40000, [s.id for s in specs], 7, [(bench, 1), (stones, 12)],
+                           quantities={'bamboo': 3})
+            ids = [p['plant_id'] for p in d['plants']]
+            self.assertEqual(ids.count('bamboo'), 3, style)                          # the amount, exactly
+            self.assertEqual((ids.count('bench'), ids.count('stones')), (1, 12), style)   # their features
+            for s in specs:
+                self.assertIn(s.id, ids, f'{style}: {s.name} missing, notes {d["feature_notes"]}')
+            plan = E.GardenPlan.from_dict(d['garden_plan'])
+            self.assertEqual(E.check(d['plants'], specs + [bench, stones], site, 40000, plan), [], style)
+            # the bamboo is a row along the back fence (a screen), not three trees dotted about
+            zs = {p['z'] for p in d['plants'] if p['plant_id'] == 'bamboo'}
+            self.assertEqual(len(zs), 1, style)
+
+    def test_plant_amounts_are_met_or_explained(self):
+        from apps.library import layout_engine as E
+        from apps.library.models import InventoryItem
+        r = self.client.post(self.url, {**self.valid, 'preferred_plant_ids': ['1', '2', '4'],
+                                        'plant_qty': [{'id': 4, 'quantity': 12}, {'id': 1, 'quantity': 9}]}, format='json')
+        self.assertEqual(r.status_code, 200, r.data)
+        specs = {s.id: s for s in E.specs_from_inventory(InventoryItem.objects.all())}
+        site = E.Site(10, 12)
+        for d in r.data['designs']:
+            ids = [p['plant_id'] for p in d['plants'] if not p.get('is_existing')]
+            self.assertEqual(d['source'], 'engine', d['design_name'])                 # amounts: never the AI's guess
+            self.assertEqual(ids.count('4'), 12, d['design_name'])                   # roses: exactly as asked
+            oaks = ids.count('1')
+            self.assertLessEqual(oaks, 9, d['design_name'])                          # never more than asked
+            if oaks < 9:                                                             # fewer: said why
+                self.assertTrue(any(f'Fitted {oaks} of your 9 Oak Tree' in n for n in d['adjustments']), d['adjustments'])
+            self.assertEqual(E.check(d['plants'], list(specs.values()), site, 10 ** 9), [], d['design_name'])
+
+    def test_plant_amounts_are_validated(self):
+        for qty, msg in [([{'id': 3, 'quantity': 2}], 'only for plants you picked'),
+                         ([{'id': 1, 'quantity': 0}], 'between 1 and 300'),
+                         ([{'id': 1}], 'numeric id and quantity')]:
+            r = self.client.post(self.url, {**self.valid, 'plant_qty': qty}, format='json')
+            self.assertEqual(r.status_code, 400, qty)
+            self.assertIn(msg, r.data['error'])
+
+    @patch.dict(os.environ, {'GEMINI_API_KEY': 'your_gemini_api_key_here'})
+    def test_rock_limits_follow_the_yard_size(self):
+        from apps.library.garden_ai import rock_limits
+        self.assertEqual(rock_limits(20), (3, 24))          # a small front yard: the floors
+        self.assertEqual(rock_limits(120), (10, 120))
+        self.assertEqual(rock_limits(2500), (30, 300))      # a big lot: the ceilings
+        self._features_setup()
+        InventoryItem = __import__('apps.library.models', fromlist=['InventoryItem']).InventoryItem
+        InventoryItem.objects.filter(id=51).update(stock_quantity=40)
+        big = {**self.valid, 'lot_width': 20, 'lot_length': 15, 'budget': 400000}   # 300 m² → 25 boulders
+        r = self.client.post(self.url, {**big, 'features': [{'id': 51, 'quantity': 15}]}, format='json')
+        self.assertEqual(r.status_code, 200, r.data)
+        for d in r.data['designs']:
+            placed = sum(p['plant_id'] == '51' for p in d['plants'])
+            notes = ' '.join(d['adjustments'])
+            self.assertTrue(placed == 15 or 'Left out' in notes, (d['design_name'], placed, notes))
+            self.assertGreater(placed, 9, d['design_name'])   # more than the old fixed limit of 9
+        r = self.client.post(self.url, {**self.valid, 'features': [{'id': 51, 'quantity': 15}]}, format='json')
+        self.assertEqual(r.status_code, 400)                  # the same 15 in a 120 m² yard is too many
+
+    def test_groundcover_fills_the_beds_and_is_priced_per_m2(self):
+        from apps.library.models import InventoryItem, PricingSettings
+        from apps.library.pricing import installed_price, labour_rate, layer_of
+        sun = InventoryItem.objects.create(id=60, name='Mani-mani', category='plant', is_groundcover=True, unit_price=180,
+                                           stock_quantity=300, real_world_size=0.15, sunlight='full_sun')
+        shade = InventoryItem.objects.create(id=61, name='Asiatic jasmine', category='plant', is_groundcover=True, unit_price=240,
+                                             stock_quantity=300, real_world_size=0.15, sunlight='full_shade')
+        ps = PricingSettings.current()
+        self.assertEqual(layer_of(sun), 'groundcover')
+        self.assertEqual(installed_price(ps, sun), int(180 + labour_rate(ps, 'groundcover')))
+        body = {**self.valid, 'preferred_plant_ids': [], 'budget': 150000}
+        r = self.client.post(self.url, body, format='json')
+        self.assertEqual(r.status_code, 200, r.data)
+        for d in r.data['designs']:
+            ids = {p['plant_id'] for p in d['plants']}
+            self.assertFalse(ids & {'60', '61'}, d['design_name'])            # never placed one by one
+            gc = {g['plant_id']: g['area_sqm'] for g in d['groundcover']}
+            self.assertIn('60', gc, d['design_name'])                          # the sun one over the beds
+            lawn = d['garden_plan']['lawn_area']
+            self.assertLessEqual(sum(gc.values()), 10 * 12 - lawn + 0.5)       # never more than the beds
+            line = next(l for l in d['plant_breakdown'] if l['plant_id'] == '60')
+            self.assertEqual((line['quantity'], line['unit']), (gc['60'], 'm²'))   # priced per m²
+            self.assertTrue(any(n.startswith('Groundcover:') for n in d['adjustments']), d['adjustments'])
+            self.assertLessEqual(d['total_cost'], 150000 * 1.02, d['design_name'])
+        off = self.client.post(self.url, {**body, 'groundcover': 'off'}, format='json')
+        for d in off.data['designs']:
+            self.assertEqual(d.get('groundcover') or [], [], d['design_name'])
+            self.assertFalse(any(l.get('groundcover') for l in d['plant_breakdown']))
+        # Picking a groundcover doesn't make it a plant to place, nor a "not available" plant
+        r = self.client.post(self.url, {**body, 'preferred_plant_ids': ['2', '61']}, format='json')
+        self.assertEqual(r.status_code, 200, r.data)
+        for d in r.data['designs']:
+            self.assertEqual({g['plant_id'] for g in d['groundcover']}, {'61'}, d['design_name'])
+            self.assertFalse(any('not available' in n for n in d['adjustments']), d['adjustments'])
+
+    def test_planting_follows_designer_rules(self):
+        """Focal specimen, a repeated palette in drifts round the lawn, low plants on the lawn edge, matching edging."""
+        import math
+        from apps.library import layout_engine as E
+        specs = [E.PlantSpec('palm', 'Palm', 2500, 20, 3.0, E.spacing_for(7.0), mature=7.0),
+                 E.PlantSpec('plumeria', 'Plumeria', 900, 20, 2.0, E.spacing_for(4.0), mature=4.0),
+                 E.PlantSpec('croton', 'Croton', 300, 200, 0.8, E.spacing_for(1.5), mature=1.5),
+                 E.PlantSpec('heliconia', 'Heliconia', 350, 200, 1.0, E.spacing_for(1.8), mature=1.8),
+                 E.PlantSpec('lily', 'Peace lily', 250, 300, 0.4, E.spacing_for(0.6), mature=0.6),
+                 E.PlantSpec('geranium', 'Geranium', 120, 400, 0.3, E.spacing_for(0.5), mature=0.5)]
+        by = {s.id: s for s in specs}
+        site = E.Site(10, 12)
+        d = E.generate('Lush / Organic', specs, site, 120000, seed=2)
+        plan = E.GardenPlan.from_dict(d['garden_plan'])
+        self.assertEqual(E.check(d['plants'], specs, site, 120000), [])
+        # The focal specimen: the dearest tall plant, in the back bed near the lawn's centre line
+        palms = [p for p in d['plants'] if p['plant_id'] == 'palm']
+        self.assertTrue(any(abs(p['x'] - plan.lawn[1]) < 2.5 and p['z'] < plan.back + 0.5 for p in palms), palms)
+        # Low plants frame the lawn: many within a metre of its edge
+        lows = [p for p in d['plants'] if by[p['plant_id']].layer == 'low']
+        edge = [p for p in lows if -1.0 <= plan.depth_inside(p['x'], p['z']) < 0]
+        self.assertGreaterEqual(len(edge), 8, len(edge))
+        # Repetition: some mid or low plant appears in groups on opposite sides of the lawn
+        sides = {}
+        for p in d['plants']:
+            if by[p['plant_id']].layer in ('mid', 'low'):
+                sides.setdefault(p['plant_id'], set()).add(p['x'] < plan.lawn[1])
+        self.assertTrue(any(len(v) == 2 for v in sides.values()), sides)
+        # Symmetrical: the low border's plant repeats as edging down both side beds, mirrored
+        d = E.generate('Symmetrical', specs, site, 120000, seed=2)
+        plan = E.GardenPlan.from_dict(d['garden_plan'])
+        x0 = plan.lawn[1]
+        edging = [p for p in d['plants'] if by[p['plant_id']].layer == 'low' and abs(p['x'] - x0) < 0.6
+                  and plan.back < p['z'] < site.length - plan.front]
+        self.assertGreaterEqual(len(edging), 3, edging)
+        for p in edging:
+            self.assertTrue(any(abs(q['x'] - (10 - p['x'])) < 0.01 and abs(q['z'] - p['z']) < 0.01 and q['plant_id'] == p['plant_id']
+                                for q in d['plants']), p)
 
     def test_features_that_dont_fit_are_reported(self):
         from apps.library import layout_engine as E
@@ -512,18 +681,16 @@ class GenerateLayoutsViewTests(APITestCase):
         self.assertEqual(ok.status_code, 200)
 
     @patch.dict(os.environ, {'GEMINI_API_KEY': 'your_gemini_api_key_here'})
-    def test_budget_range_gives_good_better_best(self):
+    def test_budget_range_gives_three_styles_for_the_same_budget(self):
+        # (2026-11-12: was good / better / best across the range — Minimalist at the low end looked like it ignored
+        # the budget. Now every style aims at the top of the range and spends it its own way.)
         r = self.client.post(self.url, {**self.valid, 'budget': None, 'budget_min': 60000, 'budget_max': 120000},
                              format='json')
         self.assertEqual(r.status_code, 200, r.data)
         self.assertEqual(r.data['budget_range'], {'min': 60000, 'max': 120000})
-        by_style = {d['design_name']: d for d in r.data['designs']}
-        self.assertEqual(by_style['Minimalist']['target_budget'], 60000)
-        self.assertEqual(by_style['Symmetrical']['target_budget'], 90000)
-        self.assertEqual(by_style['Lush / Organic']['target_budget'], 120000)
         for d in r.data['designs']:
+            self.assertEqual(d['target_budget'], 120000, d['design_name'])
             self.assertLessEqual(d['cost_breakdown']['total'], d['target_budget'] + 2, d['design_name'])
-        self.assertGreater(by_style['Lush / Organic']['total_cost'], by_style['Symmetrical']['total_cost'])
 
     @patch.dict(os.environ, {'GEMINI_API_KEY': 'your_gemini_api_key_here'})
     def test_range_low_end_is_lifted_to_a_workable_budget(self):
@@ -3795,7 +3962,7 @@ class StaffPhaseCTests(APITestCase):
         self.client.force_authenticate(self.owner)
         staff = self.client.get('/api/users/', {'page': 1}).data
         self.assertEqual(staff['group'], 'staff')
-        self.assertEqual(staff['counts'], {'staff': 3, 'customers': 35, 'all': 38})
+        self.assertEqual(staff['counts'], {'staff': 3, 'customers': 35, 'all': 38, 'closed': 0})
         self.assertEqual(len(staff['results']), 3)
         first = self.client.get('/api/users/', {'page': 1, 'group': 'customers'}).data
         self.assertEqual((len(first['results']), first['has_more']), (30, True))
@@ -3916,6 +4083,1241 @@ class InstallScopeAndCapacityTests(APITestCase):
         call_command('load_sample_prices', '--dry-run', stdout=out)
         self.assertEqual(InventoryItem.objects.get(name='Geranium').unit_price, 677)       # dry run: unchanged
         self.assertIn('Would change', out.getvalue())
+        InventoryItem.objects.create(name='Volcanic rock', category='hardscape', unit_price=800, stock_quantity=5,
+                                     real_world_size=0.6, model_file='volcanic_rock.glb')
         call_command('load_sample_prices', stdout=StringIO())
-        self.assertEqual(InventoryItem.objects.get(name='Geranium').unit_price, 120)
+        self.assertEqual(InventoryItem.objects.get(name='Geranium').unit_price, 85)
         self.assertEqual(InventoryItem.objects.get(name='Croton').unit_price, 150)          # not in the list: unchanged
+        # Small garden stones are added once, sharing the boulder's model, at ~20 cm and ₱30 each
+        stones = InventoryItem.objects.get(name='Volcanic stones (small)')
+        self.assertEqual((stones.unit_price, stones.model_file, stones.category), (30, 'volcanic_rock.glb', 'hardscape'))
+        self.assertLess(stones.real_world_size, 0.35)
+        self.assertFalse(InventoryItem.objects.filter(name='River stones (small)').exists())   # its boulder isn't in this catalog
+        call_command('load_sample_prices', stdout=StringIO())
+        self.assertEqual(InventoryItem.objects.filter(name='Volcanic stones (small)').count(), 1)   # not twice
+
+
+class SavedCartTests(APITestCase):
+    """The shop cart follows a customer between devices; prices and stock stay the catalog's."""
+
+    def setUp(self):
+        from apps.library.models import InventoryItem
+        self.user = User.objects.create_user(username='cartuser', password='pw')
+        self.other = User.objects.create_user(username='cartother', password='pw')
+        self.fern = InventoryItem.objects.create(name='Fern', category='plant', unit_price=500, stock_quantity=10)
+        self.bench = InventoryItem.objects.create(name='Bench', category='furniture', unit_price=3000, stock_quantity=2)
+        self._as(self.user)
+
+    def _as(self, user):
+        self.client.credentials(HTTP_AUTHORIZATION=f'Bearer {RefreshToken.for_user(user).access_token}')
+
+    def _put(self, items):
+        return self.client.put('/api/cart/', {'items': items}, format='json')
+
+    def test_needs_sign_in(self):
+        self.client.credentials()
+        self.assertEqual(self.client.get('/api/cart/').status_code, 401)
+
+    def test_empty_cart_before_anything_is_saved(self):
+        r = self.client.get('/api/cart/')
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.data['items'], [])
+
+    def test_save_and_read_back_with_live_product_data(self):
+        r = self._put([{'id': self.fern.id, 'quantity': 2}, {'id': self.bench.id, 'quantity': 1}])
+        self.assertEqual(r.status_code, 200, r.data)
+        self.fern.unit_price = 450
+        self.fern.save()
+        r = self.client.get('/api/cart/')
+        lines = {l['product']['name']: l for l in r.data['items']}
+        self.assertEqual(lines['Fern']['quantity'], 2)
+        self.assertEqual(float(lines['Fern']['product']['unit_price']), 450.0)   # the catalog's price, not a copy
+
+    def test_lines_are_merged_capped_and_unknown_ids_dropped(self):
+        r = self._put([{'id': self.fern.id, 'quantity': 600}, {'id': self.fern.id, 'quantity': 600},
+                       {'id': 999999, 'quantity': 1}, {'id': self.bench.id, 'quantity': 0}])
+        self.assertEqual(r.status_code, 200, r.data)
+        self.assertEqual([(l['product']['id'], l['quantity']) for l in r.data['items']], [(self.fern.id, 999)])
+
+    def test_malformed_requests_are_refused(self):
+        self.assertEqual(self._put('nope').status_code, 400)
+        self.assertEqual(self._put([{'id': 'x', 'quantity': 1}]).status_code, 400)
+        self.assertEqual(self._put([{'id': self.fern.id, 'quantity': 1}] * 61).status_code, 400)
+
+    def test_archived_items_are_left_out(self):
+        self._put([{'id': self.fern.id, 'quantity': 1}, {'id': self.bench.id, 'quantity': 1}])
+        self.bench.is_active = False
+        self.bench.save()
+        names = [l['product']['name'] for l in self.client.get('/api/cart/').data['items']]
+        self.assertEqual(names, ['Fern'])
+
+    def test_each_customer_sees_only_their_own_cart(self):
+        self._put([{'id': self.fern.id, 'quantity': 3}])
+        self._as(self.other)
+        self.assertEqual(self.client.get('/api/cart/').data['items'], [])
+
+    def test_placing_an_order_empties_the_saved_cart(self):
+        self._put([{'id': self.fern.id, 'quantity': 2}])
+        r = self.client.post('/api/checkout/', {
+            'customer_name': 'Buyer', 'customer_email': 'b@example.com', 'address': QUEZON_ADDRESS,
+            'customer_phone': '09171234567', 'payment_method': 'cod',
+            'items': [{'id': self.fern.id, 'quantity': 2}]}, format='json')
+        self.assertEqual(r.status_code, 201, r.data)
+        self.assertEqual(self.client.get('/api/cart/').data['items'], [])
+
+
+class DesignShareTests(APITestCase):
+    """Share links: only the owner makes or stops one; the public copy shows the garden, not private details."""
+
+    def setUp(self):
+        from apps.library.models import GardenDesign
+        self.owner = User.objects.create_user(username='shareowner', password='pw', first_name='Maria')
+        self.other = User.objects.create_user(username='shareother', password='pw')
+        self.staff = User.objects.create_user(username='sharestaff', password='pw', is_staff=True)
+        self.design = GardenDesign.objects.create(
+            user=self.owner, name='Lush Tropical',
+            placed_items=[{'plant_id': '24', 'x': 3.3, 'z': 5, 'rotation': 70, 'uid': 'p1', 'secret_note': 'gate code 1234'}],
+            plant_breakdown=[{'plant_id': '24', 'name': 'Christmas Palm', 'quantity': 1, 'unit_price': 500, 'subtotal': 500}],
+            dimensions={'width': 8, 'length': 12, 'photoCorners': [{'u': 0.1, 'v': 0.5}],
+                        'gardenPlan': {'lawn': {'x': 0}}, 'customerEdits': {'notes': ['private']}},
+            reference_image_url='/media/designs/yard.jpg',
+            cost_estimate={'lines': [{'key': 'plants', 'label': 'Plants', 'amount': 500}]},
+            total_cost=500,
+        )
+        self.url = f'/api/designs/{self.design.id}/share/'
+
+    def _as(self, user):
+        self.client.credentials(HTTP_AUTHORIZATION=f'Bearer {RefreshToken.for_user(user).access_token}')
+
+    def test_owner_gets_one_link_and_asking_again_returns_the_same(self):
+        self._as(self.owner)
+        r1 = self.client.post(self.url)
+        self.assertEqual(r1.status_code, 201, r1.data)
+        self.assertEqual(r1.data['path'], f"/d/{r1.data['token']}")
+        self.assertGreaterEqual(len(r1.data['token']), 12)
+        r2 = self.client.post(self.url)
+        self.assertEqual(r2.status_code, 200)
+        self.assertEqual(r2.data['token'], r1.data['token'])
+
+    def test_nobody_else_can_share_it_not_even_the_office(self):
+        for user in (self.other, self.staff):
+            self._as(user)
+            self.assertEqual(self.client.post(self.url).status_code, 404)
+        self.client.credentials()
+        self.assertEqual(self.client.post(self.url).status_code, 401)
+
+    def test_anyone_with_the_link_sees_the_garden_without_private_details(self):
+        self._as(self.owner)
+        token = self.client.post(self.url).data['token']
+        self.client.credentials()
+        r = self.client.get(f'/api/shared-designs/{token}/')
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r['X-Robots-Tag'], 'noindex')
+        self.assertEqual(r.data['name'], 'Lush Tropical')
+        self.assertEqual(r.data['lot'], {'width': 8, 'length': 12})
+        self.assertEqual(r.data['plants'], [{'uid': 'p1', 'plant_id': '24', 'x': 3.3, 'z': 5, 'rotation': 70}])
+        self.assertEqual(r.data['garden_plan'], {'lawn': {'x': 0}})
+        self.assertEqual(r.data['plant_breakdown'][0]['name'], 'Christmas Palm')
+        self.assertEqual(r.data['estimate_lines'], [{'label': 'Plants', 'amount': 500}])
+        self.assertFalse(r.data['is_owner'])
+        body = str(r.data)
+        for private in ('yard.jpg', 'photoCorners', 'gate code', 'customerEdits', 'shareowner', 'Maria'):
+            self.assertNotIn(private, body)
+
+    def test_the_shared_copy_rebuilds_the_yard_without_what_the_customer_typed(self):
+        self.design.placed_items = [{'plant_id': 'existing', 'x': 2, 'z': 3, 'r': 1.5, 'is_existing': True, 'label': "Lola's mango"}]
+        self.design.dimensions = {**self.design.dimensions, 'siteSurvey': {
+            'items': [{'kind': 'entry', 'x': 8, 'z': 6, 'edge': 'right', 'label': 'Gate by Aling Nena'},
+                      {'kind': 'clear', 'x0': 0, 'z0': 9, 'x1': 2, 'z1': 12, 'label': 'Driveway'},
+                      {'kind': 'clear', 'x0': 5, 'z0': 0, 'x1': 6, 'z1': 1, 'label': 'Dog house of Bantay'},
+                      {'kind': 'keep', 'x': 2, 'z': 3, 'r': 1.5, 'label': "Lola's mango"}],
+            'sun': {'facing': 135, 'house': 'two'}}}
+        self.design.save()
+        self._as(self.owner)
+        token = self.client.post(self.url).data['token']
+        self.client.credentials()
+        r = self.client.get(f'/api/shared-designs/{token}/')
+        self.assertEqual(r.data['plants'], [{'plant_id': 'existing', 'x': 2, 'z': 3, 'r': 1.5, 'is_existing': True}])
+        self.assertEqual(r.data['site'], {
+            'items': [{'kind': 'entry', 'x': 8, 'z': 6, 'edge': 'right'},
+                      {'kind': 'clear', 'x0': 0, 'z0': 9, 'x1': 2, 'z1': 12, 'label': 'Driveway'},
+                      {'kind': 'clear', 'x0': 5, 'z0': 0, 'x1': 6, 'z1': 1, 'label': 'Other'}],
+            'outline': None, 'sun': {'house': 'two'}})
+        body = str(r.data)
+        for private in ('Nena', 'Bantay', 'Lola', 'facing', '135'):
+            self.assertNotIn(private, body)
+
+    def test_views_count_visitors_but_not_the_owner(self):
+        from apps.library.models import DesignShare
+        self._as(self.owner)
+        token = self.client.post(self.url).data['token']
+        self.assertTrue(self.client.get(f'/api/shared-designs/{token}/').data['is_owner'])
+        self.client.credentials()
+        self.client.get(f'/api/shared-designs/{token}/')
+        self.client.get(f'/api/shared-designs/{token}/')
+        self.assertEqual(DesignShare.objects.get(token=token).view_count, 2)
+
+    def test_stopping_the_share_breaks_the_link_and_a_new_share_gets_a_new_link(self):
+        self._as(self.owner)
+        token = self.client.post(self.url).data['token']
+        self.assertEqual(self.client.delete(self.url).status_code, 204)
+        self.client.credentials()
+        self.assertEqual(self.client.get(f'/api/shared-designs/{token}/').status_code, 404)
+        self._as(self.owner)
+        r = self.client.post(self.url)
+        self.assertEqual(r.status_code, 201)
+        self.assertNotEqual(r.data['token'], token)
+
+    def test_unknown_link(self):
+        self.assertEqual(self.client.get('/api/shared-designs/nope-not-real/').status_code, 404)
+
+
+class DesignProposalTests(APITestCase):
+    """The PDF proposal: owner only, a real 3-page PDF, pictures checked and stripped of GPS."""
+
+    def setUp(self):
+        from apps.library.models import GardenDesign, InventoryItem
+        self.owner = User.objects.create_user(username='propowner', password='pw', first_name='Ana', last_name='Cruz')
+        self.other = User.objects.create_user(username='propother', password='pw')
+        self.palm = InventoryItem.objects.create(name='Christmas Palm', category='plant', unit_price=500, stock_quantity=5,
+                                                 planting_height=1.2, mature_height=5, mature_spread=2, established_spread=1.5)
+        self.bench = InventoryItem.objects.create(name='Bench', category='furniture', unit_price=3000, stock_quantity=2, real_world_size=1.6)
+        self.design = GardenDesign.objects.create(
+            user=self.owner, name='Lush <Tropical> & Co',
+            placed_items=[{'plant_id': str(self.palm.id), 'x': 2, 'z': 3}, {'plant_id': str(self.bench.id), 'x': 5, 'z': 9},
+                          {'plant_id': 'background_perimeter', 'x': 5, 'z': 1, 'is_existing': True}],
+            plant_breakdown=[{'plant_id': str(self.palm.id), 'name': 'Christmas Palm', 'quantity': 1, 'unit_price': 500, 'subtotal': 500},
+                             {'plant_id': str(self.bench.id), 'name': 'Bench', 'quantity': 1, 'unit_price': 3000, 'subtotal': 3000}],
+            dimensions={'width': 8, 'length': 12, 'gardenPlan': {'lawn': {'shape': 'ellipse', 'cx': 4, 'cz': 6, 'rx': 2, 'rz': 3},
+                                                                 'entry': {'x0': 3.4, 'x1': 4.6, 'z0': 9, 'z1': 12}}},
+            cost_estimate={'lines': [{'key': 'plants', 'label': 'Plants', 'amount': 3500}, {'key': 'labour', 'label': 'Labour', 'amount': 900}]},
+            total_cost=4400,
+        )
+        self.url = f'/api/designs/{self.design.id}/proposal/'
+
+    def _as(self, user):
+        self.client.credentials(HTTP_AUTHORIZATION=f'Bearer {RefreshToken.for_user(user).access_token}')
+
+    def _jpeg(self, gps=False, size=(400, 300)):
+        import io
+        from PIL import Image
+        img = Image.new('RGB', size, (90, 140, 60))
+        out = io.BytesIO()
+        if gps:
+            exif = Image.Exif()
+            exif[0x8825] = {1: 'N', 2: (14.0, 5.0, 0.0)}   # GPSInfo
+            img.save(out, 'JPEG', exif=exif)
+        else:
+            img.save(out, 'JPEG')
+        out.seek(0)
+        out.name = 'pic.jpg'
+        return out
+
+    def test_owner_gets_a_three_page_pdf(self):
+        self._as(self.owner)
+        r = self.client.post(self.url, {'render': self._jpeg()}, format='multipart')
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r['Content-Type'], 'application/pdf')
+        self.assertIn('-proposal.pdf', r['Content-Disposition'])
+        body = r.content
+        self.assertTrue(body.startswith(b'%PDF'))
+        self.assertEqual(body.count(b'/Type /Page\n') + body.count(b'/Type /Page '), 3)
+
+    def test_works_without_pictures_and_with_before_after(self):
+        self._as(self.owner)
+        self.assertEqual(self.client.post(self.url, {}, format='multipart').status_code, 200)
+        r = self.client.post(self.url, {'photo_before': self._jpeg(), 'photo_after': self._jpeg()}, format='multipart')
+        self.assertEqual(r.status_code, 200)
+
+    def test_only_the_owner(self):
+        self._as(self.other)
+        self.assertEqual(self.client.post(self.url, {}, format='multipart').status_code, 404)
+        self.client.credentials()
+        self.assertEqual(self.client.post(self.url, {}, format='multipart').status_code, 401)
+
+    def test_rejects_a_file_that_is_not_a_picture(self):
+        import io
+        self._as(self.owner)
+        bad = io.BytesIO(b'not an image at all')
+        bad.name = 'x.jpg'
+        r = self.client.post(self.url, {'render': bad}, format='multipart')
+        self.assertEqual(r.status_code, 400)
+
+    def test_pictures_lose_their_gps_and_are_resized(self):
+        from PIL import Image
+        import io
+        from apps.library.proposal import clean_picture
+        src = self._jpeg(gps=True, size=(4000, 3000))
+        src.size = len(src.getvalue())
+        self.assertIn(0x8825, Image.open(io.BytesIO(src.getvalue())).getexif())
+        data, w, h = clean_picture(src)
+        self.assertEqual((w, h), (1800, 1350))
+        self.assertNotIn(0x8825, Image.open(io.BytesIO(data)).getexif())
+
+    def test_expired_prices_still_build(self):
+        from datetime import timedelta
+        from django.utils import timezone
+        from apps.library.proposal import build_proposal
+        pdf = build_proposal(self.design, self.owner, {}, now=timezone.now() + timedelta(days=60))
+        self.assertTrue(pdf.startswith(b'%PDF'))
+
+
+class WorkOrderPdfTests(APITestCase):
+    """The crew work order prints prices with the peso sign, and still builds without a peso font."""
+
+    def setUp(self):
+        from datetime import date
+        from apps.library.models import GardenDesign, InventoryItem, ServiceBooking
+        self.admin = User.objects.create_user(username='woadmin', password='pw', is_staff=True, is_superuser=True)
+        customer = User.objects.create_user(username='wocustomer', password='pw')
+        palm = InventoryItem.objects.create(name='Palm', category='plant', unit_price=500, stock_quantity=5)
+        design = GardenDesign.objects.create(
+            user=customer, name='WO design', placed_items=[{'plant_id': str(palm.id), 'x': 2, 'z': 3}],
+            plant_breakdown=[{'plant_id': str(palm.id), 'name': 'Palm', 'quantity': 2, 'unit_price': 500, 'subtotal': 1000}],
+            dimensions={'width': 10, 'length': 10}, total_cost=1000)
+        self.booking = ServiceBooking.objects.create(user=customer, service_type='consultation', scheduled_date=date.today(), design=design)
+        self.client.credentials(HTTP_AUTHORIZATION=f'Bearer {RefreshToken.for_user(self.admin).access_token}')
+
+    def _get(self):
+        return self.client.get(f'/api/bookings/{self.booking.id}/generate_pdf/')
+
+    def test_builds_with_the_peso_font(self):
+        r = self._get()
+        self.assertEqual(r.status_code, 200)
+        self.assertTrue(r.content.startswith(b'%PDF'))
+
+    def test_builds_on_a_server_without_a_peso_font(self):
+        from unittest import mock
+        from apps.library import proposal
+        with mock.patch.object(proposal, '_fonts', ('Helvetica', 'Helvetica-Bold', 'PHP ')):
+            r = self._get()
+            self.assertEqual(r.status_code, 200)
+            self.assertTrue(r.content.startswith(b'%PDF'))
+            pdf = proposal.build_proposal(self.booking.design, self.admin, {})
+            self.assertTrue(pdf.startswith(b'%PDF'))
+
+
+class BookedDesignLockTests(APITestCase):
+    """design_lock.py: a booked design is the crew's build reference, so it stays the version that was booked."""
+
+    def setUp(self):
+        from apps.library.models import GardenDesign, StaffProfile
+        self.customer = User.objects.create_user(username='lockcust', password='pw')
+        self.other = User.objects.create_user(username='lockother', password='pw')
+        self.office = User.objects.create_user(username='lockoffice', password='pw', is_staff=True)
+        StaffProfile.objects.create(user=self.office, role='OFFICE_ADMIN')
+        self.crew = User.objects.create_user(username='lockcrew', password='pw', is_staff=True)
+        StaffProfile.objects.create(user=self.crew, role='FIELD_CREW')
+        self.design = GardenDesign.objects.create(
+            user=self.customer, name='Tropical Retreat', total_cost=60000,
+            placed_items=[{'id': 1, 'plant_id': '24', 'x': 2, 'z': 3, 'position': {'x': 0, 'y': 0, 'z': 0}}],
+            plant_breakdown=[{'plant_id': '24', 'name': 'Christmas Palm', 'quantity': 1, 'unit_price': 500, 'subtotal': 500}],
+            cost_estimate={'lines': []}, reference_image_url='/media/designs/yard.jpg',
+            dimensions={'width': 8, 'length': 12})
+        self.url = f'/api/designs/{self.design.id}/'
+
+    def _as(self, user):
+        self.client.credentials(HTTP_AUTHORIZATION=f'Bearer {RefreshToken.for_user(user).access_token}')
+
+    def _book(self, design_id=None, user=None):
+        self._as(user or self.customer)
+        return self.client.post('/api/bookings/', {
+            'service_type': 'consultation', 'scheduled_date': '2027-02-01',
+            'design': design_id or self.design.id, 'address': QUEZON_ADDRESS,
+        }, format='json')
+
+    def test_customer_edits_and_deletes_freely_until_booked(self):
+        self._as(self.customer)
+        self.assertFalse(self.client.get(self.url).data['locked'])
+        r = self.client.patch(self.url, {'name': 'Renamed'}, format='json')
+        self.assertEqual(r.status_code, status.HTTP_200_OK, r.data)
+
+    def test_booking_locks_the_design_for_the_customer(self):
+        booking = self._book()
+        self.assertEqual(booking.status_code, status.HTTP_201_CREATED, booking.data)
+        detail = self.client.get(self.url).data
+        self.assertTrue(detail['locked'])
+        self.assertEqual(detail['locked_for']['booking'], booking.data['id'])
+        self.assertTrue(next(d for d in self.client.get('/api/designs/').data if d['id'] == self.design.id)['locked'])
+
+        r = self.client.patch(self.url, {'name': 'Sneaky change'}, format='json')
+        self.assertEqual(r.status_code, status.HTTP_409_CONFLICT)
+        self.assertTrue(r.data['locked'])
+        self.assertIn('Save it as a new design', r.data['error'])
+        r = self.client.patch(f'{self.url}items/1/', {'rotation_y': 90}, format='json')
+        self.assertEqual(r.status_code, status.HTTP_409_CONFLICT)
+        self.assertEqual(self.client.delete(self.url).status_code, status.HTTP_409_CONFLICT)
+        self.design.refresh_from_db()
+        self.assertEqual(self.design.name, 'Tropical Retreat')
+
+        # The way out: an unbooked copy with everything the original had
+        copy = self.client.post(f'{self.url}duplicate/')
+        self.assertEqual(copy.status_code, status.HTTP_201_CREATED)
+        self.assertFalse(copy.data['locked'])
+        self.assertEqual(copy.data['plant_breakdown'], self.design.plant_breakdown)
+        self.assertEqual(copy.data['reference_image_url'], self.design.reference_image_url)
+        self.assertEqual(self.client.patch(f"/api/designs/{copy.data['id']}/", {'name': 'Mine'}, format='json').status_code,
+                         status.HTTP_200_OK)
+
+    def test_cancelling_the_booking_unlocks_it(self):
+        booking_id = self._book().data['id']
+        self.assertEqual(self.client.delete(f'/api/bookings/{booking_id}/').status_code, status.HTTP_204_NO_CONTENT)
+        self.assertFalse(self.client.get(self.url).data['locked'])
+        self.assertEqual(self.client.patch(self.url, {'name': 'Free again'}, format='json').status_code, status.HTTP_200_OK)
+
+    def test_office_can_adjust_a_booked_design_and_it_is_logged_but_not_delete_it(self):
+        from apps.library.models import ActivityLog
+        booking_id = self._book().data['id']
+        self._as(self.office)
+        r = self.client.patch(self.url, {'name': 'Adjusted after site visit'}, format='json')
+        self.assertEqual(r.status_code, status.HTTP_200_OK, r.data)
+        self.assertTrue(ActivityLog.objects.filter(action='booked_design_changed', details__booking=booking_id).exists())
+        self.assertEqual(self.client.delete(self.url).status_code, status.HTTP_409_CONFLICT)
+
+    def test_crew_can_view_but_never_change_a_job_design(self):
+        from apps.library.models import ServiceBooking
+        booking = ServiceBooking.objects.get(id=self._book().data['id'])
+        booking.assigned_crew.add(self.crew)
+        self._as(self.crew)
+        self.assertEqual(self.client.get(self.url).status_code, status.HTTP_200_OK)
+        self.assertEqual(self.client.patch(self.url, {'name': 'x'}, format='json').status_code, status.HTTP_403_FORBIDDEN)
+        self.assertEqual(self.client.delete(self.url).status_code, status.HTTP_403_FORBIDDEN)
+        self.assertEqual(self.client.patch(f'{self.url}items/1/', {'rotation_y': 90}, format='json').status_code,
+                         status.HTTP_403_FORBIDDEN)
+
+    def test_customer_cannot_book_someone_elses_design(self):
+        r = self._book(user=self.other)
+        self.assertEqual(r.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('design', r.data)
+        # A design id that doesn't exist is an error too (it used to book quietly without a design)
+        self.assertEqual(self._book(design_id=999999).status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_customer_can_switch_design_only_while_pending(self):
+        from apps.library.models import GardenDesign, ServiceBooking
+        second = GardenDesign.objects.create(user=self.customer, name='Zen Garden')
+        booking_id = self._book().data['id']
+        url = f'/api/bookings/{booking_id}/'
+        self.assertEqual(self.client.patch(url, {'design': second.id}, format='json').status_code, status.HTTP_200_OK)
+        self.assertFalse(self.client.get(self.url).data['locked'])   # the first one is free again
+        ServiceBooking.objects.filter(id=booking_id).update(status='Preparing')
+        r = self.client.patch(url, {'design': self.design.id}, format='json')
+        self.assertEqual(r.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('design', r.data)
+
+
+class DesignReviewTests(APITestCase):
+    """design_review.py: the office sends the adjusted design, the customer approves that exact version."""
+
+    def setUp(self):
+        from apps.library.models import GardenDesign, InventoryItem, ServiceBooking, StaffProfile, ProjectTracker
+        self.customer = User.objects.create_user(username='revcust', password='pw')
+        self.other = User.objects.create_user(username='revother', password='pw')
+        self.office = User.objects.create_user(username='revoffice', password='pw', is_staff=True)
+        StaffProfile.objects.create(user=self.office, role='OFFICE_ADMIN')
+        self.crew = User.objects.create_user(username='revcrew', password='pw', is_staff=True)
+        StaffProfile.objects.create(user=self.crew, role='FIELD_CREW')
+        self.palm = InventoryItem.objects.create(name='Christmas Palm', category='plant', unit_price=500, stock_quantity=10)
+        self.fern = InventoryItem.objects.create(name='Boston Fern', category='plant', unit_price=150, stock_quantity=10)
+        self.design = GardenDesign.objects.create(
+            user=self.customer, name='Tropical Retreat', total_cost=60000,
+            placed_items=[{'plant_id': str(self.palm.id), 'x': 2, 'z': 3}, {'plant_id': str(self.palm.id), 'x': 5, 'z': 3}],
+            plant_breakdown=[{'plant_id': str(self.palm.id), 'name': 'Christmas Palm', 'quantity': 2, 'unit_price': 500, 'subtotal': 1000}],
+            dimensions={'width': 8, 'length': 12})
+        self.booking = ServiceBooking.objects.create(user=self.customer, service_type='consultation',
+                                                     scheduled_date='2027-02-01', design=self.design)
+        self.booking.assigned_crew.add(self.crew)
+        ProjectTracker.objects.create(booking=self.booking, total_price=60000, remaining_balance=60000)
+        self.url = f'/api/bookings/{self.booking.id}/design-review/'
+
+    def _as(self, user):
+        self.client.credentials(HTTP_AUTHORIZATION=f'Bearer {RefreshToken.for_user(user).access_token}')
+
+    def _review(self):
+        return self.client.get(f'/api/bookings/{self.booking.id}/').data['design_review']
+
+    def _office_edit(self, **data):
+        self._as(self.office)
+        r = self.client.patch(f'/api/designs/{self.design.id}/', data, format='json')
+        self.assertEqual(r.status_code, status.HTTP_200_OK, r.data)
+        return r
+
+    def test_full_round_send_changes_adjust_resend_approve(self):
+        from apps.library.models import Notification, ProjectTracker
+        self._as(self.customer)
+        self.assertEqual(self._review()['state'], 'draft')
+
+        # Office adjusts after the site visit (a Studio save: placed items only) and sends it
+        self._office_edit(placed_items=[{'productId': self.palm.id, 'position': {'x': 0, 'z': 0}},
+                                        {'productId': self.fern.id, 'position': {'x': 1, 'z': 1}}])
+        self.design.refresh_from_db()
+        self.assertEqual(self.design.revision, 2)
+        self.assertEqual({r['name']: r['quantity'] for r in self.design.plant_breakdown},
+                         {'Christmas Palm': 1, 'Boston Fern': 1})   # recounted, not the old list
+        r = self.client.post(self.url, {'step': 'send', 'note': 'Moved the palm away from the water pipe.'}, format='json')
+        self.assertEqual(r.status_code, status.HTTP_200_OK, r.data)
+        self.assertEqual(r.data['design_review']['state'], 'sent')
+        self.assertTrue(Notification.objects.filter(user=self.customer, kind='design_sent',
+                                                    link=f'/my-bookings?review={self.booking.id}').exists())
+        self.assertEqual(self.client.post(self.url, {'step': 'send'}, format='json').status_code, 400)  # already waiting
+
+        # Customer asks for changes
+        self._as(self.customer)
+        self.assertEqual(self.client.post(self.url, {'step': 'changes', 'note': ''}, format='json').status_code, 400)
+        r = self.client.post(self.url, {'step': 'changes', 'note': 'Can we keep two palms?'}, format='json')
+        self.assertEqual(r.data['design_review']['state'], 'changes')
+        self.assertTrue(Notification.objects.filter(user=self.office, kind='design_changes').exists())
+
+        # Office adjusts again and resends; customer approves exactly that version
+        self._office_edit(placed_items=[{'productId': self.palm.id, 'position': {'x': 0, 'z': 0}},
+                                        {'productId': self.palm.id, 'position': {'x': 2, 'z': 0}}])
+        self.assertEqual(self.client.post(self.url, {'step': 'send'}, format='json').status_code, 200)
+        self._as(self.customer)
+        review = self._review()
+        self.assertEqual(review['state'], 'sent')
+        r = self.client.post(self.url, {'step': 'approve', 'revision': review['revision']}, format='json')
+        self.assertEqual(r.status_code, status.HTTP_200_OK, r.data)
+        self.assertEqual(r.data['design_review']['state'], 'approved')
+        self.assertEqual(r.data['design_review']['approved_revision'], 3)
+        self.assertEqual(ProjectTracker.objects.get(booking=self.booking).status, 'DESIGN_APPROVED')
+        self.assertTrue(Notification.objects.filter(user=self.crew, kind='design_approved').exists())
+
+    def test_approving_a_version_that_changed_since_it_was_opened_fails(self):
+        self._as(self.office)
+        self.client.post(self.url, {'step': 'send'}, format='json')
+        self._as(self.customer)
+        seen = self._review()['revision']
+        self._office_edit(dimensions={'width': 9, 'length': 12})
+        self._as(self.customer)
+        self.assertEqual(self._review()['state'], 'changed')
+        r = self.client.post(self.url, {'step': 'approve', 'revision': seen}, format='json')
+        self.assertEqual(r.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_changing_an_approved_design_needs_approval_again_but_a_rename_does_not(self):
+        self._as(self.office)
+        self.client.post(self.url, {'step': 'approved_in_person', 'note': 'Signed at the site visit'}, format='json')
+        self._as(self.customer)
+        self.assertEqual(self._review()['state'], 'approved')
+        self.assertTrue(self._review()['approved_in_person'])
+        self._office_edit(name='Tropical Retreat (final)')
+        self._as(self.customer)
+        self.assertEqual(self._review()['state'], 'approved')
+        self._office_edit(total_cost=65000)
+        self._as(self.customer)
+        self.assertEqual(self._review()['state'], 'changed')
+
+    def test_who_may_do_what(self):
+        self._as(self.customer)
+        self.assertEqual(self.client.post(self.url, {'step': 'send'}, format='json').status_code, 403)
+        self.assertEqual(self.client.post(self.url, {'step': 'approved_in_person', 'note': 'x'}, format='json').status_code, 403)
+        self.assertEqual(self.client.post(self.url, {'step': 'approve', 'revision': 1}, format='json').status_code, 400)  # nothing sent
+        self._as(self.crew)
+        self.assertEqual(self.client.post(self.url, {'step': 'send'}, format='json').status_code, 403)
+        self.assertEqual(self.client.post(self.url, {'step': 'approve', 'revision': 1}, format='json').status_code, 403)
+        self._as(self.other)
+        self.assertEqual(self.client.post(self.url, {'step': 'approve', 'revision': 1}, format='json').status_code, 404)
+        self._as(self.office)
+        self.assertEqual(self.client.post(self.url, {'step': 'approved_in_person', 'note': ''}, format='json').status_code, 400)
+
+    def test_design_and_contract_stage_waits_for_approval(self):
+        self._as(self.office)
+        url = f'/api/bookings/{self.booking.id}/update_milestone/'
+        r = self.client.patch(url, {'phase': 'design_contract', 'completion_pct': 100}, format='json')
+        self.assertEqual(r.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("hasn't approved", r.data['error'])
+        self.client.post(self.url, {'step': 'approved_in_person', 'note': 'Agreed on site'}, format='json')
+        r = self.client.patch(url, {'phase': 'design_contract', 'completion_pct': 100}, format='json')
+        self.assertEqual(r.status_code, status.HTTP_200_OK, r.data)
+
+
+class DesignItemsTests(APITestCase):
+    """design_items.lot_items: Studio items (centred, radians) come out in lot metres and degrees like AI items."""
+
+    def test_studio_and_ai_items_share_one_shape(self):
+        import math
+        from apps.library.design_items import lot_items
+        from apps.library.models import GardenDesign
+        design = GardenDesign(dimensions={'width': 8, 'length': 12}, placed_items=[
+            {'plant_id': '5', 'x': 2, 'z': 3, 'rotation': 45, 'uid': 'a'},
+            {'is_existing': True, 'x': 1, 'z': 1},
+            {'product_id': 7, 'position': {'x': -4, 'y': 0, 'z': 6}, 'rotation': {'x': 0, 'y': math.pi / 2, 'z': 0}},
+            {'productId': 9, 'position': {'x': 0, 'y': 0, 'z': 0}},
+            'junk',
+        ])
+        items = lot_items(design)
+        self.assertEqual(items[0], {'plant_id': '5', 'x': 2, 'z': 3, 'rotation': 45, 'uid': 'a'})
+        self.assertTrue(items[1]['is_existing'])
+        self.assertEqual(items[2], {'plant_id': '7', 'x': 0.0, 'z': 12.0, 'rotation': 90.0})
+        self.assertEqual(items[3], {'plant_id': '9', 'x': 4.0, 'z': 6.0, 'rotation': 0.0})
+        self.assertEqual(len(items), 4)
+
+
+class SettingOutTests(APITestCase):
+    """setting_out.py: labels and tape measurements the crew sets the garden out with."""
+
+    def setUp(self):
+        from apps.library.models import GardenDesign, InventoryItem, ServiceBooking, StaffProfile
+        self.palm = InventoryItem.objects.create(name='Christmas Palm', category='plant', unit_price=500, stock_quantity=9)
+        self.bench = InventoryItem.objects.create(name='Garden Bench', category='furniture', unit_price=4000, stock_quantity=2)
+        self.customer = User.objects.create_user(username='socust', password='pw')
+        self.crew = User.objects.create_user(username='socrew', password='pw', is_staff=True)
+        StaffProfile.objects.create(user=self.crew, role='FIELD_CREW')
+        # 8 m wide, 12 m deep. Mixed formats: an office Studio edit leaves Studio items next to AI ones.
+        self.design = GardenDesign.objects.create(
+            user=self.customer, name='Mixed', dimensions={'width': 8, 'length': 12},
+            plant_breakdown=[{'plant_id': str(self.bench.id), 'name': 'Garden Bench', 'quantity': 1},
+                             {'plant_id': str(self.palm.id), 'name': 'Christmas Palm', 'quantity': 2}],
+            placed_items=[
+                {'plant_id': str(self.palm.id), 'x': 1.0, 'z': 2.0},                  # back left
+                {'product_id': self.palm.id, 'position': {'x': 2.5, 'y': 0, 'z': 4.5}},  # = lot (6.5, 10.5)
+                {'plant_id': str(self.bench.id), 'x': 4.0, 'z': 11.0},
+                {'is_existing': True, 'x': 7.0, 'z': 1.0},
+            ])
+        self.booking = ServiceBooking.objects.create(user=self.customer, service_type='Softscape',
+                                                     scheduled_date='2027-03-01', status='Preparing', design=self.design)
+        self.booking.assigned_crew.add(self.crew)
+
+    def test_labels_follow_the_plant_list_and_measure_from_house_and_nearer_side(self):
+        from apps.library.setting_out import setting_out
+        so = setting_out(self.design)
+        self.assertEqual([(t['no'], t['name'], t['quantity']) for t in so['types']],
+                         [(1, 'Garden Bench', 1), (2, 'Christmas Palm', 2)])
+        rows = {r['label']: r for r in so['items']}
+        self.assertEqual(set(rows), {'1.1', '2.1', '2.2', 'E1'})
+        # 2.1 is the palm nearest the house: the Studio one at lot (6.5, 10.5)
+        self.assertEqual((rows['2.1']['from_house'], rows['2.1']['side'], rows['2.1']['from_side']), (1.5, 'right', 1.5))
+        self.assertEqual((rows['2.2']['from_house'], rows['2.2']['side'], rows['2.2']['from_side']), (10.0, 'left', 1.0))
+        self.assertEqual((rows['1.1']['from_house'], rows['1.1']['from_side']), (1.0, 4.0))
+        self.assertTrue(rows['E1']['existing'])
+        self.assertEqual((rows['E1']['from_house'], rows['E1']['side'], rows['E1']['from_side']), (11.0, 'right', 1.0))
+        self.assertFalse(any(r['outside'] for r in so['items']))
+
+    def test_crew_get_it_with_the_job_and_the_work_order_has_the_plan(self):
+        self.client.credentials(HTTP_AUTHORIZATION=f'Bearer {RefreshToken.for_user(self.crew).access_token}')
+        data = self.client.get(f'/api/bookings/{self.booking.id}/').data
+        self.assertEqual(len(data['design_details']['setting_out']['items']), 4)
+        r = self.client.get(f'/api/bookings/{self.booking.id}/generate_pdf/')
+        self.assertEqual(r.status_code, status.HTTP_200_OK)
+        pdf = b''.join(r.streaming_content) if getattr(r, 'streaming', False) else r.content
+        self.assertTrue(pdf.startswith(b'%PDF'))
+
+    def test_design_without_items_has_no_plan(self):
+        from apps.library.models import GardenDesign
+        from apps.library.setting_out import setting_out
+        self.assertIsNone(setting_out(GardenDesign(dimensions={'width': 5, 'length': 5}, placed_items=[])))
+        self.assertIsNone(setting_out(None))
+
+    def test_work_order_prints_an_approved_design(self):
+        from apps.library import design_review
+        office = User.objects.create_user(username="sooffice", password="pw", is_staff=True)
+        design_review.approve_in_person(self.booking, office, "Signed at the site visit")
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {RefreshToken.for_user(self.crew).access_token}")
+        r = self.client.get(f"/api/bookings/{self.booking.id}/generate_pdf/")
+        self.assertEqual(r.status_code, status.HTTP_200_OK)
+
+
+class InventorySpacingTests(APITestCase):
+    """Planting distance (spacing_cm) from the Inventory form: optional, 10–400 cm."""
+
+    def setUp(self):
+        from apps.library.models import InventoryItem, StaffProfile
+        self.office = User.objects.create_user(username='spoffice', password='pw', is_staff=True)
+        StaffProfile.objects.create(user=self.office, role='OFFICE_ADMIN')
+        self.item = InventoryItem.objects.create(name='Fern', category='plant', unit_price=150, stock_quantity=3)
+        self.client.credentials(HTTP_AUTHORIZATION=f'Bearer {RefreshToken.for_user(self.office).access_token}')
+        self.url = f'/api/inventory/{self.item.id}/'
+
+    def test_set_clear_and_reject_out_of_range(self):
+        self.assertEqual(self.client.patch(self.url, {'spacing_cm': '90'}, format='multipart').status_code, 200)
+        self.item.refresh_from_db()
+        self.assertEqual(self.item.spacing_cm, 90)
+        self.assertEqual(self.client.patch(self.url, {'spacing_cm': ''}, format='multipart').status_code, 200)
+        self.item.refresh_from_db()
+        self.assertIsNone(self.item.spacing_cm)
+        r = self.client.patch(self.url, {'spacing_cm': '5000'}, format='multipart')
+        self.assertEqual(r.status_code, 400)
+        self.assertIn('spacing_cm', r.data)
+
+
+class MyAccountTests(APITestCase):
+    """account.py: people read and correct their own details; email and password need the current password."""
+
+    def setUp(self):
+        self.user = User.objects.create_user(username='maria', password='Garden-pass-2026', email='maria@example.com',
+                                             first_name='Maria')
+        self.other = User.objects.create_user(username='jose', password='Garden-pass-2026', email='jose@example.com')
+        self._as(self.user)
+
+    def _as(self, user):
+        self.client.credentials(HTTP_AUTHORIZATION=f'Bearer {RefreshToken.for_user(user).access_token}')
+
+    def test_read_and_correct_name_and_mobile(self):
+        r = self.client.get('/api/me/')
+        self.assertEqual((r.data['username'], r.data['first_name'], r.data['phone'], r.data['role']), ('maria', 'Maria', '', 'customer'))
+        r = self.client.patch('/api/me/', {'first_name': '  Maria  Clara ', 'last_name': 'Santos', 'phone': '+63 917-123-4567'}, format='json')
+        self.assertEqual(r.status_code, 200, r.data)
+        self.assertEqual((r.data['first_name'], r.data['last_name'], r.data['phone']), ('Maria Clara', 'Santos', '09171234567'))
+        # Fresh tokens carry the new name, so the app's header changes at once
+        from rest_framework_simplejwt.tokens import AccessToken
+        self.assertEqual(AccessToken(r.data['tokens']['access'])['first_name'], 'Maria Clara')
+        # The username is the sign-in name: it can't be changed here
+        self.client.patch('/api/me/', {'username': 'hacker'}, format='json')
+        self.user.refresh_from_db()
+        self.assertEqual(self.user.username, 'maria')
+
+    def test_bad_values_are_refused_and_the_number_can_be_cleared(self):
+        self.assertEqual(self.client.patch('/api/me/', {'phone': '12345'}, format='json').status_code, 400)
+        self.assertEqual(self.client.patch('/api/me/', {'first_name': '   '}, format='json').status_code, 400)
+        self.client.patch('/api/me/', {'phone': '09171234567'}, format='json')
+        r = self.client.patch('/api/me/', {'phone': ''}, format='json')
+        self.assertEqual(r.data['phone'], '')
+
+    def test_change_password_needs_the_current_one(self):
+        url = '/api/me/password/'
+        r = self.client.post(url, {'current_password': 'wrong', 'new_password': 'Another-pass-2026'}, format='json')
+        self.assertEqual(r.status_code, 400)
+        self.assertIn('current_password', r.data)
+        self.assertEqual(self.client.post(url, {'current_password': 'Garden-pass-2026', 'new_password': '123'}, format='json').status_code, 400)
+        r = self.client.post(url, {'current_password': 'Garden-pass-2026', 'new_password': 'Another-pass-2026'}, format='json')
+        self.assertEqual(r.status_code, 200, r.data)
+        self.assertIn('access', r.data['tokens'])
+        self.user.refresh_from_db()
+        self.assertTrue(self.user.check_password('Another-pass-2026'))
+
+    def test_change_email_needs_the_password_and_must_be_free(self):
+        url = '/api/me/email/'
+        self.assertEqual(self.client.post(url, {'email': 'new@example.com', 'current_password': 'nope'}, format='json').status_code, 400)
+        r = self.client.post(url, {'email': 'JOSE@example.com', 'current_password': 'Garden-pass-2026'}, format='json')
+        self.assertEqual(r.status_code, 400)
+        self.assertIn('Another account', r.data['email'])
+        self.assertEqual(self.client.post(url, {'email': 'not-an-email', 'current_password': 'Garden-pass-2026'}, format='json').status_code, 400)
+        r = self.client.post(url, {'email': 'maria.santos@example.com', 'current_password': 'Garden-pass-2026'}, format='json')
+        self.assertEqual(r.status_code, 200, r.data)
+        self.assertEqual(r.data['email'], 'maria.santos@example.com')
+
+    def test_sign_up_refuses_an_email_already_in_use(self):
+        self.client.credentials()
+        r = self.client.post('/api/register/', {'username': 'maria2', 'email': 'Maria@Example.com', 'password': 'Garden-pass-2026',
+                                                'accept_privacy': True}, format='json')
+        self.assertEqual(r.status_code, 400)
+        self.assertIn('email', r.data)
+
+    def test_needs_sign_in(self):
+        self.client.credentials()
+        self.assertEqual(self.client.get('/api/me/').status_code, 401)
+
+
+class AccountPrivacyTests(APITestCase):
+    """account_privacy.py: consent record, a copy of your data, closing the account (anonymised, records kept)."""
+
+    def setUp(self):
+        from apps.library.models import (AccountProfile, GardenDesign, InventoryItem, Order, PrivacyConsent,
+                                         SavedAddress, ServiceBooking, ServiceReview)
+        self.user = User.objects.create_user(username='lina', password='Garden-pass-2026', email='lina@example.com',
+                                             first_name='Lina', last_name='Cruz')
+        AccountProfile.objects.create(user=self.user, phone='09171234567')
+        PrivacyConsent.objects.create(user=self.user, policy_version='2026-01-01')
+        SavedAddress.objects.create(user=self.user, city_code='045624000', barangay_code='045624002', street='12 Quezon Ave',
+                                    lat=13.93, lng=121.61, contact_phone='09171234567')
+        self.draft = GardenDesign.objects.create(user=self.user, name='Just trying')
+        self.booked = GardenDesign.objects.create(user=self.user, name='The one we built')
+        self.booking = ServiceBooking.objects.create(user=self.user, service_type='Softscape', scheduled_date='2026-10-01',
+                                                     status='Finished', design=self.booked, contact_number='09171234567',
+                                                     site_lat=13.93, site_lng=121.61)
+        ServiceReview.objects.create(booking=self.booking, user=self.user, rating=5, comment='Lovely work', is_public=True)
+        item = InventoryItem.objects.create(name='Fern', category='plant', unit_price=150, stock_quantity=5)
+        self.order = Order.objects.create(user=self.user, customer_name='Lina Cruz', customer_email='lina@example.com',
+                                          customer_phone='09171234567', customer_address='12 Quezon Ave, Lucena',
+                                          total_price=300, status='Delivered', delivery_lat=13.9, delivery_lng=121.6)
+        self.order.items.create(item=item, quantity=2, price_at_booking=150)
+        self.client.credentials(HTTP_AUTHORIZATION=f'Bearer {RefreshToken.for_user(self.user).access_token}')
+
+    def test_consent_shows_and_the_updated_notice_can_be_accepted(self):
+        r = self.client.get('/api/me/privacy/')
+        self.assertEqual(r.data['consent']['version'], '2026-01-01')
+        self.assertFalse(r.data['up_to_date'])
+        self.assertTrue(r.data['can_close'])
+        r = self.client.post('/api/me/privacy/accept/')
+        self.assertTrue(r.data['up_to_date'])
+
+    def test_download_my_data(self):
+        import json
+        r = self.client.get('/api/me/export/')
+        self.assertEqual(r.status_code, 200)
+        self.assertIn('attachment', r['Content-Disposition'])
+        data = json.loads(r.content)
+        self.assertEqual(data['account']['phone'], '09171234567')
+        self.assertEqual(len(data['addresses']), 1)
+        self.assertEqual(data['orders'][0]['items'][0]['quantity'], 2)
+        self.assertEqual(data['service_reviews'][0]['comment'], 'Lovely work')
+
+    def test_open_work_blocks_closing(self):
+        from apps.library.models import ProjectTracker, ServiceBooking
+        open_booking = ServiceBooking.objects.create(user=self.user, service_type='maintenance', scheduled_date='2027-01-05', status='Pending')
+        ProjectTracker.objects.create(booking=self.booking, total_price=1000, remaining_balance=400)
+        blockers = self.client.get('/api/me/privacy/').data['blockers']
+        self.assertTrue(any(f'#{open_booking.id}' in b and 'Cancel it' in b for b in blockers))
+        self.assertTrue(any('unpaid balance' in b for b in blockers))
+        r = self.client.post('/api/me/close/', {'current_password': 'Garden-pass-2026', 'confirm': 'CLOSE'}, format='json')
+        self.assertEqual(r.status_code, 409)
+        self.user.refresh_from_db()
+        self.assertTrue(self.user.is_active)
+
+    def test_close_needs_password_and_the_word(self):
+        self.assertEqual(self.client.post('/api/me/close/', {'current_password': 'nope', 'confirm': 'CLOSE'}, format='json').status_code, 400)
+        self.assertEqual(self.client.post('/api/me/close/', {'current_password': 'Garden-pass-2026', 'confirm': 'yes'}, format='json').status_code, 400)
+
+    def test_closing_erases_the_person_and_keeps_the_records(self):
+        from apps.library.models import (ActivityLog, GardenDesign, Order, SavedAddress, ServiceBooking, ServiceReview)
+        from apps.library.serializers import public_reviewer_name
+        r = self.client.post('/api/me/close/', {'current_password': 'Garden-pass-2026', 'confirm': 'close'}, format='json')
+        self.assertEqual(r.status_code, 200, r.data)
+        self.user.refresh_from_db()
+        self.assertFalse(self.user.is_active)
+        self.assertTrue(self.user.username.startswith(f'deleted-{self.user.id}-'))
+        self.assertEqual((self.user.email, self.user.first_name, self.user.last_name), ('', '', ''))
+        self.assertFalse(self.user.has_usable_password())
+        self.assertEqual(self.user.account_profile.phone, '')
+        self.assertFalse(SavedAddress.objects.filter(user=self.user).exists())
+        self.assertFalse(GardenDesign.objects.filter(pk=self.draft.pk).exists())       # never booked: gone
+        self.assertTrue(GardenDesign.objects.filter(pk=self.booked.pk).exists())       # the built design stays
+        order = Order.objects.get(pk=self.order.pk)                                    # the sale stays, minus phone and pin
+        self.assertEqual((order.customer_phone, order.delivery_lat, str(order.total_price)), ('', None, '300.00'))
+        booking = ServiceBooking.objects.get(pk=self.booking.pk)
+        self.assertEqual((booking.contact_number, booking.site_lat), ('', None))
+        review = ServiceReview.objects.get(booking=self.booking)
+        self.assertEqual(public_reviewer_name(review.user), 'Verified customer')
+        self.assertTrue(ActivityLog.objects.filter(action='account_closed').exists())
+        # The old sign-in no longer works
+        self.client.credentials()
+        r = self.client.post('/api/token/', {'username': 'lina', 'password': 'Garden-pass-2026'}, format='json')
+        self.assertEqual(r.status_code, 401)
+
+    def test_staff_close_through_the_owner(self):
+        from apps.library.models import StaffProfile
+        staff = User.objects.create_user(username='office2', password='Garden-pass-2026', is_staff=True)
+        StaffProfile.objects.create(user=staff, role='OFFICE_ADMIN')
+        self.client.credentials(HTTP_AUTHORIZATION=f'Bearer {RefreshToken.for_user(staff).access_token}')
+        self.assertFalse(self.client.get('/api/me/privacy/').data['can_close'])
+        r = self.client.post('/api/me/close/', {'current_password': 'Garden-pass-2026', 'confirm': 'CLOSE'}, format='json')
+        self.assertEqual(r.status_code, 409)
+
+
+class ClosedAccountsTests(APITestCase):
+    """User accounts → Closed: the owner sees closed accounts and what was kept; they can't be revived or deleted."""
+
+    def setUp(self):
+        from apps.library.models import Order, ServiceBooking
+        self.owner = User.objects.create_superuser(username='owner1', password='Garden-pass-2026', email='o@example.com')
+        self.customer = User.objects.create_user(username='rosa', password='Garden-pass-2026', email='rosa@example.com')
+        self.other = User.objects.create_user(username='ben', password='Garden-pass-2026')
+        Order.objects.create(user=self.customer, customer_name='Rosa', customer_email='rosa@example.com', customer_address='Lucena',
+                             total_price=500, status='Delivered', payment_status='Paid')
+        ServiceBooking.objects.create(user=self.customer, service_type='maintenance', scheduled_date='2026-09-01', status='Finished')
+        self.client.credentials(HTTP_AUTHORIZATION=f'Bearer {RefreshToken.for_user(self.customer).access_token}')
+        r = self.client.post('/api/me/close/', {'current_password': 'Garden-pass-2026', 'confirm': 'CLOSE'}, format='json')
+        self.assertEqual(r.status_code, 200, r.data)
+        self.client.credentials(HTTP_AUTHORIZATION=f'Bearer {RefreshToken.for_user(self.owner).access_token}')
+
+    def test_closed_tab_shows_kept_records_and_nothing_personal(self):
+        r = self.client.get('/api/users/', {'page': 1, 'group': 'closed'})
+        self.assertEqual(r.data['counts']['closed'], 1)
+        row = r.data['results'][0]
+        self.assertEqual((row['id'], row['orders'], row['bookings'], row['paid_total']), (self.customer.id, 1, 1, 500.0))
+        self.assertIsNotNone(row['closed_at'])
+        self.assertNotIn('username', row)
+        self.assertNotIn('email', row)
+        # Not mixed in with the open accounts
+        customers = self.client.get('/api/users/', {'page': 1, 'group': 'customers'}).data
+        self.assertEqual([u['id'] for u in customers['results']], [self.other.id])
+        self.assertEqual(customers['counts']['all'], 2)   # owner + ben
+
+    def test_closed_account_cant_be_revived_or_deleted(self):
+        url = f'/api/users/{self.customer.id}/'
+        self.assertEqual(self.client.patch(url, {'is_active': True}, format='json').status_code, 400)
+        self.assertEqual(self.client.delete(url).status_code, 400)
+        self.customer.refresh_from_db()
+        self.assertFalse(self.customer.is_active)
+
+    def test_an_account_with_orders_or_bookings_is_never_hard_deleted(self):
+        from apps.library.models import Order
+        Order.objects.create(user=self.other, customer_name='Ben', customer_email='b@example.com', customer_address='Tayabas',
+                             total_price=100, status='Delivered')
+        r = self.client.delete(f'/api/users/{self.other.id}/')
+        self.assertEqual(r.status_code, 400)
+        self.assertIn('Deactivate it instead', r.data['error'])
+        empty = User.objects.create_user(username='nobody', password='Garden-pass-2026')
+        self.assertEqual(self.client.delete(f'/api/users/{empty.id}/').status_code, 204)
+
+
+class SignOutEverywhereTests(APITestCase):
+    """jwt_session.py / signout.py: raising the session version ends every token issued before, at once."""
+
+    def setUp(self):
+        self.user = User.objects.create_user(username='tess', password='Garden-pass-2026', email='tess@example.com')
+
+    def _login(self):
+        r = self.client.post('/api/token/', {'username': 'tess', 'password': 'Garden-pass-2026'}, format='json')
+        self.assertEqual(r.status_code, 200, r.data)
+        return r.data
+
+    def _me(self, access):
+        self.client.credentials(HTTP_AUTHORIZATION=f'Bearer {access}')
+        return self.client.get('/api/me/')
+
+    def test_other_devices_are_signed_out_and_this_one_stays(self):
+        phone, laptop = self._login(), self._login()
+        self.assertEqual(self._me(phone['access']).status_code, 200)
+        self.client.credentials(HTTP_AUTHORIZATION=f'Bearer {laptop["access"]}')
+        r = self.client.post('/api/me/sign-out-everywhere/')
+        self.assertEqual(r.status_code, 200)
+        self.assertIsNotNone(r.data['signed_out_everywhere_at'])
+        fresh = r.data['tokens']
+        # The phone's access token stops working at once (not after it expires), and so does its refresh
+        r = self._me(phone['access'])
+        self.assertEqual(r.status_code, 401)
+        self.assertEqual(r.data['code'], 'session_ended')
+        self.client.credentials()
+        self.assertEqual(self.client.post('/api/token/refresh/', {'refresh': phone['refresh']}, format='json').status_code, 401)
+        self.assertEqual(self._me(laptop['access']).status_code, 401)   # the laptop's old token too
+        # The device that asked carries on with its fresh tokens, and can refresh them
+        self.assertEqual(self._me(fresh['access']).status_code, 200)
+        self.client.credentials()
+        self.assertEqual(self.client.post('/api/token/refresh/', {'refresh': fresh['refresh']}, format='json').status_code, 200)
+        # Signing in again works as usual
+        self.assertEqual(self._me(self._login()['access']).status_code, 200)
+
+    def test_changing_the_password_signs_out_the_other_devices(self):
+        other, mine = self._login(), self._login()
+        self.client.credentials(HTTP_AUTHORIZATION=f'Bearer {mine["access"]}')
+        r = self.client.post('/api/me/password/', {'current_password': 'Garden-pass-2026', 'new_password': 'Fresh-garden-2027'}, format='json')
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(self._me(other['access']).status_code, 401)
+        self.assertEqual(self._me(r.data['tokens']['access']).status_code, 200)
+
+    def test_tokens_from_before_still_work_until_someone_signs_out(self):
+        # Tokens without the "sv" claim (issued before this feature) count as version 0
+        legacy = str(RefreshToken.for_user(self.user).access_token)
+        self.assertEqual(self._me(legacy).status_code, 200)
+        self.client.post('/api/me/sign-out-everywhere/')
+        self.assertEqual(self._me(legacy).status_code, 401)
+
+
+class BarangayLookupTests(APITestCase):
+    """geo_lookup.py: map pin → town and barangay from the official boundaries (no outside service)."""
+
+    def _areas(self):
+        import json, os
+        from django.conf import settings
+        with open(os.path.join(settings.BASE_DIR, 'apps', 'library', 'data', 'quezon_areas.json'), encoding='utf-8') as f:
+            return json.load(f)['cities']
+
+    def test_every_barangay_has_a_boundary(self):
+        from apps.library.geo_lookup import _bounds
+        codes = {row['code'] for row in _bounds()}
+        ours = {b['code'] for t in self._areas() for b in t['barangays']}
+        self.assertEqual(codes, ours)
+        self.assertEqual(len(codes), 1242)
+
+    def test_known_places_land_in_their_own_barangay(self):
+        """Barangay centres from OpenStreetMap (an independent source): most must land in their own barangay,
+        and the town must be right far more often (a centre near a border can sit in the next barangay)."""
+        from apps.library.geo_lookup import locate
+        same_brgy = same_town = total = 0
+        for town in self._areas():
+            for b in town['barangays']:
+                if not b.get('lat'):
+                    continue
+                total += 1
+                found = locate(b['lat'], b['lng'])
+                same_brgy += bool(found and found['barangay_code'] == b['code'])
+                same_town += bool(found and found['city_code'] == town['code'])
+        self.assertGreaterEqual(same_brgy / total, 0.90, f'{same_brgy}/{total} in their own barangay')
+        self.assertGreaterEqual(same_town / total, 0.97, f'{same_town}/{total} in their own town')
+
+    def test_lucena_and_tayabas_codes_line_up(self):
+        """The two cities whose codes needed care (Lucena has its own code since 2023)."""
+        from apps.library.geo_lookup import locate
+        for name in ('Lucena City', 'Tayabas City'):
+            town = next(t for t in self._areas() if t['name'] == name)
+            hits = [locate(b['lat'], b['lng']) for b in town['barangays'] if b.get('lat')]
+            self.assertTrue(any(h and h['city_code'] == town['code'] and h['city_name'] == name for h in hits), name)
+
+    def test_outside_quezon_is_no_match(self):
+        from apps.library.geo_lookup import locate
+        self.assertIsNone(locate(14.5995, 120.9842))   # Manila
+        self.assertIsNone(locate(12.0, 124.5))         # open sea, far south-east
+        self.assertIsNone(locate('x', None))
+
+    def test_inside_near_and_far_on_a_known_shape(self):
+        from unittest import mock
+        from apps.library import geo_lookup
+        square = [{'code': '045601001', 'city': '045601000', 'bbox': [121.0, 14.0, 121.01, 14.01],
+                   'rings': [[(121.0, 14.0), (121.01, 14.0), (121.01, 14.01), (121.0, 14.01), (121.0, 14.0)]]}]
+        with mock.patch.object(geo_lookup, '_bounds', return_value=square):
+            self.assertEqual(geo_lookup.locate(14.005, 121.005)['match'], 'inside')
+            near = geo_lookup.locate(14.005, 121.0108)        # ~85 m east of the edge
+            self.assertEqual((near['match'], near['barangay_code']), ('near', '045601001'))
+            self.assertTrue(60 <= near['distance_m'] <= 110, near['distance_m'])
+            self.assertIsNone(geo_lookup.locate(14.005, 121.013))   # ~320 m out: too far to guess
+
+    def test_endpoint(self):
+        town = next(t for t in self._areas() if t['name'] == 'Lucena City')
+        b = next(x for x in town['barangays'] if x.get('lat'))
+        r = self.client.get('/api/address-locate/', {'lat': b['lat'], 'lng': b['lng']})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.data['city_code'], town['code'])
+        self.assertIn(r.data['match'], ('inside', 'near'))
+        self.assertTrue(r.data['barangay_name'])
+        self.assertEqual(self.client.get('/api/address-locate/', {'lat': 14.5995, 'lng': 120.9842}).data, {'match': None})
+        self.assertEqual(self.client.get('/api/address-locate/', {'lat': 'abc', 'lng': 1}).status_code, 400)
+        self.assertEqual(self.client.get('/api/address-locate/', {'lat': 95, 'lng': 1}).status_code, 400)
+
+
+class SiteSurveyTests(APITestCase):
+    """site_survey.py: what the customer marked on their yard (photo or plan) shapes every design."""
+
+    setUp = GenerateLayoutsViewTests.setUp   # same catalogue and no real Gemini; not its tests
+
+    def test_parse_cleans_and_clamps(self):
+        from apps.library import site_survey as S
+        s = S.parse({'items': [
+            {'kind': 'clear', 'x0': 8, 'z0': -3, 'x1': 30, 'z1': 2, 'label': 'Driveway'},   # clamped into 10 × 12
+            {'kind': 'clear', 'x0': 1, 'z0': 1, 'x1': 1.05, 'z1': 1.05},                    # a tap, not an area: dropped
+            {'kind': 'keep', 'x': 5, 'z': 4, 'r': 99},                                      # canopy capped
+            {'kind': 'entry', 'x': 5, 'z': 12, 'edge': 'front'},
+            {'kind': 'screen', 'edge': 'left', 'a': 9, 'b': 2},
+        ]}, 10, 12)
+        kinds = [i['kind'] for i in s['items']]
+        self.assertEqual(kinds, ['clear', 'keep', 'entry', 'screen'])
+        self.assertEqual((s['items'][0]['x1'], s['items'][0]['z0']), (10.0, 0.0))
+        self.assertEqual(s['items'][1]['r'], 8.0)
+        self.assertEqual((s['items'][3]['a'], s['items'][3]['b']), (2.0, 9.0))
+        for bad in ('nope', [{'kind': 'volcano'}], [{'kind': 'entry', 'x': 1, 'z': 1, 'edge': 'up'}],
+                    [{'kind': 'keep', 'x': 'a', 'z': 1, 'r': 1}]):
+            with self.assertRaises(S.SurveyError):
+                S.parse(bad, 10, 12)
+        self.assertEqual(S.parse(None, 10, 12), {'items': [], 'sun': None, 'outline': None})
+        # Sun setup: compass degrees wrapped to 0–360, unknown house height → one storey
+        self.assertEqual(S.parse({'sun': {'facing': -90, 'house': 'tower'}}, 10, 12)['sun'], {'facing': 270.0, 'house': 'one'})
+
+    def test_designs_keep_marked_areas_and_trees_clear(self):
+        from apps.library import layout_engine as E, site_survey as S
+        survey = {'items': [
+            {'kind': 'clear', 'x0': 0, 'z0': 6, 'x1': 3, 'z1': 12, 'label': 'Driveway'},   # front-left strip
+            {'kind': 'keep', 'x': 8, 'z': 2.5, 'r': 1.5, 'label': 'Mango tree'},          # back-right tree
+        ]}
+        r = self.client.post(self.url, {**self.valid, 'site_survey': survey}, format='json')
+        self.assertEqual(r.status_code, 200, r.data)
+        site = E.Site(10, 12, rules=S.rules(S.parse(survey, 10, 12)))
+        specs = {s.id: s for s in E.specs_from_inventory(__import__('apps.library.models', fromlist=['x']).InventoryItem.objects.all())}
+        for d in r.data['designs']:
+            planted = [p for p in d['plants'] if not p.get('is_existing')]
+            self.assertTrue(planted)
+            for p in planted:
+                self.assertTrue(site.is_clear(specs[str(p['plant_id'])], p['x'], p['z']), (d['design_name'], p))
+                self.assertFalse(0 <= p['x'] <= 3 and 6 <= p['z'] <= 12, (d['design_name'], p))      # not on the driveway
+                self.assertGreater(((p['x'] - 8) ** 2 + (p['z'] - 2.5) ** 2) ** 0.5, 1.2, (d['design_name'], p))
+            kept = [p for p in d['plants'] if p.get('is_existing')]
+            self.assertEqual([(k['label'], k['x'], k['z'], k['r']) for k in kept], [('Mango tree', 8.0, 2.5, 1.5)])
+            self.assertTrue(any('kept clear the 1 area' in n and '1 tree' in n for n in d['adjustments']), d['adjustments'])
+        self.assertEqual(len(r.data['site_survey']['items']), 2)
+
+    def test_a_bad_survey_is_refused_and_edits_respect_the_marks(self):
+        r = self.client.post(self.url, {**self.valid, 'site_survey': 'not json'}, format='json')
+        self.assertEqual(r.status_code, 400)
+        survey = {'items': [{'kind': 'clear', 'x0': 0, 'z0': 0, 'x1': 10, 'z1': 3}]}   # the whole back strip
+        r = self.client.post('/api/layout-review/', {
+            'plants': [{'plant_id': 2, 'x': 5, 'z': 1.5}], 'lot_width': 10, 'lot_length': 12, 'site_survey': survey,
+        }, format='json')
+        self.assertEqual(r.status_code, 200, r.data)
+        self.assertTrue(any(n['kind'] == 'keep_clear' for n in r.data['notes']), r.data['notes'])
+
+
+class SiteSurveyEngineTests(APITestCase):
+    """Phase 2: the engine plans around the marks: paths from gates, screens, low views, the house setback."""
+
+    setUp = GenerateLayoutsViewTests.setUp
+
+    def _designs(self, items):
+        r = self.client.post(self.url, {**self.valid, 'preferred_plant_ids': [], 'site_survey': {'items': items}}, format='json')
+        self.assertEqual(r.status_code, 200, r.data)
+        return r.data['designs']
+
+    def _specs(self):
+        from apps.library import layout_engine as E
+        from apps.library.models import InventoryItem
+        return {s.id: s for s in E.specs_from_inventory(InventoryItem.objects.all())}
+
+    def test_a_side_gate_gets_a_clear_path_to_the_lawn(self):
+        from apps.library import layout_engine as E
+        specs = self._specs()
+        for d in self._designs([{'kind': 'entry', 'x': 10, 'z': 9, 'edge': 'right'}]):
+            plan = E.GardenPlan.from_dict(d['garden_plan'])
+            self.assertTrue(plan.paths, d['design_name'])
+            x0, x1, z0, z1 = plan.paths[0]
+            self.assertAlmostEqual(x1, 10.0)                       # starts at the gate's fence…
+            self.assertTrue(z0 <= 9 <= z1)                         # …at the gate
+            self.assertTrue(plan.depth_inside(x0 + 0.01, 9) > -0.01 or len(plan.paths) == 2)   # and reaches the lawn
+            for p in d['plants']:
+                if not p.get('is_existing'):
+                    self.assertFalse(plan.on_walk(specs[str(p['plant_id'])], p['x'], p['z']), (d['design_name'], p))
+            self.assertTrue(any('path from your gate' in n for n in d['adjustments']), d['adjustments'])
+
+    def test_a_front_door_moves_the_entry(self):
+        from apps.library import layout_engine as E
+        d = self._designs([{'kind': 'entry', 'x': 2.5, 'z': 12, 'edge': 'front'}])[0]   # Symmetrical
+        plan = E.GardenPlan.from_dict(d['garden_plan'])
+        self.assertIsNone(plan.entry)                               # not the default middle gap…
+        x0, x1, z0, z1 = plan.paths[0]
+        self.assertTrue(x0 <= 2.5 <= x1 and z1 == 12.0)            # …a path from the door
+
+    def test_a_screen_plants_a_tall_row_along_the_back_fence(self):
+        specs = self._specs()
+        for d in self._designs([{'kind': 'screen', 'edge': 'back', 'a': 1, 'b': 9}]):
+            row = [p for p in d['plants'] if not p.get('is_existing') and p['z'] <= 2.2
+                   and specs[str(p['plant_id'])].layer in ('tall', 'mid') and 1 <= p['x'] <= 9]
+            self.assertGreaterEqual(len(row), 2, d['design_name'])
+            self.assertTrue(any('Screened the back fence' in n for n in d['adjustments']), d['adjustments'])
+
+    def test_a_view_keeps_only_low_plants_and_nothing_crowds_the_house(self):
+        from apps.library import layout_engine as E
+        specs = self._specs()
+        view = (3, 5, 7, 9)   # x0, z0, x1, z1
+        for d in self._designs([{'kind': 'view', 'x0': view[0], 'z0': view[1], 'x1': view[2], 'z1': view[3]}]):
+            for p in d['plants']:
+                if p.get('is_existing'):
+                    continue
+                spec = specs[str(p['plant_id'])]
+                if view[0] <= p['x'] <= view[2] and view[1] <= p['z'] <= view[3]:
+                    self.assertEqual(spec.layer, 'low', (d['design_name'], p))
+                self.assertLessEqual(p['z'], 12 - E.HOUSE_SETBACK + 1e-6, (d['design_name'], p))
+
+    def test_review_explains_the_new_rules(self):
+        from apps.library import layout_engine as E
+        specs = list(self._specs().values())
+        palm = next(s for s in specs if s.layer == 'tall')
+        site = E.Site(10, 12, rules=E.SiteRules(views=((0, 0, 10, 12),)))
+        kinds = {n['kind'] for n in E.review([{'plant_id': palm.id, 'x': 5, 'z': 11.8}], specs, site)}
+        self.assertTrue({'house', 'view'} <= kinds, kinds)
+
+
+class SunMapTests(APITestCase):
+    """Phase 3: sun and shade per spot, from which way the yard faces, the house, walls and kept trees."""
+
+    setUp = GenerateLayoutsViewTests.setUp
+
+    def test_the_house_shades_the_yard_only_when_the_sun_is_behind_it(self):
+        from apps.library import sun_map as S
+        # Back of the yard faces north: the house is south of it, between the yard and the (mostly southern) sun
+        north = S.hours_grid(10.0, 10.0, 0.0, S.HOUSE_HEIGHTS['two'])
+        south = S.hours_grid(10.0, 10.0, 180.0, S.HOUSE_HEIGHTS['two'])
+        by_house = lambda g: sum(g[-1]) / len(g[-1])   # noqa: E731  the row next to the house
+        self.assertLess(by_house(north), S.SHADE_H)
+        self.assertGreater(by_house(south), S.FULL_SUN_H)
+        # No house: nothing on that side shades the yard
+        self.assertGreater(by_house(S.hours_grid(10.0, 10.0, 0.0, 0.0)), by_house(north) + 2)
+        # A kept tree shades the ground under it
+        tree = S.hours_grid(10.0, 10.0, 180.0, 0.0, ((5.0, 5.0, 2.5),))
+        self.assertLess(tree[10][10], S.hours_grid(10.0, 10.0, 180.0, 0.0)[10][10] - 1)
+
+    def test_the_sun_map_endpoint(self):
+        self.client.credentials()   # works before signing in
+        r = self.client.post('/api/sun-map/', {'lot_width': 8, 'lot_length': 10,
+                                               'site_survey': {'items': [], 'sun': {'facing': 0, 'house': 'one'}}}, format='json')
+        self.assertEqual(r.status_code, 200, r.data)
+        self.assertEqual(len(r.data['hours']), r.data['grid'])
+        self.assertAlmostEqual(sum(r.data['summary'].values()), 1.0, places=1)
+        r = self.client.post('/api/sun-map/', {'lot_width': 8, 'lot_length': 10, 'site_survey': {'items': []}}, format='json')
+        self.assertEqual(r.status_code, 400)
+
+    def test_designs_put_each_plant_in_the_light_it_needs(self):
+        from apps.library import layout_engine as E, site_survey as S
+        from apps.library.models import InventoryItem
+        survey = {'items': [], 'sun': {'facing': 0, 'house': 'two'}}   # deep shade along the house
+        r = self.client.post(self.url, {**self.valid, 'preferred_plant_ids': [], 'site_survey': survey}, format='json')
+        self.assertEqual(r.status_code, 200, r.data)
+        lot_w, lot_l = float(self.valid['lot_width']), float(self.valid['lot_length'])
+        site = E.Site(lot_w, lot_l, rules=S.rules(S.parse(survey, lot_w, lot_l), lot_w, lot_l))
+        specs = {s.id: s for s in E.specs_from_inventory(InventoryItem.objects.all())}
+        for d in r.data['designs']:
+            for p in d['plants']:
+                if not p.get('is_existing'):
+                    self.assertTrue(E.sun_suits(specs[str(p['plant_id'])], p['x'], p['z'], site, d['plants'], specs),
+                                    (d['design_name'], p, site.sun_hours(p['x'], p['z'])))
+            self.assertTrue(any('Sun and shade worked out' in n for n in d['adjustments']), d['adjustments'])
+
+    def test_review_says_when_a_plant_is_in_the_wrong_light(self):
+        from apps.library import layout_engine as E, sun_map as S
+        from apps.library.models import InventoryItem
+        sunny = next(s for s in E.specs_from_inventory(InventoryItem.objects.all()) if s.is_plant and s.sunlight == 'full_sun')
+        site = E.Site(10, 10, rules=E.SiteRules(sun=S.hours_grid(10.0, 10.0, 0.0, S.HOUSE_HEIGHTS['two'])))
+        notes = E.review([{'plant_id': sunny.id, 'x': 5, 'z': 9.2}], [sunny], site)
+        self.assertIn('sun', {n['kind'] for n in notes}, notes)
+
+
+class YardShapeTests(APITestCase):
+    """Part 1 of shaped yards: the customer's own outline (L-shape, narrower at the back, cut corner…)."""
+
+    setUp = GenerateLayoutsViewTests.setUp
+    # 10 × 12 lot; the house takes the front-right corner (4 m × 5 m): the yard is an L around it
+    L_SHAPE = [{'x': 0, 'z': 0}, {'x': 10, 'z': 0}, {'x': 10, 'z': 7, 'house': True}, {'x': 6, 'z': 7, 'house': True},
+               {'x': 6, 'z': 12, 'house': True}, {'x': 0, 'z': 12}]
+
+    def test_outlines_are_checked(self):
+        from apps.library import lot_shape as S
+        self.assertIsNone(S.clean(None, 10, 12))
+        self.assertIsNone(S.clean([[0, 0], [10, 0], [10, 12], [0, 12]], 10, 12))       # just the box
+        pts, house = S.clean([[0, 0], [10, 0], [7, 12], [3, 12]], 10, 12)               # narrower at the house
+        self.assertEqual(house, (False, False, True, False))                          # z = L side by default
+        with self.assertRaises(S.ShapeError):
+            S.clean([[0, 0], [10, 12], [10, 0], [0, 12]], 10, 12)                      # sides cross
+        with self.assertRaises(S.ShapeError):
+            S.clean([[0, 0], [1, 0], [0, 1]], 10, 12)                                  # too small
+        self.assertEqual(S.area([(0, 0), (10, 0), (10, 7), (6, 7), (6, 12), (0, 12)]), 100.0)
+
+    def test_designs_stay_inside_the_shape_and_off_the_house_walls(self):
+        from apps.library import layout_engine as E, site_survey as SS
+        from apps.library.models import InventoryItem
+        survey = {'items': [], 'outline': self.L_SHAPE}
+        r = self.client.post(self.url, {**self.valid, 'preferred_plant_ids': [], 'site_survey': survey}, format='json')
+        self.assertEqual(r.status_code, 200, r.data)
+        site = E.Site(10, 12, rules=SS.rules(SS.parse(survey, 10, 12), 10, 12))
+        self.assertEqual(site.area, 100.0)
+        specs = {s.id: s for s in E.specs_from_inventory(InventoryItem.objects.all())}
+        for d in r.data['designs']:
+            plants = [p for p in d['plants'] if not p.get('is_existing')]
+            self.assertTrue(plants, d['design_name'])
+            for p in plants:
+                spec = specs[str(p['plant_id'])]
+                self.assertTrue(site.in_bounds(spec, p['x'], p['z']), (d['design_name'], p))
+                self.assertFalse(site.near_house(spec, p['x'], p['z']), (d['design_name'], p))
+            plan = E.GardenPlan.from_dict(d['garden_plan'])
+            self.assertEqual(len(plan.outline), 6)                                    # the views get the shape
+            if plan.lawn:
+                for x, z in ((plan.lawn[1], plan.lawn[3]), (plan.lawn[2], plan.lawn[4])) if plan.lawn[0] == 'rect' else ():
+                    self.assertTrue(site.inside(x, z), (d['design_name'], plan.lawn))
+            self.assertTrue(any("your yard's own shape" in n for n in d['adjustments']), d['adjustments'])
+
+    def test_price_uses_the_real_area(self):
+        from unittest import mock
+        from apps.library import garden_ai
+        with mock.patch.object(garden_ai, 'project_estimate', wraps=garden_ai.project_estimate) as est:
+            r = self.client.post(self.url, {**self.valid, 'preferred_plant_ids': [],
+                                            'site_survey': {'items': [], 'outline': self.L_SHAPE}}, format='json')
+        self.assertEqual(r.status_code, 200, r.data)
+        self.assertTrue(est.called)
+        self.assertEqual({c.args[2] for c in est.call_args_list}, {100.0})     # not the 10 × 12 = 120 m² box
+
+    def test_sun_map_leaves_out_what_is_outside(self):
+        from apps.library import sun_map as M
+        rows = M.hours_grid(10.0, 12.0, 180.0, 6.5, (), 20, ((0, 0), (10, 0), (10, 7), (6, 7), (6, 12), (0, 12)),
+                            (((10, 7), (6, 7)), ((6, 7), (6, 12))))
+        self.assertIsNone(rows[19][19])          # front right: the house
+        self.assertIsNotNone(rows[19][0])
+        # The house's back wall (z = 7) shades the yard behind it when the sun comes from the house side
+        # (back of the yard faces north: the sun is mostly in the south, behind the house)
+        shape = ((0, 0), (10, 0), (10, 7), (6, 7), (6, 12), (0, 12))
+        walls = (((10, 7), (6, 7)), ((6, 7), (6, 12)))
+        tall = M.hours_grid(10.0, 12.0, 0.0, 6.5, (), 20, shape, walls)
+        none = M.hours_grid(10.0, 12.0, 0.0, 0.0, (), 20, shape, walls)
+        self.assertLess(tall[10][16], none[10][16] - 1)    # x 8.25, z 6.3: just behind the house

@@ -1,8 +1,13 @@
+from . import account, account_privacy, signout
 from django.urls import path, include
 from rest_framework import routers
 
 from .views import generate_depth
-from .addresses import SavedAddressViewSet, address_areas
+from .addresses import SavedAddressViewSet, address_areas, address_locate
+from .site_survey import sun_map_view
+from .cart import my_cart
+from .share import design_share, shared_design
+from .proposal import design_proposal
 from .crew_location import arrived, live_locations, report_location
 from .analytics import income_analytics
 from .portfolio import BusinessCredentialViewSet, PortfolioViewSet
@@ -42,11 +47,21 @@ router.register(r'addresses', SavedAddressViewSet, basename='address')
 urlpatterns = [
     path('', include(router.urls)),
     path('address-areas/', address_areas, name='address-areas'),
+    path('address-locate/', address_locate, name='address-locate'),   # pin → town & barangay
+    path('me/', account.me, name='me'),
+    path('me/password/', account.change_password, name='me-password'),
+    path('me/email/', account.change_email, name='me-email'),
+    path('me/privacy/', account_privacy.privacy, name='me-privacy'),
+    path('me/privacy/accept/', account_privacy.accept_notice, name='me-privacy-accept'),
+    path('me/export/', account_privacy.export, name='me-export'),
+    path('me/close/', account_privacy.close, name='me-close'),
+    path('me/sign-out-everywhere/', signout.sign_out_everywhere, name='me-sign-out-everywhere'),
     path('crew-location/', report_location, name='crew-location'),
     path('crew-location/live/', live_locations, name='crew-location-live'),
     path('crew-location/arrived/', arrived, name='crew-arrived'),
     path('generate-depth/', generate_depth, name='generate-depth'),
     path('generate-layouts/', GenerateLayoutsView.as_view(), name='generate-layouts'),
+    path('sun-map/', sun_map_view, name='sun-map'),   # Mark your yard → Show sun & shade
     path('scan-zones/', scan_zones, name='scan-zones'),
     path('layout-review/', layout_review, name='layout-review'),
     path('layout-place/', layout_place, name='layout-place'),
@@ -70,6 +85,10 @@ urlpatterns = [
     path('ai-designer/health/', ai_designer_health, name='ai-designer-health'),
     path('register/', RegisterView.as_view(), name='auth_register'),
     path('checkout/', checkout, name='checkout'),
+    path('cart/', my_cart, name='my_cart'),
+    path('designs/<int:pk>/share/', design_share, name='design-share'),
+    path('designs/<int:pk>/proposal/', design_proposal, name='design-proposal'),
+    path('shared-designs/<str:token>/', shared_design, name='shared-design'),
     path('create-checkout-session/', create_checkout_session, name='create_checkout_session'),
     path('paymongo-webhook/', paymongo_webhook, name='paymongo_webhook'),
     path('order-receipt/<int:pk>/', order_receipt, name='order_receipt'),

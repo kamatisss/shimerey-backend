@@ -5,7 +5,8 @@ Recorded (area / action):
   money     cash_received, order_refunded, order_cancelled, payment_recorded, payment_requested,
             payment_request_cancelled, contract_price_changed
   stock     price_changed, item_added, item_archived, item_restored, stock_adjusted
-  people    user_added, role_changed, account_disabled, account_enabled, user_deleted
+  people    user_added, role_changed, account_disabled, account_enabled, user_deleted, password_changed, email_changed,
+            account_closed, signed_out_everywhere
   work      booking_cancelled, job_signed_off
   settings  business_profile_changed, pricing_changed
 Only the owner reads it (GET /api/admin/activity/). Rows are never edited or deleted from the app.

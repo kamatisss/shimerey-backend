@@ -99,13 +99,13 @@ class IsOfficeAdmin(BasePermission):
 
 from django.contrib.auth.models import User
 from django.db import transaction
-from django.db.models import Avg, Count, Q
+from django.db.models import Avg, Count, F, Q
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from rest_framework_simplejwt.views import TokenObtainPairView
 
 from .portfolio import create_portfolio_draft, sanitize_image
-from . import activity, addresses, cash, field_work, inventory, notifications, offline, paymongo, work_queues
+from . import activity, addresses, cart, cash, design_lock, design_review, field_work, inventory, notifications, offline, paymongo, work_queues
 from .emails import send_payment_request_email
 
 from .models import (
@@ -260,10 +260,12 @@ class GardenDesignViewSet(viewsets.ModelViewSet):
         user = self.request.user
         if work_queues.is_field_crew(user):
             # Crew open the design of a job they are on (and any of their own), nobody else's
-            return GardenDesign.objects.filter(Q(bookings__assigned_crew=user) | Q(user=user)).distinct()
-        if user.is_staff or user.is_superuser:
-            return GardenDesign.objects.all()
-        return GardenDesign.objects.filter(user=user)
+            qs = GardenDesign.objects.filter(Q(bookings__assigned_crew=user) | Q(user=user)).distinct()
+        elif user.is_staff or user.is_superuser:
+            qs = GardenDesign.objects.all()
+        else:
+            qs = GardenDesign.objects.filter(user=user)
+        return qs.annotate(is_locked=design_lock.locked_annotation())
 
     def get_serializer_class(self):
         if self.action == 'list':
@@ -274,21 +276,57 @@ class GardenDesignViewSet(viewsets.ModelViewSet):
         user = self.request.user if self.request.user.is_authenticated else None
         serializer.save(user=user)
 
+    # Booked designs are locked: the crew builds from them (design_lock.py)
+    def update(self, request, *args, **kwargs):
+        design = self.get_object()
+        blocked = design_lock.write_error(request.user, design)
+        if blocked:
+            return Response(blocked[1], status=blocked[0])
+        response = super().update(request, *args, **kwargs)
+        info = design_lock.lock_info(design)
+        if info:
+            # Only the office gets here: keep a trail of every change to a design a booking uses
+            activity.record(request.user, 'work', 'booked_design_changed',
+                            f'Changed the design "{design.name}" used by booking #{info["booking"]}',
+                            link=notifications.booking_office_path(info['booking']),
+                            booking=info['booking'], design=design.id)
+        return response
+
+    # What the crew builds from: a change to any of these is a new version (design_review.py)
+    BUILD_FIELDS = ('placed_items', 'dimensions', 'plant_breakdown', 'total_cost', 'terrain_height')
+
     def perform_update(self, serializer):
-        serializer.save()
+        design, data, extra = serializer.instance, serializer.validated_data, {}
+        if 'placed_items' in data and 'plant_breakdown' not in data and data['placed_items'] != design.placed_items:
+            # The Studio saves only the placed items: count the plant list again so it isn't the old version's
+            extra['plant_breakdown'] = field_work.plant_breakdown_for(data['placed_items'], design.plant_breakdown)
+        if any(f in data and data[f] != getattr(design, f) for f in self.BUILD_FIELDS) or extra:
+            extra['revision'] = design.revision + 1
+        serializer.save(**extra)
+
+    def destroy(self, request, *args, **kwargs):
+        design = self.get_object()
+        blocked = design_lock.write_error(request.user, design, deleting=True)
+        if blocked:
+            return Response(blocked[1], status=blocked[0])
+        return super().destroy(request, *args, **kwargs)
 
     @action(detail=True, methods=['post'])
     def duplicate(self, request, pk=None):
-        """POST /api/designs/:id/duplicate/ → clone a design."""
+        """POST /api/designs/:id/duplicate/ → an unbooked copy of a design (how a customer keeps working on a booked one)."""
         original = self.get_object()
         copy = GardenDesign.objects.create(
             user=request.user if request.user.is_authenticated else None,
-            name=f"{original.name} (Copy)",
+            name=f"{original.name} (Copy)"[:100],
+            garden_image=original.garden_image,
             original_image_url=original.original_image_url,
+            reference_image_url=original.reference_image_url,
             depth_data=original.depth_data,
             placed_items=original.placed_items,
+            plant_breakdown=original.plant_breakdown,
             dimensions=original.dimensions,
             total_cost=original.total_cost,
+            cost_estimate=original.cost_estimate,
             terrain_height=original.terrain_height,
             time_of_day=original.time_of_day,
         )
@@ -326,6 +364,9 @@ class GardenDesignViewSet(viewsets.ModelViewSet):
         Accepts any subset of: position, rotation, scale.
         """
         design = self.get_object()
+        blocked = design_lock.write_error(request.user, design)
+        if blocked:
+            return Response(blocked[1], status=blocked[0])
         placed = design.placed_items or []
 
         # Find the item by its client-side id (stored as a number or string)
@@ -351,7 +392,8 @@ class GardenDesignViewSet(viewsets.ModelViewSet):
                     target[field] = value
 
         design.placed_items = placed
-        design.save(update_fields=['placed_items', 'updated_at'])
+        design.revision += 1
+        design.save(update_fields=['placed_items', 'revision', 'updated_at'])
         return Response({'status': 'updated', 'item': target})
 
 
@@ -374,7 +416,7 @@ class ServiceBookingViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         user = self.request.user
-        base = ServiceBooking.objects.select_related('design', 'design__garden_image', 'tracker').prefetch_related('assigned_crew', 'tracker__payment_requests')
+        base = ServiceBooking.objects.select_related('design', 'design__garden_image', 'tracker').prefetch_related('assigned_crew', 'tracker__payment_requests', 'design_reviews__by')
 
         if not (user.is_staff or user.is_superuser):
             return base.filter(user=user)
@@ -426,16 +468,9 @@ class ServiceBookingViewSet(viewsets.ModelViewSet):
         return Response(work_queues.booking_schedule(self.get_queryset(), start, end, crew))
 
     def perform_create(self, serializer):
-        design_id = self.request.data.get('design_id') or self.request.data.get('design')
-        if design_id:
-            try:
-                from .models import GardenDesign
-                design = GardenDesign.objects.get(id=design_id)
-                booking = serializer.save(user=self.request.user, design=design)
-            except Exception:
-                booking = serializer.save(user=self.request.user)
-        else:
-            booking = serializer.save(user=self.request.user)
+        # `design` is checked by the serializer (customers attach only their own); a bad id is a 400 now,
+        # it used to quietly make the booking without its design. Booking it locks it (design_lock.py).
+        booking = serializer.save(user=self.request.user)
 
         # Every booking gets a project tracker so billing and stages exist from day one.
         # The design estimate is the starting contract price; staff can adjust it.
@@ -460,6 +495,10 @@ class ServiceBookingViewSet(viewsets.ModelViewSet):
         if not (user.is_staff or user.is_superuser):
             for field in self.CUSTOMER_LOCKED:
                 serializer.validated_data.pop(field, None)
+            if 'design' in serializer.validated_data and serializer.validated_data['design'] != booking.design                     and booking.status != 'Pending':
+                # The office has quoted and planned from this design: changing it is their call
+                from rest_framework.exceptions import ValidationError as DRFValidationError
+                raise DRFValidationError({'design': 'We are already preparing this job from your design; contact us to change it.'})
             if 'address' in serializer.validated_data and booking.status not in ('Pending', 'Preparing'):
                 # The crew navigates to and checks in at this pin: once work has started, call the office
                 from rest_framework.exceptions import ValidationError as DRFValidationError
@@ -619,6 +658,41 @@ class ServiceBookingViewSet(viewsets.ModelViewSet):
         serializer = ServiceBookingSerializer(booking, context={'request': request})
         return Response(serializer.data)
 
+    @action(detail=True, methods=['post'], url_path='design-review', permission_classes=[IsAuthenticated])
+    def design_review(self, request, pk=None):
+        """
+        Agree the final design (design_review.py). POST {step, note?, revision?}:
+          office:   send | approved_in_person
+          customer: approve (revision = the version on their screen) | changes
+        """
+        booking = self.get_object()
+        user, step = request.user, request.data.get('step')
+        office = design_lock.is_office(user)
+        owner = booking.user_id == user.id
+        note = request.data.get('note', '')
+        try:
+            if step == 'send' and office:
+                design_review.send(booking, user, note)
+            elif step == 'approved_in_person' and office:
+                design_review.approve_in_person(booking, user, note)
+            elif step == 'approve' and owner:
+                design_review.approve(booking, user, request.data.get('revision'))
+            elif step == 'changes' and owner:
+                design_review.request_changes(booking, user, note)
+            elif step in ('send', 'approved_in_person', 'approve', 'changes'):
+                who = 'the office' if step in ('send', 'approved_in_person') else 'the customer'
+                return Response({'error': f'Only {who} can do this.'}, status=status.HTTP_403_FORBIDDEN)
+            else:
+                return Response({'error': 'Unknown step.'}, status=status.HTTP_400_BAD_REQUEST)
+        except design_review.ReviewError as e:
+            return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
+        if office:
+            label = 'Sent the final design' if step == 'send' else 'Recorded in-person approval of the design'
+            activity.record(user, 'work', f'design_{step}', f'{label} for booking #{booking.id}',
+                            link=notifications.booking_office_path(booking.id), booking=booking.id)
+        booking = self.get_queryset().get(pk=booking.pk)   # fresh, with the new step
+        return Response(ServiceBookingSerializer(booking, context={'request': request}).data)
+
     @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated])
     def on_my_way(self, request, pk=None):
         """Crew: tell the customer we're coming, with an arrival estimate (15/30/45/60 min)."""
@@ -748,6 +822,10 @@ class ServiceBookingViewSet(viewsets.ModelViewSet):
             if pct == 100 and not proof_photo_url_direct:
                 return Response({'error': 'Take a photo to finish this stage.'}, status=status.HTTP_400_BAD_REQUEST)
 
+        if phase == 'design_contract' and pct == 100 and booking.design_id and not design_review.is_approved(booking):
+            return Response({'error': "The customer hasn't approved the final design yet. Send it to them, "
+                                      'or record that they approved it in person.'}, status=status.HTTP_400_BAD_REQUEST)
+
         milestone, _ = ProjectMilestone.objects.get_or_create(booking=booking, phase=phase)
         milestone.completion_pct = pct
         if notes:
@@ -876,7 +954,7 @@ class ServiceBookingViewSet(viewsets.ModelViewSet):
             from reportlab.lib import colors
             from reportlab.platypus import (
                 SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle,
-                HRFlowable, Image as RLImage, Flowable, PageBreak,
+                HRFlowable, Image as RLImage, Flowable, PageBreak, KeepTogether,
             )
             from reportlab.lib.enums import TA_CENTER, TA_RIGHT, TA_LEFT
             from reportlab.graphics.shapes import (
@@ -890,6 +968,12 @@ class ServiceBookingViewSet(viewsets.ModelViewSet):
                 {'error': 'PDF library (reportlab) is not installed on this server.'},
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR,
             )
+
+        # A font with the peso sign, arrows and circles (Helvetica has none of them; falls back to
+        # Helvetica with plain text when no such font is installed). Same fonts as the proposal PDF.
+        from .proposal import fonts as _pdf_fonts
+        _FONT, _BOLD, _PESO = _pdf_fonts()
+        _TTF = _FONT != 'Helvetica'
 
         buffer = _io.BytesIO()
         PAGE_W, PAGE_H = A4
@@ -911,18 +995,18 @@ class ServiceBookingViewSet(viewsets.ModelViewSet):
         BG    = colors.HexColor('#f8fafc')
         BG2   = colors.HexColor('#f0fdf4')
 
-        H1    = ParagraphStyle('H1',    fontName='Helvetica-Bold', fontSize=20, textColor=DARK, alignment=TA_CENTER, spaceAfter=2)
-        H2    = ParagraphStyle('H2',    fontName='Helvetica-Bold', fontSize=10, textColor=DARK, spaceBefore=10, spaceAfter=5)
-        SUB   = ParagraphStyle('SUB',   fontName='Helvetica',      fontSize=9,  textColor=MID,  alignment=TA_CENTER, spaceAfter=4)
-        LBL   = ParagraphStyle('LBL',   fontName='Helvetica-Bold', fontSize=8,  textColor=LIGHT)
-        VAL   = ParagraphStyle('VAL',   fontName='Helvetica',      fontSize=9,  textColor=DARK)
-        SMALL = ParagraphStyle('SMALL', fontName='Helvetica',      fontSize=7,  textColor=LIGHT, alignment=TA_CENTER)
-        CELL  = ParagraphStyle('CELL',  fontName='Helvetica',      fontSize=8,  textColor=DARK)
-        CELLR = ParagraphStyle('CELLR', fontName='Helvetica',      fontSize=8,  textColor=DARK,  alignment=TA_RIGHT)
-        CELLC = ParagraphStyle('CELLC', fontName='Helvetica',      fontSize=8,  textColor=MID,   alignment=TA_CENTER)
-        HEAD  = ParagraphStyle('HEAD',  fontName='Helvetica-Bold', fontSize=8,  textColor=colors.white)
-        HEADR = ParagraphStyle('HEADR', fontName='Helvetica-Bold', fontSize=8,  textColor=colors.white, alignment=TA_RIGHT)
-        HEADC = ParagraphStyle('HEADC', fontName='Helvetica-Bold', fontSize=8,  textColor=colors.white, alignment=TA_CENTER)
+        H1    = ParagraphStyle('H1',    fontName=_BOLD, fontSize=20, leading=24, textColor=DARK, alignment=TA_CENTER, spaceAfter=2)
+        H2    = ParagraphStyle('H2',    fontName=_BOLD, fontSize=10, textColor=DARK, spaceBefore=10, spaceAfter=5)
+        SUB   = ParagraphStyle('SUB',   fontName=_FONT,      fontSize=9,  textColor=MID,  alignment=TA_CENTER, spaceAfter=4)
+        LBL   = ParagraphStyle('LBL',   fontName=_BOLD, fontSize=8,  textColor=LIGHT)
+        VAL   = ParagraphStyle('VAL',   fontName=_FONT,      fontSize=9,  textColor=DARK)
+        SMALL = ParagraphStyle('SMALL', fontName=_FONT,      fontSize=7,  textColor=LIGHT, alignment=TA_CENTER)
+        CELL  = ParagraphStyle('CELL',  fontName=_FONT,      fontSize=8,  textColor=DARK)
+        CELLR = ParagraphStyle('CELLR', fontName=_FONT,      fontSize=8,  textColor=DARK,  alignment=TA_RIGHT)
+        CELLC = ParagraphStyle('CELLC', fontName=_FONT,      fontSize=8,  textColor=MID,   alignment=TA_CENTER)
+        HEAD  = ParagraphStyle('HEAD',  fontName=_BOLD, fontSize=8,  textColor=colors.white)
+        HEADR = ParagraphStyle('HEADR', fontName=_BOLD, fontSize=8,  textColor=colors.white, alignment=TA_RIGHT)
+        HEADC = ParagraphStyle('HEADC', fontName=_BOLD, fontSize=8,  textColor=colors.white, alignment=TA_CENTER)
 
         col_full = PAGE_W - 2 * MARGIN
 
@@ -936,32 +1020,14 @@ class ServiceBookingViewSet(viewsets.ModelViewSet):
             def draw(self):
                 _renderPDF.draw(self._d, self.canv, 0, 0)
 
-        # ── Pre-parse Design Placements & Dimensions ──────────────────
-        placed_raw = (booking.design.placed_items or []) if booking.design else []
-        dims       = (booking.design.dimensions or {}) if booking.design else {}
-        plant_num  = {}  # pid str → 1-based number; shared by the BOM No. column
-        plant_groups = {}  # pid str → {'label': str, 'positions': [(x,z)]}
-
-        if placed_raw and isinstance(placed_raw, list):
-            # Parse plant positions from both AI-format and 3D-studio-format items
-            for item in placed_raw:
-                if 'x' in item and 'z' in item:
-                    pid   = str(item.get('plant_id', item.get('productId', '?')))
-                    label = item.get('name') or pid
-                    x, z  = float(item['x']), float(item['z'])
-                elif 'position' in item:
-                    pid   = str(item.get('productId', item.get('modelType', '?')))
-                    label = item.get('name') or pid
-                    x = float(item['position'].get('x', 0))
-                    z = float(item['position'].get('z', 0))
-                else:
-                    continue
-                plant_groups.setdefault(pid, {'label': label, 'positions': []})['positions'].append((x, z))
-
-            if plant_groups:
-                # Assign stable 1-based numbers so the legend and BOM can cross-reference
-                for seq, pid in enumerate(plant_groups.keys(), 1):
-                    plant_num[pid] = seq
+        # ── Setting out: each item's label and tape measurements (setting_out.py) ──
+        from .setting_out import setting_out as _setting_out, plan_drawing as _plan_drawing
+        from .design_items import lot_items as _lot_items
+        so = _setting_out(booking.design) if booking.design else None
+        # Lot metres for AI and Studio items alike (the old parse drew Studio items off-centre)
+        placed_raw = _lot_items(booking.design) if booking.design else []
+        plant_num = {t['plant_id']: t['no'] for t in (so or {}).get('types', [])}   # = the BOM No. column
+        plant_groups = bool(so and so['items'])
 
         story = []
 
@@ -1014,6 +1080,20 @@ class ServiceBookingViewSet(viewsets.ModelViewSet):
             story.append(Paragraph('  ·  '.join(crew_names), VAL))
             story.append(Spacer(1, 4))
 
+        # Is this the design the customer approved? (design_review.py) — printed so paper copies say so too
+        if booking.design:
+            rv = design_review.summary(booking)
+            if rv['state'] == 'approved':
+                how = 'in person' if rv['approved_in_person'] else f"by {rv['approved_by']}"
+                line = (f"<font color='#059669'><b>Approved</b></font> {how} on {rv['approved_at']:%b %d, %Y} "
+                        f"(version {rv['approved_revision']}). Build this version.")
+            else:
+                line = ("<font color='#ea580c'><b>NOT FINAL.</b></font> The customer has not approved this version "
+                        "of the design. Check with the office before planting.")
+            story.append(Paragraph('FINAL DESIGN', H2))
+            story.append(Paragraph(line, VAL))
+            story.append(Spacer(1, 4))
+
         # AI Design Photo (on Page 1 if present)
         ai_url = None
         if booking.design:
@@ -1046,152 +1126,38 @@ class ServiceBookingViewSet(viewsets.ModelViewSet):
             story.append(PageBreak())
 
             if plant_groups:
-                story.append(Paragraph('GARDEN LAYOUT BLUEPRINT  (Overhead / Orthographic View)', H2))
+                story.append(Paragraph('SETTING-OUT PLAN  (from above, to scale)', H2))
+                story.append(Paragraph(
+                    'Stand at the house facing the garden. For each item, measure straight out from the house '
+                    'side of the lot, then across from the nearer side boundary (left or right). Labels match the '
+                    'table below; the number before the dot is the item on the bill of materials.', CELL))
+                story.append(Spacer(1, 4))
+                story.append(_DrawingFlowable(_plan_drawing(booking.design, so, float(col_full), 12.5 * cm, _FONT, _BOLD)))
+                story.append(Spacer(1, 6))
 
-                # Redesigned 25m x 10m grid scaling
-                lot_w = 25.0
-                lot_l = 10.0
-
-                DIAG_W  = float(col_full)
-                DIAG_H  = 13.5 * cm  # Fulfills min 50% vertical page real estate requirement
-                D_MARG  = 35.0
-
-                usable_w = DIAG_W - 2 * D_MARG
-                usable_h = DIAG_H - 2 * D_MARG
-                scale    = min(usable_w / lot_w, usable_h / lot_l)
-
-                lot_px_w = lot_w * scale
-                lot_px_h = lot_l * scale
-                ox = (DIAG_W - lot_px_w) / 2
-                oy = (DIAG_H - lot_px_h) / 2
-
-                drw = Drawing(DIAG_W, DIAG_H)
-
-                # Lot background + green boundary frame
-                drw.add(Rect(ox, oy, lot_px_w, lot_px_h,
-                             fillColor=colors.HexColor('#f0fdf4'),
-                             strokeColor=GREEN, strokeWidth=1.5))
-
-                # Minor grid lines (every 1 m) — very faint
-                GRID_MINOR = colors.HexColor('#d1fae5')
-                for xi in range(1, int(lot_w)):
-                    gx = ox + xi * scale
-                    drw.add(Line(gx, oy, gx, oy + lot_px_h,
-                                 strokeColor=GRID_MINOR, strokeWidth=0.3))
-                for zi in range(1, int(lot_l)):
-                    gz = oy + zi * scale
-                    drw.add(Line(ox, gz, ox + lot_px_w, gz,
-                                 strokeColor=GRID_MINOR, strokeWidth=0.3))
-
-                # Major grid lines (every 5 m) — slightly more visible
-                GRID_MAJOR = colors.HexColor('#6ee7b7')
-                for xi in range(5, int(lot_w), 5):
-                    gx = ox + xi * scale
-                    drw.add(Line(gx, oy, gx, oy + lot_px_h,
-                                 strokeColor=GRID_MAJOR, strokeWidth=0.8))
-                for zi in range(5, int(lot_l), 5):
-                    gz = oy + zi * scale
-                    drw.add(Line(ox, gz, ox + lot_px_w, gz,
-                                 strokeColor=GRID_MAJOR, strokeWidth=0.8))
-
-                # Tick labels every 5 m along width axis (bottom)
-                for xi in range(0, int(lot_w) + 1, 5):
-                    gx = ox + xi * scale
-                    drw.add(GrStr(gx, oy - 12, f'{xi}m',
-                                  textAnchor='middle', fontSize=7, fillColor=LIGHT))
-
-                # Tick labels every 5 m along length axis (left)
-                for zi in range(0, int(lot_l) + 1, 5):
-                    gz = oy + zi * scale
-                    drw.add(GrStr(ox - 12, gz - 2.5, f'{zi}m',
-                                  textAnchor='end', fontSize=7, fillColor=LIGHT))
-
-                # Clear orientation markers (House Side / Fence Side)
-                drw.add(GrStr(ox + lot_px_w / 2, oy + lot_px_h + 15, "FENCE SIDE",
-                              textAnchor='middle', fontSize=9, fontName='Helvetica-Bold', fillColor=DARK))
-                drw.add(GrStr(ox + lot_px_w / 2, oy - 25, "HOUSE SIDE",
-                              textAnchor='middle', fontSize=9, fontName='Helvetica-Bold', fillColor=DARK))
-
-                # North indicator (top-right corner, outside grid but inside canvas margin)
-                drw.add(GrStr(ox + lot_px_w, oy + lot_px_h + 15,
-                              'N ↑', textAnchor='end', fontSize=9, fontName='Helvetica-Bold', fillColor=MID))
-
-                # Dimension span labels
-                drw.add(GrStr(ox + lot_px_w / 2, oy - 38,
-                              f'Width: {lot_w:.0f} m',
-                              textAnchor='middle', fontSize=8,
-                              fillColor=MID, fontName='Helvetica-Bold'))
-
-                from reportlab.graphics.shapes import Group as _GrGrp
-                h_lbl_grp = _GrGrp()
-                h_lbl_grp.add(GrStr(0, 0, f'Length: {lot_l:.0f} m',
-                                    textAnchor='middle', fontSize=8,
-                                    fillColor=MID, fontName='Helvetica-Bold'))
-                h_lbl_grp.transform = (0, 1, -1, 0, ox - 26, oy + lot_px_h / 2)
-                drw.add(h_lbl_grp)
-
-                # Plant markers (e.g. 1.24, 2.25) rendered as circles with inner labels
-                PALETTE = [
-                    '#059669', '#0ea5e9', '#f59e0b', '#8b5cf6',
-                    '#ef4444', '#06b6d4', '#84cc16', '#f97316',
-                ]
-                legend_entries = []   # [(seq, label, hex_color)]
-                r_pt = 11.0  # Larger marker size for clear text legibility
-
-                for pid, data in plant_groups.items():
-                    seq     = plant_num[pid]
-                    hex_col = PALETTE[(seq - 1) % len(PALETTE)]
-                    rl_col  = colors.HexColor(hex_col)
-                    legend_entries.append((seq, data['label'], hex_col))
-
-                    for idx, (x, z) in enumerate(data['positions']):
-                        # Use abs to guard against negative coordinates
-                        cx = ox + abs(float(x)) * scale
-                        cy = oy + abs(float(z)) * scale
-                        cx = max(ox + r_pt, min(ox + lot_px_w - r_pt, cx))
-                        cy = max(oy + r_pt, min(oy + lot_px_h - r_pt, cy))
-                        drw.add(Circle(cx, cy, r_pt,
-                                       fillColor=rl_col,
-                                       strokeColor=colors.white, strokeWidth=0.8))
-                        # Format label as Species.Instance (e.g. 1.24, 2.25)
-                        marker_str = f"{seq}.{idx+1}"
-                        drw.add(GrStr(cx, cy - r_pt * 0.25,
-                                      marker_str,
-                                      textAnchor='middle',
-                                      fontSize=6.5,
-                                      fontName='Helvetica-Bold',
-                                      fillColor=colors.white))
-
-                story.append(_DrawingFlowable(drw))
-                story.append(Spacer(1, 5))
-
-                # Plant Legend immediately adjacent to/below the Blueprint
-                HLEG = ParagraphStyle('HLEG', fontName='Helvetica-Bold', fontSize=8,
-                                      textColor=MID, spaceAfter=3)
-                story.append(Paragraph('PLANT LEGEND  (Markers format: Species.Instance, e.g. 1.24 is instance 24 of species 1)', HLEG))
-                legend_entries.sort(key=lambda e: e[0])
-                leg_cols = 3
-                leg_row_data = [legend_entries[i:i+leg_cols]
-                                for i in range(0, len(legend_entries), leg_cols)]
-                for row in leg_row_data:
-                    cells = []
-                    for seq, lbl, hex_col in row:
-                        cells.append(Paragraph(
-                            f'<font color="{hex_col}"><b>&#9679;</b></font>'
-                            f'  <b>{seq}.</b>  {lbl}',
-                            CELL,
-                        ))
-                    while len(cells) < leg_cols:
-                        cells.append(Paragraph('', CELL))
-                    story.append(Table(
-                        [cells],
-                        colWidths=[col_full / leg_cols] * leg_cols,
-                        style=TableStyle([
-                            ('TOPPADDING',    (0, 0), (-1, -1), 2),
-                            ('BOTTOMPADDING', (0, 0), (-1, -1), 2),
-                            ('LEFTPADDING',   (0, 0), (-1, -1), 4),
-                        ]),
-                    ))
+                SO_HEAD = [Paragraph('Label', HEADC), Paragraph('Plant / item', HEAD),
+                           Paragraph('From house', HEADR), Paragraph('From side', HEADR)]
+                so_rows = [SO_HEAD]
+                for it in so['items']:
+                    side = 'left' if it['side'] == 'left' else 'right'
+                    name = it['name'] + ('  (outside the lot: check with the office)' if it['outside'] else '')
+                    so_rows.append([
+                        Paragraph(f"<b>{it['label']}</b>", CELLC),
+                        Paragraph(name, CELL),
+                        Paragraph(f"{it['from_house']:.2f} m", CELLR),
+                        Paragraph(f"{it['from_side']:.2f} m from {side}", CELLR),
+                    ])
+                so_tbl = Table(so_rows, colWidths=[col_full * r for r in (0.1, 0.44, 0.2, 0.26)], repeatRows=1)
+                so_tbl.setStyle(TableStyle([
+                    ('BACKGROUND',     (0, 0), (-1, 0),  DARK),
+                    ('ROWBACKGROUNDS', (0, 1), (-1, -1), [BG, colors.white]),
+                    ('TOPPADDING',     (0, 0), (-1, -1), 3),
+                    ('BOTTOMPADDING',  (0, 0), (-1, -1), 3),
+                    ('GRID',           (0, 0), (-1, -1), 0.3, RULE),
+                    ('VALIGN',         (0, 0), (-1, -1), 'MIDDLE'),
+                ]))
+                story.append(Paragraph(f"SETTING-OUT TABLE  ·  lot {so['width']:.2f} m wide × {so['length']:.2f} m deep  ·  measurements to 5 cm", H2))
+                story.append(so_tbl)
                 story.append(Spacer(1, 6))
 
             # Site Reference — "Before" Photo (Grouped with blueprint and legend on Page 2)
@@ -1210,8 +1176,11 @@ class ServiceBookingViewSet(viewsets.ModelViewSet):
                         out = _io.BytesIO()
                         pil.save(out, format='JPEG', quality=88)
                         out.seek(0)
-                        story.append(Paragraph('SITE REFERENCE  —  "Before" Photo  (use as visual anchor on site)', H2))
-                        story.append(RLImage(out, width=col_full, height=5.5*cm, kind='proportional'))
+                        # Heading and photo stay on one page
+                        story.append(KeepTogether([
+                            Paragraph('SITE REFERENCE  —  "Before" Photo  (use as visual anchor on site)', H2),
+                            RLImage(out, width=col_full, height=5.5*cm, kind='proportional'),
+                        ]))
                         story.append(Spacer(1, 4))
                 except Exception:
                     pass
@@ -1292,8 +1261,8 @@ class ServiceBookingViewSet(viewsets.ModelViewSet):
                     Paragraph('Plant / Item', HEAD),
                     Paragraph('Qty', HEADC),
                     Paragraph('Spacing', HEADC),
-                    Paragraph('Unit (₱)', HEADR),
-                    Paragraph('Total (₱)', HEADR),
+                    Paragraph(f'Unit ({_PESO.strip()})', HEADR),
+                    Paragraph(f'Total ({_PESO.strip()})', HEADR),
                 ]
                 bom_rows = [bom_headers]
 
@@ -1316,15 +1285,15 @@ class ServiceBookingViewSet(viewsets.ModelViewSet):
                         Paragraph(f"{line_total:,.2f}", CELLR),
                     ])
 
-                GT  = ParagraphStyle('GT',  fontName='Helvetica-Bold', fontSize=8,  textColor=DARK)
-                GTR = ParagraphStyle('GTR', fontName='Helvetica-Bold', fontSize=10, textColor=GREEN, alignment=TA_RIGHT)
+                GT  = ParagraphStyle('GT',  fontName=_BOLD, fontSize=8,  textColor=DARK)
+                GTR = ParagraphStyle('GTR', fontName=_BOLD, fontSize=10, textColor=GREEN, alignment=TA_RIGHT)
                 bom_rows.append([
                     Paragraph('', CELLC),
                     Paragraph('GRAND TOTAL', GT),
                     Paragraph('', CELLC),
                     Paragraph('', CELLC),
                     Paragraph('', CELLR),
-                    Paragraph(f"₱ {grand:,.2f}", GTR),
+                    Paragraph(f"{_PESO}{grand:,.2f}", GTR),
                 ])
                 bom_tbl = Table(bom_rows, colWidths=cw)
                 bom_tbl.setStyle(TableStyle([
@@ -1348,16 +1317,16 @@ class ServiceBookingViewSet(viewsets.ModelViewSet):
             if booking.milestones:
                 story.append(Paragraph('PROJECT MILESTONES', H2))
                 mc = [col_full * r for r in (0.55, 0.15, 0.30)]
-                DONE_STYLE  = ParagraphStyle('DONE',  fontName='Helvetica-Bold', fontSize=9,
+                DONE_STYLE  = ParagraphStyle('DONE',  fontName=_BOLD, fontSize=9,
                                              textColor=GREEN, alignment=TA_CENTER)
-                PEND_STYLE  = ParagraphStyle('PEND',  fontName='Helvetica',      fontSize=9,
+                PEND_STYLE  = ParagraphStyle('PEND',  fontName=_FONT,      fontSize=9,
                                              textColor=LIGHT, alignment=TA_CENTER)
                 m_rows = [[Paragraph(h, HEAD) for h in ['Milestone', 'Status', 'Completed At']]]
                 for m in booking.milestones:
                     done = bool(m.get('completed', False))
                     m_rows.append([
                         Paragraph(m.get('label', ''), CELL),
-                        Paragraph('✔  Done' if done else '○  Pending', DONE_STYLE if done else PEND_STYLE),
+                        Paragraph(('●  Done' if done else '○  Pending') if _TTF else ('Done' if done else 'Pending'), DONE_STYLE if done else PEND_STYLE),
                         Paragraph(str(m.get('completed_at') or '—')[:10], CELL),
                     ])
                 m_tbl = Table(m_rows, colWidths=mc)
@@ -1382,13 +1351,13 @@ class ServiceBookingViewSet(viewsets.ModelViewSet):
                 story.append(Spacer(1, 6))
 
             # ── Client Acknowledgement — bordered box ─────────────────
-            ACK_HDR = ParagraphStyle('ACKHDR', fontName='Helvetica-Bold', fontSize=9,
+            ACK_HDR = ParagraphStyle('ACKHDR', fontName=_BOLD, fontSize=9,
                                       textColor=colors.white)
-            ACK_NOTE = ParagraphStyle('ACKNOTE', fontName='Helvetica', fontSize=8,
+            ACK_NOTE = ParagraphStyle('ACKNOTE', fontName=_FONT, fontSize=8,
                                        textColor=MID, spaceAfter=6)
-            SIG_LBL  = ParagraphStyle('SIGLBL', fontName='Helvetica-Bold', fontSize=7,
+            SIG_LBL  = ParagraphStyle('SIGLBL', fontName=_BOLD, fontSize=7,
                                        textColor=LIGHT, spaceAfter=2)
-            SIG_NOTE = ParagraphStyle('SIGNOTE', fontName='Helvetica', fontSize=6,
+            SIG_NOTE = ParagraphStyle('SIGNOTE', fontName=_FONT, fontSize=6,
                                        textColor=LIGHT, alignment=TA_CENTER)
 
             ack_content = [
@@ -1455,12 +1424,12 @@ class ServiceBookingViewSet(viewsets.ModelViewSet):
 
         def _watermark(canv, _doc):
             canv.saveState()
-            canv.setFont('Helvetica-Bold', 52)
+            canv.setFont(_BOLD, 52)
             canv.setFillColor(colors.Color(0.72, 0.72, 0.72, alpha=0.09))
             canv.translate(_WM_W / 2, _WM_H / 2)
             canv.rotate(42)
             canv.drawCentredString(0, 30, 'CONFIDENTIAL')
-            canv.setFont('Helvetica', 18)
+            canv.setFont(_FONT, 18)
             canv.setFillColor(colors.Color(0.72, 0.72, 0.72, alpha=0.07))
             canv.drawCentredString(0, -22, 'INTERNAL — FIELD USE ONLY')
             canv.restoreState()
@@ -1755,6 +1724,7 @@ def checkout(request):
 
         if order.payment_method == 'cod':
             notifications.order_new(order)
+        cart.clear_saved_cart(request.user)   # the cart became this order (on every device)
         return Response({'message': 'Order successfully placed!', 'order_id': order.id,
                          'receipt_token': order.receipt_token,
                          'subtotal': float(subtotal), 'shipping_fee': float(shipping_fee),
@@ -2050,10 +2020,37 @@ def password_reset_confirm(request):
         return Response({'error': ' '.join(e.messages)}, status=status.HTTP_400_BAD_REQUEST)
     user.set_password(new_password)   # also makes the link stop working (the token covers the hash)
     user.save(update_fields=['password'])
+    from .jwt_session import end_all_sessions
+    end_all_sessions(user)   # a reset password means whoever had the old one is signed out everywhere
     return Response({'message': 'Your password was changed. You can sign in now.', 'username': user.username})
 
 
 password_reset_confirm.cls.throttle_scope = 'password_reset_confirm'
+
+
+def closed_account_rows(users):
+    """User accounts → Closed: when it was closed and what was kept (business records), nothing personal."""
+    from django.db.models import Count, Sum
+    ids = [u.id for u in users]
+    orders = {r['user']: r for r in Order.objects.filter(user__in=ids).values('user')
+              .annotate(n=Count('id'), paid=Sum('total_price', filter=Q(payment_status='Paid')))}
+    bookings = {r['user']: r['n'] for r in ServiceBooking.objects.filter(user__in=ids).values('user').annotate(n=Count('id'))}
+    paid_projects = {r['booking__user']: r['paid'] for r in ProjectTracker.objects.filter(booking__user__in=ids)
+                     .values('booking__user').annotate(paid=Sum(F('total_price') - F('remaining_balance')))}
+    from .models import ProductReview, ServiceReview
+    reviews = {}
+    for model in (ServiceReview, ProductReview):
+        for r in model.objects.filter(user__in=ids).values('user').annotate(n=Count('id')):
+            reviews[r['user']] = reviews.get(r['user'], 0) + r['n']
+    rows = []
+    for u in users:
+        o = orders.get(u.id, {})
+        rows.append({
+            'id': u.id, 'closed': True, 'date_joined': u.date_joined, 'closed_at': u.account_profile.closed_at,
+            'orders': o.get('n', 0), 'bookings': bookings.get(u.id, 0), 'reviews': reviews.get(u.id, 0),
+            'paid_total': float((o.get('paid') or 0) + (paid_projects.get(u.id) or 0)),
+        })
+    return rows
 
 
 class UserViewSet(viewsets.ModelViewSet):
@@ -2070,10 +2067,13 @@ class UserViewSet(viewsets.ModelViewSet):
         self.permission_classes = [IsSuperUser]
         return super().get_permissions()
 
+    # Closed accounts (the customer closed it: account_privacy.py) only show under "closed"
+    OPEN_ACCOUNT = Q(account_profile__closed_at__isnull=True)
     USER_GROUPS = {
         'staff': Q(is_staff=True) | Q(is_superuser=True),
-        'customers': Q(is_staff=False, is_superuser=False),
-        'all': Q(),
+        'customers': Q(is_staff=False, is_superuser=False) & OPEN_ACCOUNT,
+        'all': OPEN_ACCOUNT,
+        'closed': ~OPEN_ACCOUNT,
     }
     USERS_PAGE = 30
 
@@ -2097,10 +2097,14 @@ class UserViewSet(viewsets.ModelViewSet):
         except (TypeError, ValueError):
             page = 1
         rows = qs.filter(self.USER_GROUPS[group])
+        if group == 'closed':
+            rows = rows.order_by('-account_profile__closed_at')
         start = (page - 1) * self.USERS_PAGE
         chunk = list(rows[start:start + self.USERS_PAGE + 1])
+        results = (closed_account_rows(chunk[:self.USERS_PAGE]) if group == 'closed'
+                   else self.get_serializer(chunk[:self.USERS_PAGE], many=True).data)
         return Response({
-            'results': self.get_serializer(chunk[:self.USERS_PAGE], many=True).data,
+            'results': results,
             'counts': counts, 'group': group, 'page': page, 'has_more': len(chunk) > self.USERS_PAGE,
         })
 
@@ -2115,8 +2119,15 @@ class UserViewSet(viewsets.ModelViewSet):
             from rest_framework.exceptions import ValidationError
             raise ValidationError({'error': f"You can't {what} your own account."})
 
+    def _closed(self, instance):
+        return bool(getattr(getattr(instance, 'account_profile', None), 'closed_at', None))
+
     def perform_update(self, serializer):
         data = self.request.data
+        if self._closed(serializer.instance):
+            # Re-enabling would bring back a sign-in for a person whose details were erased at their request
+            from rest_framework.exceptions import ValidationError
+            raise ValidationError({'error': 'The customer closed this account. It can’t be changed or re-activated.'})
         if 'is_active' in data and str(data['is_active']).lower() in ('false', '0', ''):
             self._not_yourself(serializer.instance, 'deactivate')
         if (data.get('role') and data['role'] != 'SUPER_ADMIN') or (data.get('input_role') and data['input_role'] != 'admin'):
@@ -2133,11 +2144,20 @@ class UserViewSet(viewsets.ModelViewSet):
                             f'{"Re-enabled" if user.is_active else "Disabled"} the account of {who}',
                             link='/manage-users', user=user.id)
         if self.request.data.get('password'):
-            activity.record(self.request.user, 'people', 'password_reset', f'Set a new password for {who}',
+            from .jwt_session import end_all_sessions
+            end_all_sessions(user)   # the old password's sessions end with it
+            activity.record(self.request.user, 'people', 'password_reset', f'Set a new password for {who} (signed out everywhere)',
                             link='/manage-users', user=user.id)
 
     def perform_destroy(self, instance):
         self._not_yourself(instance, 'delete')
+        # Deleting cascades to everything the account points at: orders, bookings, payments, reviews.
+        # Those are business records, so an account that has any is deactivated instead, never deleted.
+        if self._closed(instance) or Order.objects.filter(user=instance).exists() \
+                or ServiceBooking.objects.filter(user=instance).exists():
+            from rest_framework.exceptions import ValidationError
+            raise ValidationError({'error': 'This account has orders or bookings, which the business must keep. '
+                                            'Deactivate it instead of deleting it.'})
         summary = f'Deleted the account of {activity.name_of(instance)} ({activity.role_of(instance)})'
         instance.delete()
         activity.record(self.request.user, 'people', 'user_deleted', summary, link='/manage-users')

@@ -48,8 +48,21 @@ def rate_snapshot(ps=None):
     return data
 
 
+SMALL_STONE = 0.35          # m: hardscape smaller than this is a small garden stone (sold by the dozen), not a boulder
+STONE_LABOUR_SHARE = Decimal('0.2')   # placing a small stone takes a fifth of the work of setting a boulder
+
+
+def is_small_stone(item):
+    return item.category == 'hardscape' and float(item.real_world_size or 1.0) < SMALL_STONE
+
+
 def layer_of(item):
-    """Size class of an inventory item: plants by mature height; anything else is 'other'."""
+    """Size class of an inventory item: plants by mature height; groundcover 'groundcover' (per m²); small garden stones
+    'stone'; anything else 'other'."""
+    if getattr(item, 'is_groundcover', False):
+        return 'groundcover'
+    if is_small_stone(item):
+        return 'stone'
     if item.category != 'plant':
         return 'other'
     height = float(item.real_world_size or 1.0)
@@ -57,6 +70,10 @@ def layer_of(item):
 
 
 def labour_rate(ps, layer):
+    if layer == 'stone':
+        return (ps.install_other * STONE_LABOUR_SHARE).quantize(Decimal('0.01'))
+    if layer == 'groundcover':
+        return ps.planting_low   # per m²: about nine plugs, quick to plant
     return {'tall': ps.planting_tall, 'mid': ps.planting_mid, 'low': ps.planting_low}.get(layer, ps.install_other)
 
 
@@ -96,7 +113,8 @@ def plant_budget_from_all_in(budget, area_sqm, ps=None, lawn_sqm=0, new_lawn=Tru
 
 def compost_for(ps, item, scope):
     """Compost & soil for one planting hole: plants going into an existing garden (no bed-wide soil)."""
-    return ps.compost_per_plant if scope == EXISTING and item.category == 'plant' else Decimal(0)
+    return (ps.compost_per_plant if scope == EXISTING and item.category == 'plant' and not getattr(item, 'is_groundcover', False)
+            else Decimal(0))
 
 
 def installed_price(ps, item, scope=MAKEOVER):
@@ -135,9 +153,11 @@ def project_estimate(counts, items_by_id, area_sqm, ps=None, lawn_sqm=0, new_law
         plants += item.unit_price * qty
         labour += labour_rate(ps, layer_of(item)) * qty
         compost += compost_for(ps, item, scope) * qty
-        holes += qty if item.category == 'plant' else 0
+        gc = getattr(item, 'is_groundcover', False)
+        holes += qty if item.category == 'plant' and not gc else 0
         plant_lines.append({'plant_id': str(item.id), 'name': item.name, 'quantity': qty, 'category': item.category,
-                            'unit_price': _peso(item.unit_price), 'subtotal': _peso(item.unit_price * qty)})
+                            'unit_price': _peso(item.unit_price), 'subtotal': _peso(item.unit_price * qty),
+                            **({'unit': 'm²', 'groundcover': True} if gc else {})})
     d = lambda v: Decimal(str(round(v, 2)))  # noqa: E731
     lines = [
         {'key': 'plants', 'label': 'Plants & materials from our nursery', 'amount': _peso(plants)},
@@ -196,7 +216,8 @@ def plants_only_estimate(counts, items_by_id, ps=None):
             continue
         plants += item.unit_price * qty
         plant_lines.append({'plant_id': str(item.id), 'name': item.name, 'quantity': qty, 'category': item.category,
-                            'unit_price': _peso(item.unit_price), 'subtotal': _peso(item.unit_price * qty)})
+                            'unit_price': _peso(item.unit_price), 'subtotal': _peso(item.unit_price * qty),
+                            **({'unit': 'm²', 'groundcover': True} if getattr(item, 'is_groundcover', False) else {})})
     has_features = any(l['category'] != 'plant' for l in plant_lines)
     lines = [{'key': 'plants', 'label': 'Plants & garden features from our nursery' if has_features
               else 'Plants from our nursery', 'amount': _peso(plants)},
@@ -237,7 +258,7 @@ def suggest_range(area_sqm, installed=True, ps=None, scope=MAKEOVER):
     a light planting (~0.25 plants/m², cheaper plants) to a full one (~0.6 plants/m²).
     """
     ps = ps or PricingSettings.current()
-    plants = [i for i in InventoryItem.objects.filter(category='plant', stock_quantity__gt=0, is_active=True) if i.unit_price > 0]
+    plants = [i for i in InventoryItem.objects.filter(category='plant', is_groundcover=False, stock_quantity__gt=0, is_active=True) if i.unit_price > 0]
     if not plants:
         return None
     area = max(1.0, float(area_sqm))
@@ -270,7 +291,7 @@ def typical_planting(area_sqm, fullness='balanced'):
     plants per m² by fullness, split across tall/mid/low, spread over the plants in each layer.
     A light planting uses the cheaper half of each layer. Returns (counts, items_by_id).
     """
-    plants = [i for i in InventoryItem.objects.filter(category='plant', stock_quantity__gt=0, is_active=True) if i.unit_price > 0]
+    plants = [i for i in InventoryItem.objects.filter(category='plant', is_groundcover=False, stock_quantity__gt=0, is_active=True) if i.unit_price > 0]
     layers = {}
     for item in sorted(plants, key=lambda i: (i.unit_price, i.id)):
         layers.setdefault(layer_of(item), []).append(item)
@@ -314,7 +335,7 @@ def yard_capacity(width, length, installed=True, scope=MAKEOVER, new_lawn=True, 
     from django.core.cache import cache
     from . import layout_engine as engine
     ps = ps or PricingSettings.current()
-    items = [i for i in InventoryItem.objects.filter(category='plant', is_active=True, stock_quantity__gt=0) if i.unit_price > 0]
+    items = [i for i in InventoryItem.objects.filter(category='plant', is_groundcover=False, is_active=True, stock_quantity__gt=0) if i.unit_price > 0]
     if not items:
         return None
     import hashlib

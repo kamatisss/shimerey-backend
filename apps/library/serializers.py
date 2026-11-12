@@ -55,6 +55,10 @@ class CustomTokenObtainPairSerializer(TokenObtainPairSerializer):
         # Normalises legacy 'Staff' values so the frontend never sees an unexpected string
         token['role'] = _resolve_canonical_role(user)
 
+        # Session version: "Sign out everywhere" raises it and every older token stops working (signout.py)
+        from .jwt_session import CLAIM, current_version
+        token[CLAIM] = current_version(user.id)
+
         return token
 
     def validate(self, attrs):
@@ -101,7 +105,7 @@ class UserSerializer(serializers.ModelSerializer):
 
 
 # Change this (and the date on the frontend's /privacy page) whenever the privacy notice changes
-PRIVACY_POLICY_VERSION = '2026-11-07.2'   # + live crew location on shift (change with PrivacyPolicy.jsx PRIVACY_UPDATED)
+PRIVACY_POLICY_VERSION = '2026-11-10'   # + My account: download your data, close your account (change with PrivacyPolicy.jsx PRIVACY_UPDATED)
 
 
 class RegisterSerializer(UserSerializer):
@@ -110,6 +114,13 @@ class RegisterSerializer(UserSerializer):
 
     class Meta(UserSerializer.Meta):
         fields = UserSerializer.Meta.fields + ('accept_privacy',)
+
+    def validate_email(self, value):
+        """One account per email: "Forgot password" finds the account by its email."""
+        from .account import email_taken
+        if value and email_taken(value):
+            raise serializers.ValidationError('An account with this email already exists. Sign in, or use "Forgot password".')
+        return value
 
     def validate_accept_privacy(self, value):
         if not value:
@@ -143,9 +154,18 @@ class InventoryItemSerializer(serializers.ModelSerializer):
         fields = ['id', 'name', 'category', 'description', 'stock_quantity',
                   'unit_price', 'image_url', 'model_file', 'thumbnail', 'real_world_size', 'spacing_cm',
                   'is_active', 'reorder_level', 'is_low_stock', 'avg_rating', 'review_count',
-                  'sunlight', 'water_need', 'is_invasive', 'planting_height', 'mature_height',
+                  'sunlight', 'water_need', 'is_invasive', 'is_groundcover', 'planting_height', 'mature_height',
                   'planting_spread', 'established_spread', 'mature_spread']
         read_only_fields = ['is_active']   # archive / restore have their own actions
+
+    def validate_spacing_cm(self, value):
+        """Planting distance, centre to centre. Empty = the AI layout works it out from the height.
+        10–400 cm: the layout engine never spaces plants outside 0.3–4 m, and the work order prints it."""
+        if value in (None, ''):
+            return None
+        if not 10 <= value <= 400:
+            raise serializers.ValidationError('Planting distance must be between 10 and 400 cm.')
+        return value
 
     def get_avg_rating(self, obj):
         avg = getattr(obj, 'avg_rating', None)
@@ -264,23 +284,51 @@ class GardenImageSerializer(serializers.ModelSerializer):
         fields = '__all__'
 
 
+def _design_locked(obj):
+    """True while a booking that isn't cancelled uses the design (design_lock.py)."""
+    annotated = getattr(obj, 'is_locked', None)
+    if annotated is not None:
+        return bool(annotated)
+    if not obj.pk:
+        return False
+    from .design_lock import open_bookings
+    return open_bookings(obj).exists()
+
+
 class GardenDesignSerializer(serializers.ModelSerializer):
+    # Booked designs are locked (design_lock.py): the Studio offers "save as a new design" instead
+    locked = serializers.SerializerMethodField()
+    locked_for = serializers.SerializerMethodField()
+
     class Meta:
         model = GardenDesign
         fields = ['id', 'name', 'original_image_url', 'reference_image_url',
                   'depth_data', 'placed_items', 'plant_breakdown', 'dimensions', 'total_cost',
                   'cost_estimate', 'terrain_height', 'time_of_day', 'status',
-                  'created_at', 'updated_at']
+                  'locked', 'locked_for', 'created_at', 'updated_at']
         read_only_fields = ['id', 'created_at', 'updated_at']
+
+    def get_locked(self, obj):
+        return _design_locked(obj)
+
+    def get_locked_for(self, obj):
+        if not _design_locked(obj):
+            return None
+        from .design_lock import lock_info
+        return lock_info(obj)
 
 
 class GardenDesignListSerializer(serializers.ModelSerializer):
     """Lighter serializer for list views (no placed_items blob)."""
     customer_name = serializers.SerializerMethodField()
+    locked = serializers.SerializerMethodField()
 
     class Meta:
         model = GardenDesign
-        fields = ['id', 'name', 'total_cost', 'status', 'created_at', 'updated_at', 'dimensions', 'original_image_url', 'reference_image_url', 'customer_name']
+        fields = ['id', 'name', 'total_cost', 'status', 'created_at', 'updated_at', 'dimensions', 'original_image_url', 'reference_image_url', 'customer_name', 'locked']
+
+    def get_locked(self, obj):
+        return _design_locked(obj)
 
     def get_customer_name(self, obj):
         if obj.user:
@@ -332,6 +380,8 @@ class ServiceBookingSerializer(serializers.ModelSerializer):
     sign_off_blockers = serializers.SerializerMethodField(read_only=True)
     # What to load on the truck, counted from the design (crew "What to bring" checklist)
     materials = serializers.SerializerMethodField(read_only=True)
+    # Agreeing the final design: state, steps, the approved version (design_review.py)
+    design_review = serializers.SerializerMethodField(read_only=True)
     assigned_crew = serializers.PrimaryKeyRelatedField(
         queryset=User.objects.all(),
         many=True,
@@ -351,7 +401,7 @@ class ServiceBookingSerializer(serializers.ModelSerializer):
             'assigned_crew', 'assigned_crew_names',
             'design', 'design_details', 'clock_out_photo_url',
             'milestones', 'progress_pct', 'staff_notes',
-            'project_milestones', 'tracker', 'sign_off_blockers', 'materials', 'crew_on_way_at', 'crew_arrived_at',
+            'project_milestones', 'tracker', 'sign_off_blockers', 'materials', 'design_review', 'crew_on_way_at', 'crew_arrived_at',
             'created_at', 'updated_at',
         ]
         read_only_fields = [
@@ -360,6 +410,10 @@ class ServiceBookingSerializer(serializers.ModelSerializer):
             'crew_on_way_at', 'crew_arrived_at', 'service_address', 'site_lat', 'site_lng', 'address_detail',
             'design_details', 'clock_out_photo_url', 'tracker',
         ]
+
+    def get_design_review(self, obj):
+        from .design_review import summary
+        return summary(obj)
 
     def get_materials(self, obj):
         from .field_work import materials_for
@@ -392,6 +446,16 @@ class ServiceBookingSerializer(serializers.ModelSerializer):
                 for r in t.payment_requests.all() if r.status == 'PENDING'
             ],
         }
+
+    def validate_design(self, design):
+        """Customers attach only their own designs (any id used to be accepted)."""
+        request = self.context.get('request')
+        if request is not None:
+            from .design_lock import attach_error
+            error = attach_error(request.user, design)
+            if error:
+                raise serializers.ValidationError(error)
+        return design
 
     def validate(self, attrs):
         if 'assigned_crew' in attrs and attrs['assigned_crew']:
@@ -455,6 +519,7 @@ class ServiceBookingSerializer(serializers.ModelSerializer):
         return names
 
     def get_design_details(self, obj):
+        from .setting_out import setting_out
         if obj.design:
             image_url = obj.design.original_image_url
             if not image_url and obj.design.garden_image:
@@ -472,6 +537,9 @@ class ServiceBookingSerializer(serializers.ModelSerializer):
                 'plant_breakdown': obj.design.plant_breakdown or [],
                 'dimensions': obj.design.dimensions or {},
                 'total_cost': float(obj.design.total_cost),
+                'revision': obj.design.revision,
+                # Each item's label and tape measurements from the house and the side (crew Plan view)
+                'setting_out': setting_out(obj.design),
             }
         return None
 

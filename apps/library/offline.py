@@ -48,7 +48,7 @@ def delay_note(request):
 def _user_id(request):
     """The JWT user, resolved here because this middleware runs before DRF authentication."""
     try:
-        from rest_framework_simplejwt.authentication import JWTAuthentication
+        from .jwt_session import SessionJWTAuthentication as JWTAuthentication   # signed-out sessions count as no user
         result = JWTAuthentication().authenticate(request)
     except Exception:  # noqa: BLE001 — bad or expired token: the view answers 401 itself
         return None
