@@ -173,6 +173,11 @@ def _system_instruction(specs, keep_clear_cells, has_features=False, lawn_cells=
         "COMPATIBILITY: keep low-water and high-water plants in separate beds, keep aggressive spreaders "
         "(AGGRESSIVE ROOTS, e.g. bamboo) at the back with a buffer around them, and keep low full-sun plants "
         "out from under tall plants. Shade-loving plants go beside or under taller plants.\n"
+        "LOOKS: keep the flowers to one colour family, hot (red, orange, yellow) or cool (pink, purple); white "
+        "and foliage plants go with either. Set contrasting shapes and leaf colours side by side (a palm beside a "
+        "mounding shrub, variegated leaves against plain green), repeat the same few plants in groups, and use each "
+        "plant for its listed role (specimen at the focal point, structure in screens and frames, edging along the "
+        "front border).\n"
         "SPACING: keep plants at least their listed spacing apart (centre to centre) and never stack two "
         "plants in one cell. STOCK: never use more of a plant than its stock.\n"
         "Rotation must be between 0 and 360 degrees.\n\n"
@@ -180,7 +185,8 @@ def _system_instruction(specs, keep_clear_cells, has_features=False, lawn_cells=
     if keep_clear_cells:
         cells = ', '.join(f'({gx},{gz})' for gx, gz in sorted(keep_clear_cells))
         instruction += (f"KEEP-CLEAR CELLS — existing paths, pools or structures"
-                        + (", plus the customer's seating spot, its walkway and accent rocks (already placed)"
+                        + (", plus the customer's garden features (seating and its walkway, rocks, pots, lights, "
+                           "water features; already placed)"
                            if has_features else '')
                         + f", DO NOT PLANT HERE: {cells}\n\n")
     if lawn_cells:
@@ -194,13 +200,21 @@ def _system_instruction(specs, keep_clear_cells, has_features=False, lawn_cells=
     return instruction
 
 
+def _looks(spec):
+    """', flowers red, leaves green, palm, role specimen' — only what the office has set (InventoryItem looks)."""
+    parts = [f"flowers {spec.flower}" if spec.flower else '',
+             f"leaves {spec.foliage.replace('_', ' ')}" if spec.foliage else '',
+             spec.form, f"role {spec.role}" if spec.role else '']
+    return ''.join(f', {p}' for p in parts if p)
+
+
 def _user_prompt(specs, catalog_items, plant_budget, lot_w, lot_l, preferred_ids, site_features, installed=True,
                  compat_note=''):
     desc = {str(i.id): i.description for i in catalog_items}
     catalog = '\n'.join(
         f"- ID '{s.id}': {s.name} — ₱{s.price}{' installed' if installed else ''}, height {s.height:g} m now, {s.grown:g} m fully grown ({s.layer}), "
         f"sun: {s.sunlight}, water: {s.water_need}{', AGGRESSIVE ROOTS' if s.is_invasive else ''}, "
-        f"spacing {s.spacing:g} m, stock {s.stock}" + (f" ({desc[s.id]})" if desc.get(s.id) else '')
+        f"spacing {s.spacing:g} m, stock {s.stock}" + _looks(s) + (f" ({desc[s.id]})" if desc.get(s.id) else '')
         for s in specs
     )
     floor = int(plant_budget * engine.BUDGET_FLOOR)
@@ -299,7 +313,7 @@ def _cache_key(*parts):
 
 
 FEATURE_CATEGORIES = ('furniture', 'hardscape')
-MAX_SEATS, MAX_FEATURE_KINDS = 2, 4
+MAX_SEATS, MAX_FEATURE_KINDS = 2, 6
 MAX_FEATURE_QTY = 300   # sanity bound when reading the request; the real limits come from the yard (rock_limits)
 
 
@@ -309,6 +323,18 @@ def rock_limits(area_sqm):
     crowds the beds and the design can't place them well."""
     a = max(0.0, float(area_sqm or 0))
     return max(3, min(30, round(a / 12))), max(24, min(300, round(a)))
+
+
+def feature_limits(area_sqm):
+    """Most pots, garden lights and water features (each kind) for a yard of this area (m²), mirrored in the AI form
+    (data/pricing.js featureLimits): a pot per ~10 m² (2–12: a pair at the way in, more round the lawn), a light per
+    ~6 m² (4–30: the walkways and the lawn's edge), one water feature (a second, balancing it, from 150 m²)."""
+    a = max(0.0, float(area_sqm or 0))
+    return {'pot': max(2, min(12, round(a / 10))), 'light': max(4, min(30, round(a / 6))),
+            'water': 2 if a >= 150 else 1}
+
+
+FEATURE_LIMIT_NAMES = {'pot': 'pots', 'light': 'garden lights', 'water': 'water features'}
 
 
 def _parse_features(value):
@@ -461,8 +487,9 @@ class GenerateLayoutsView(APIView):
       is binding; empty = we choose from the whole catalog), keep_clear_zones (list of zone ids, confirmed by the customer),
       seed (int, optional — "show me other variations"), image (optional legacy: scanned for zones
       only when keep_clear_zones isn't sent),
-      features (optional list of {id, quantity}: seating from furniture, accent rocks from hardscape;
-      placed first, paid for first, at most MAX_SEATS seats and, of each kind of rock, rock_limits(yard area)).
+      features (optional list of {id, quantity}: furniture and hardscape by engine.feature_kind — seating, accent
+      rocks, pots, garden lights, water features; placed first, paid for first, at most MAX_SEATS seats and, of each
+      kind, rock_limits / feature_limits(yard area)).
     Always returns 3 designs unless the request is invalid or the anti-abuse limit is hit.
     """
     permission_classes = [IsAuthenticated]
@@ -538,13 +565,21 @@ class GenerateLayoutsView(APIView):
         if missing:
             return Response({'error': 'Some garden features are no longer available. Please pick them again.'},
                             status=status.HTTP_400_BAD_REQUEST)
-        if sum(q for k, q in feature_qty.items() if feature_items[k].category == 'furniture') > MAX_SEATS:
+        kinds = {k: engine.feature_kind(i) for k, i in feature_items.items()}
+        if sum(q for k, q in feature_qty.items() if kinds[k] == 'seat') > MAX_SEATS:
             return Response({'error': f'Choose at most {MAX_SEATS} seats for one seating spot.'},
                             status=status.HTTP_400_BAD_REQUEST)
         max_boulders, max_stones = rock_limits(area)
+        limits = feature_limits(area)
         for k, q in feature_qty.items():
             item = feature_items[k]
-            if item.category != 'hardscape':
+            if kinds[k] in limits:
+                if q > limits[kinds[k]]:
+                    return Response({'error': f'For a {area:g} m² yard, choose at most {limits[kinds[k]]} '
+                                              f'{FEATURE_LIMIT_NAMES[kinds[k]]} of each kind ({item.name}).'},
+                                    status=status.HTTP_400_BAD_REQUEST)
+                continue
+            if kinds[k] != 'rock':
                 continue
             limit, what = (max_stones, 'small stones') if is_small_stone(item) else (max_boulders, 'boulders')
             if q > limit:
@@ -604,7 +639,7 @@ class GenerateLayoutsView(APIView):
         # Out-of-stock features drop out here (and are reported by the engine as left out)
         features = [(f, feature_qty[f.id]) for f in fspecs]
         features += [(engine.PlantSpec(k, i.name, int(i.unit_price) or 1, 0, 1.0, 1.0,
-                                       kind='seat' if i.category == 'furniture' else 'rock'), feature_qty[k])
+                                       kind=engine.feature_kind(i)), feature_qty[k])
                      for k, i in feature_items.items() if k not in {f.id for f in fspecs}]
 
         # Three styles for the customer's budget (2026-11-12, was low / middle / top of the range): every design aims
@@ -669,6 +704,11 @@ class GenerateLayoutsView(APIView):
 
         # 2. Keep-clear zones: the customer's confirmed choice wins; an image is scanned only as a fallback
         image = request.FILES.get('image')
+        if image is not None:
+            from .file_checks import image_problem
+            problem = image_problem(image)   # never send a non-photo to Gemini
+            if problem:
+                return Response({'error': f'Yard photo: {problem}'}, status=status.HTTP_400_BAD_REQUEST)
         zone_scan, detected = ('customer', [{'zone': z, 'label': z} for z in confirmed_zones if z in engine.ZONES])
         if not confirmed_zones:
             zone_scan, detected = 'none', []
@@ -836,8 +876,10 @@ def scan_zones(request):
     image = request.FILES.get('image')
     if image is None:
         return Response({'error': 'An image is required (field name: image).'}, status=status.HTTP_400_BAD_REQUEST)
-    if image.size > 15 * 1024 * 1024:
-        return Response({'error': 'Image is larger than 15 MB.'}, status=status.HTTP_400_BAD_REQUEST)
+    from .file_checks import image_problem
+    problem = image_problem(image)   # never send a non-photo to Gemini (it would bill a PDF happily)
+    if problem:
+        return Response({'error': problem}, status=status.HTTP_400_BAD_REQUEST)
     if ai_mode() == 'engine_only' or not gemini_api_key() or breaker_open():
         return Response({'status': 'unavailable', 'zones': []})
     found, error = scan_image_zones(image)

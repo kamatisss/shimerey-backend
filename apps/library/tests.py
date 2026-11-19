@@ -192,7 +192,7 @@ class GenerateLayoutsViewTests(APITestCase):
     @patch.dict(os.environ, {'GEMINI_API_KEY': 'test_api_key'})
     def test_scan_zones_reports_failure_instead_of_hiding_it(self, mock_scan):
         url = '/api/scan-zones/'
-        photo = SimpleUploadedFile('yard.jpg', b'fake', content_type='image/jpeg')
+        photo = SimpleUploadedFile('yard.jpg', _jpeg_bytes(), content_type='image/jpeg')   # a real photo: non-photos are refused before Gemini
         mock_scan.return_value = ([{'zone': 'foreground_left', 'label': 'path', 'blocks_planting': True,
                                     'is_existing': True}], None)
         r = self.client.post(url, {'image': photo}, format='multipart')
@@ -1467,6 +1467,59 @@ class IncomeAnalyticsTests(APITestCase):
         self.assertEqual(data['ecommerce_by_category'], [{'label': 'Plants', 'value': 600.0}])
         self.assertEqual(data['landscape_by_service'][0], {'label': 'Maintenance', 'value': 12000.0, 'count': 1})
 
+    def test_completion_rate_leaves_out_work_not_due_yet(self):
+        # 2 finished today + 1 pending next week: the pending one isn't due, so 2 of 2 are done
+        data = self._get(range='30d').data
+        self.assertEqual(data['landscape']['completion_rate'], 100.0)
+        self.assertEqual(data['landscape']['open_due_count'], 0)
+        self.assertEqual(data['landscape']['pipeline_count'], 1)            # still in the pipeline
+        # e-commerce: 1 delivered, 1 pending, 1 cancelled, all placed today → 1 of 3
+        self.assertEqual(data['ecommerce']['completion_rate'], 33.3)
+        self.assertEqual(data['ecommerce']['open_due_count'], 1)
+
+    def test_pipeline_is_everything_open_now_whatever_the_range(self):
+        from django.utils import timezone
+        from apps.library.models import ServiceBooking
+        ServiceBooking.objects.create(user=self.customer, service_type='maintenance',
+                                      scheduled_date=timezone.localdate() - timedelta(days=60), status='Installing')
+        short, long = self._get(range='30d').data, self._get(range='12m').data
+        self.assertEqual(short['landscape']['pipeline_count'], 2)   # the 60-day-old job is still open now
+        self.assertEqual(short['landscape']['pipeline'], long['landscape']['pipeline'])
+
+    def test_orders_count_on_their_manila_day(self):
+        import datetime
+        from django.utils import timezone
+        from apps.library.models import Order
+        # 7:30 AM Manila on the 1st of last month = 23:30 UTC on the last day of the month before
+        first = (timezone.localdate().replace(day=1) - timedelta(days=1)).replace(day=1)
+        manila = timezone.get_current_timezone()
+        placed = timezone.make_aware(datetime.datetime.combine(first, datetime.time(7, 30)), manila)
+        o = Order.objects.create(user=self.customer, customer_name='C', customer_email='c@example.com',
+                                 customer_address='Addr', total_price=999, status='Delivered')
+        Order.objects.filter(pk=o.pk).update(created_at=placed)
+        trend = {t['period']: t for t in self._get(range='12m').data['trend']}
+        self.assertEqual(trend[first.isoformat()]['ecommerce'], 999.0)
+
+    def test_trend_marks_partial_periods(self):
+        from django.utils import timezone
+        today = timezone.localdate()
+        data = self._get(range='12m').data
+        first, last = data['trend'][0], data['trend'][-1]
+        self.assertEqual(first['from'], data['start'])
+        self.assertEqual(last['to'], today.isoformat())
+        self.assertEqual(first['partial'], data['start'][8:] != '01')       # starts mid-month → partial
+        self.assertEqual(last['partial'], (today + timedelta(days=1)).day != 1)  # month not over → partial
+        self.assertTrue(all(not t['partial'] for t in data['trend'][1:-1]))  # whole months in between
+        week = self._get(range='30d').data['trend']
+        self.assertTrue(all(t['partial'] == (t['from'] != t['period'] or
+                                             t['to'] != (datetime_date(t['period']) + timedelta(days=6)).isoformat())
+                            for t in week))
+
+
+def datetime_date(iso):
+    import datetime
+    return datetime.date.fromisoformat(iso)
+
 
 class StudioFunnelTests(APITestCase):
     """Anonymous guest Studio funnel events + the office summary."""
@@ -1503,6 +1556,26 @@ class StudioFunnelTests(APITestCase):
         self.assertEqual(steps['studio_opened']['count'], 4)
         self.assertEqual(steps['ai_teaser_clicked']['rate'], 25.0)
         self.assertEqual(data['conversion_rate'], 25.0)
+
+    def test_summary_follows_the_visits_opened_in_the_period(self):
+        from datetime import timedelta
+        from django.utils import timezone
+        from apps.library.models import FunnelEvent, StaffProfile
+        self._event('studio_opened', session='session-new1')
+        self._event('account_created', session='session-new1')
+        self._event('signed_in', session='session-new1')          # same visit: one conversion, not two
+        self._event('studio_opened', session='session-old1')
+        FunnelEvent.objects.filter(session_id='session-old1').update(created_at=timezone.now() - timedelta(days=40))
+        self._event('account_created', session='session-old1')   # opened before the period: not in it
+        admin = User.objects.create_user(username='office2', password='pw', is_staff=True)
+        StaffProfile.objects.create(user=admin, role='OFFICE_ADMIN')
+        self.client.credentials(HTTP_AUTHORIZATION=f'Bearer {RefreshToken.for_user(admin).access_token}')
+        data = self.client.get('/api/funnel-events/summary/', {'days': 30}).data
+        steps = {s['name']: s for s in data['steps']}
+        self.assertEqual(steps['studio_opened']['count'], 1)
+        self.assertEqual(steps['account_created']['count'], 1)   # not 2: the old visit isn't in the cohort
+        self.assertEqual(data['converted'], 1)
+        self.assertEqual(data['conversion_rate'], 100.0)          # was 300% when events were counted alone
 
 
 class CustomerReviewTests(APITestCase):
@@ -3596,6 +3669,9 @@ class BackupTests(TransactionTestCase):
         StaffProfile.objects.create(user=self.crew, role='FIELD_CREW')
 
     def test_backup_is_a_working_copy_and_old_ones_are_pruned(self):
+        from django.db import connection
+        if connection.vendor != 'sqlite':
+            self.skipTest('backup_db copies the SQLite file; on Postgres the database host keeps backups')
         import gzip
         import sqlite3
         import tempfile
@@ -4095,6 +4171,25 @@ class InstallScopeAndCapacityTests(APITestCase):
         self.assertFalse(InventoryItem.objects.filter(name='River stones (small)').exists())   # its boulder isn't in this catalog
         call_command('load_sample_prices', stdout=StringIO())
         self.assertEqual(InventoryItem.objects.filter(name='Volcanic stones (small)').count(), 1)   # not twice
+
+    def test_sample_products_for_shipped_models(self):
+        """Catalog models without a product (hibiscus, livistona, coral stone) get one, once, sized for the layout."""
+        from io import StringIO
+        from django.core.management import call_command
+        from apps.library import layout_engine as E
+        from apps.library.models import InventoryItem
+        # The owner already made a product with the livistona model under their own name: left alone
+        InventoryItem.objects.create(name='Anahaw', category='plant', unit_price=1200, stock_quantity=3,
+                                     real_world_size=2.0, model_file='livistona.glb')
+        call_command('load_sample_prices', stdout=StringIO())
+        call_command('load_sample_prices', stdout=StringIO())
+        hibiscus = InventoryItem.objects.get(name='Hibiscus')
+        self.assertEqual((hibiscus.model_file, hibiscus.category, hibiscus.unit_price), ('hibiscus.glb', 'plant', 150))
+        self.assertFalse(InventoryItem.objects.filter(name='Livistona palm').exists())
+        self.assertEqual(InventoryItem.objects.filter(model_file='coral_stone.glb', category='hardscape').count(), 1)
+        # A pruned shrub: the middle of the bed, not the tall back row
+        spec = next(s for s in E.specs_from_inventory([hibiscus]) if s.id == str(hibiscus.id))
+        self.assertEqual(spec.layer, 'mid')
 
 
 class SavedCartTests(APITestCase):
@@ -5321,3 +5416,1025 @@ class YardShapeTests(APITestCase):
         tall = M.hours_grid(10.0, 12.0, 0.0, 6.5, (), 20, shape, walls)
         none = M.hours_grid(10.0, 12.0, 0.0, 0.0, (), 20, shape, walls)
         self.assertLess(tall[10][16], none[10][16] - 1)    # x 8.25, z 6.3: just behind the house
+
+
+from apps.library.models import InventoryItem, UploadedModel  # noqa: E402
+
+
+def _glb(gltf=None, total_pad=0):
+    """A minimal binary glTF: header + JSON chunk (+ optional padding bytes in a BIN chunk)."""
+    import json as _json
+    import struct as _struct
+    body = _json.dumps(gltf if gltf is not None else
+                       {'asset': {'version': '2.0'}, 'meshes': [{'primitives': []}]}).encode()
+    body += b' ' * (-len(body) % 4)
+    chunks = _struct.pack('<II', len(body), 0x4E4F534A) + body
+    if total_pad:
+        chunks += _struct.pack('<II', total_pad, 0x004E4942) + b'\0' * total_pad
+    return b'glTF' + _struct.pack('<II', 2, 12 + len(chunks)) + chunks
+
+
+# Server-disk mode, whatever R2 keys the developer's .env holds
+@override_settings(MEDIA_ROOT=TEMP_MEDIA, R2_ENABLED=False, MAX_MODEL_UPLOAD_BYTES=5 * 1024 * 1024,
+                   MAX_TOTAL_MODEL_BYTES=150 * 1024 * 1024)
+class ModelUploadTests(APITestCase):
+    def setUp(self):
+        self.admin = User.objects.create_superuser(username='modeladmin', password='password123')
+        self.customer = User.objects.create_user(username='modelcustomer', password='password123')
+
+    def upload(self, data, name='Fern.glb', label='Boston Fern', category='plant'):
+        from django.core.files.uploadedfile import SimpleUploadedFile
+        return self.client.post('/api/inventory-models/', {
+            'file': SimpleUploadedFile(name, data, content_type='model/gltf-binary'),
+            'label': label, 'category': category}, format='multipart')
+
+    def test_office_uploads_and_file_is_served_with_cors(self):
+        self.client.force_authenticate(self.admin)
+        res = self.upload(_glb(total_pad=64))
+        self.assertEqual(res.status_code, 201, res.data)
+        name = res.data['file_name']
+        self.assertRegex(name, r'^boston-fern-[0-9a-f]{6}\.glb$')
+        self.client.force_authenticate(None)
+        got = self.client.get(f'/api/model-files/{name}', HTTP_ORIGIN='https://example.vercel.app')
+        self.assertEqual(got.status_code, 200)
+        self.assertEqual(b''.join(got.streaming_content)[:4], b'glTF')
+        self.assertEqual(got['Content-Type'], 'model/gltf-binary')
+        self.assertIn('access-control-allow-origin', {k.lower() for k in got.headers})
+
+    def test_item_can_use_uploaded_model_and_blocks_its_delete(self):
+        self.client.force_authenticate(self.admin)
+        res = self.upload(_glb())
+        name, pk = res.data['file_name'], res.data['id']
+        InventoryItem.objects.create(name='Fern', category='plant', unit_price=100, model_file=name)
+        self.assertEqual(self.client.delete(f'/api/inventory-models/{pk}/').status_code, 409)
+        InventoryItem.objects.filter(model_file=name).update(model_file='')
+        self.assertEqual(self.client.delete(f'/api/inventory-models/{pk}/').status_code, 204)
+        self.assertEqual(self.client.get(f'/api/model-files/{name}').status_code, 404)
+
+    def test_rejects_non_glb_and_unsupported_models(self):
+        self.client.force_authenticate(self.admin)
+        self.assertIn('not a .glb', self.upload(b'PK\x03\x04' + b'\0' * 40).data['file'])
+        self.assertIn('separate files', self.upload(_glb({'asset': {'version': '2.0'}, 'meshes': [{}],
+                                                          'images': [{'uri': 'leaf.png'}]})).data['file'])
+        self.assertIn('Draco', self.upload(_glb({'asset': {'version': '2.0'}, 'meshes': [{}],
+                                                 'extensionsRequired': ['KHR_draco_mesh_compression']})).data['file'])
+        self.assertIn('no 3D shapes', self.upload(_glb({'asset': {'version': '2.0'}})).data['file'])
+        self.assertEqual(self.upload(b'glTF' + b'\0' * 40, name='a.txt').status_code, 400)
+        self.assertEqual(UploadedModel.objects.count(), 0)
+
+    def test_size_limits(self):
+        self.client.force_authenticate(self.admin)
+        with self.settings(MAX_MODEL_UPLOAD_BYTES=100):
+            self.assertIn('the limit is', self.upload(_glb(total_pad=200)).data['file'])
+        with self.settings(MAX_TOTAL_MODEL_BYTES=100):
+            self.assertIn('Not enough space', self.upload(_glb(total_pad=200)).data['file'])
+
+    def test_customers_cannot_upload_or_list(self):
+        self.client.force_authenticate(self.customer)
+        self.assertEqual(self.upload(_glb()).status_code, 403)
+        self.assertEqual(self.client.get('/api/inventory-models/').status_code, 403)
+        self.client.force_authenticate(None)
+        self.assertEqual(self.client.get('/api/model-files/../../db.sqlite3').status_code, 404)
+
+
+R2_TEST = dict(R2_ENABLED=True, R2_ACCOUNT_ID='acc123', R2_ACCESS_KEY_ID='AKID', R2_SECRET_ACCESS_KEY='secret',
+               R2_BUCKET='models-bucket', R2_PUBLIC_URL='https://pub-test.r2.dev')
+
+
+class R2SignerTests(APITestCase):
+    def test_matches_aws_reference_signature(self):
+        # AWS's published SigV4 query-string example (S3 docs: "Authenticating Requests: Using Query Parameters")
+        from datetime import datetime, timezone
+        from apps.library.r2 import presign_url
+        url = presign_url('GET', 'examplebucket.s3.amazonaws.com', '/test.txt', 'AKIAIOSFODNN7EXAMPLE',
+                          'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY', region='us-east-1', expires=86400,
+                          now=datetime(2013, 5, 24, tzinfo=timezone.utc))
+        self.assertTrue(url.endswith('X-Amz-Signature=aeeed9bbccd4d02ee5c0109b86d86835f995330da4c265957d157751f604d404'))
+
+
+@override_settings(MEDIA_ROOT=TEMP_MEDIA, **R2_TEST)
+class R2ModelUploadTests(APITestCase):
+    def setUp(self):
+        self.admin = User.objects.create_superuser(username='r2admin', password='password123')
+        self.client.force_authenticate(self.admin)
+
+    def start(self, size=1000, label='Areca Palm'):
+        return self.client.post('/api/inventory-models/upload-url/',
+                                {'label': label, 'category': 'plant', 'size': size, 'file_name': 'areca.glb'}, format='json')
+
+    def fake_get(self, body, code=200):
+        res = MagicMock(status_code=code, content=body, text='')
+        return patch('apps.library.model_uploads.requests.get', return_value=res)
+
+    def test_direct_upload_flow(self):
+        self.assertEqual(self.client.get('/api/inventory-models/').data['storage'], 'r2')
+        start = self.start(size=len(_glb()))
+        self.assertEqual(start.status_code, 200, start.data)
+        self.assertTrue(start.data['upload_url'].startswith('https://acc123.r2.cloudflarestorage.com/models-bucket/models/areca-palm-'))
+        self.assertIn('X-Amz-Signature=', start.data['upload_url'])
+        with self.fake_get(_glb()):
+            done = self.client.post('/api/inventory-models/confirm/', {'token': start.data['token']}, format='json')
+        self.assertEqual(done.status_code, 201, done.data)
+        self.assertEqual(done.data['storage'], 'r2')
+        name = done.data['file_name']
+        self.client.force_authenticate(None)
+        got = self.client.get(f'/api/model-files/{name}', HTTP_ORIGIN='https://example.vercel.app')
+        self.assertEqual(got.status_code, 302)
+        self.assertEqual(got['Location'], f'https://pub-test.r2.dev/models/{name}')
+        self.assertIn('access-control-allow-origin', {k.lower() for k in got.headers})
+
+    def test_bad_file_in_r2_is_deleted_and_refused(self):
+        start = self.start(size=40)
+        with self.fake_get(b'PK' + bytes(38)), patch('apps.library.model_uploads.requests.delete') as delete:
+            done = self.client.post('/api/inventory-models/confirm/', {'token': start.data['token']}, format='json')
+        self.assertEqual(done.status_code, 400)
+        self.assertIn('not a .glb', done.data['file'])
+        delete.assert_called_once()
+        self.assertEqual(UploadedModel.objects.count(), 0)
+
+    def test_unreachable_r2_trusts_browser_checks(self):
+        import requests as _requests
+        start = self.start(size=1234)
+        with patch('apps.library.model_uploads.requests.get', side_effect=_requests.ConnectionError('proxy')):
+            done = self.client.post('/api/inventory-models/confirm/', {'token': start.data['token']}, format='json')
+        self.assertEqual(done.status_code, 201)
+        self.assertEqual(done.data['size_bytes'], 1234)
+
+    def test_missing_upload_and_forged_token(self):
+        start = self.start()
+        with self.fake_get(b'', code=404):
+            self.assertIn('didn’t arrive', self.client.post('/api/inventory-models/confirm/',
+                                                            {'token': start.data['token']}, format='json').data['file'])
+        self.assertEqual(self.client.post('/api/inventory-models/confirm/', {'token': 'x:y:z'}, format='json').status_code, 400)
+
+    def test_limits_and_server_upload_blocked(self):
+        with self.settings(MAX_MODEL_UPLOAD_BYTES=500):
+            self.assertIn('the limit is', self.start(size=600).data['file'])
+        from django.core.files.uploadedfile import SimpleUploadedFile
+        res = self.client.post('/api/inventory-models/', {'file': SimpleUploadedFile('a.glb', _glb()), 'label': 'A'}, format='multipart')
+        self.assertEqual(res.status_code, 400)
+
+    def test_delete_removes_from_r2(self):
+        m = UploadedModel.objects.create(label='Old', category='plant', file_name='old-abc123.glb', size_bytes=10, storage='r2')
+        with patch('apps.library.model_uploads.requests.delete', return_value=MagicMock(status_code=204)) as delete:
+            self.assertEqual(self.client.delete(f'/api/inventory-models/{m.id}/').status_code, 204)
+        self.assertIn('/models-bucket/models/old-abc123.glb?', delete.call_args[0][0])
+
+
+def _jpeg_bytes():
+    import io as _io
+    from PIL import Image as _Image
+    buf = _io.BytesIO()
+    _Image.new('RGB', (8, 8), (40, 160, 90)).save(buf, format='JPEG')
+    return buf.getvalue()
+
+
+@override_settings(MEDIA_ROOT=TEMP_MEDIA)
+class FileCheckTests(APITestCase):
+    """Uploads are judged by their bytes, never by file name or the type the browser claims."""
+
+    def setUp(self):
+        from django.utils import timezone
+        from apps.library.models import ServiceBooking, StaffProfile
+        self.crew = User.objects.create_user(username='fc-crew', password='pw', is_staff=True)
+        StaffProfile.objects.create(user=self.crew, role='FIELD_CREW')
+        self.admin = User.objects.create_superuser(username='fc-admin', password='pw')
+        customer = User.objects.create_user(username='fc-cust', password='pw')
+        self.booking = ServiceBooking.objects.create(user=customer, service_type='Softscape',
+                                                     scheduled_date=timezone.localdate(), status='Preparing')
+        self.booking.assigned_crew.add(self.crew)
+
+    def clock_in(self, photo):
+        self.client.force_authenticate(self.crew)
+        return self.client.post('/api/attendance/clock_in/', {'booking_id': self.booking.id, 'photo': photo}, format='json')
+
+    def test_attendance_photo_cannot_smuggle_html(self):
+        import base64 as _b64
+        from apps.library.models import Attendance
+        page = _b64.b64encode(b'<script>alert(1)</script>').decode()
+        res = self.clock_in(f'data:image/html;base64,{page}')
+        self.assertEqual(res.status_code, 400)
+        self.assertIn('isn’t a photo', res.data['error'])
+        self.assertFalse(Attendance.objects.exists())   # a refused photo leaves no half clock-in behind
+
+    def test_attendance_photo_saved_as_clean_jpeg(self):
+        import base64 as _b64
+        from apps.library.models import Attendance
+        res = self.clock_in('data:image/png;base64,' + _b64.b64encode(_jpeg_bytes()).decode())
+        self.assertEqual(res.status_code, 201, res.data)
+        self.assertTrue(Attendance.objects.get().clock_in_photo_url.name.endswith('.jpg'))
+
+    def test_garden_photo_endpoints_refuse_renamed_files(self):
+        self.client.force_authenticate(self.admin)
+        fake = SimpleUploadedFile('yard.jpg', b'%PDF-1.4 not a photo', content_type='image/jpeg')
+        res = self.client.post('/api/generate-depth/', {'image': fake}, format='multipart')
+        self.assertEqual(res.status_code, 400)
+        self.assertIn('PDF', res.json()['error'])
+        heic = SimpleUploadedFile('yard.jpg', b'\x00\x00\x00\x18ftypheic' + b'\x00' * 40, content_type='image/jpeg')
+        res = self.client.post('/api/scan-zones/', {'image': heic}, format='multipart')
+        self.assertEqual(res.status_code, 400)
+        self.assertIn('HEIC', res.data['error'])
+
+    def test_credentials_checked_by_content(self):
+        self.client.force_authenticate(self.admin)
+        url = '/api/business-credentials/'
+        for name, body, ok in (('permit.pdf', b'MZ\x90\x00 exe renamed', False),
+                               ('permit.pdf', _jpeg_bytes(), False),
+                               ('permit.jpg', _jpeg_bytes(), True),
+                               ('permit.pdf', b'%PDF-1.7 real', True)):
+            res = self.client.post(url, {'title': 'Permit', 'kind': 'registration',
+                                         'document': SimpleUploadedFile(name, body)}, format='multipart')
+            self.assertEqual(res.status_code == 201, ok, (name, res.data))
+
+    def test_product_photo_explains_heic(self):
+        self.client.force_authenticate(self.admin)
+        heic = SimpleUploadedFile('fern.jpg', b'\x00\x00\x00\x18ftypheic' + b'\x00' * 40, content_type='image/jpeg')
+        res = self.client.post('/api/inventory/', {'name': 'Fern', 'category': 'plant', 'unit_price': '100',
+                                                   'thumbnail': heic}, format='multipart')
+        self.assertEqual(res.status_code, 400)
+        self.assertIn('HEIC', str(res.data['thumbnail']))
+
+
+class PlantLooksTests(APITestCase):
+    """Looks (flower colour, leaf colour, shape, design role): the AI Designer combines plants for a pleasing design.
+    One flower-colour family per design, contrasting shapes side by side, each plant in its job; soft preferences
+    that never drop the customer's own picks and change nothing for plants with no looks set."""
+
+    def _specs(self):
+        from apps.library import layout_engine as E
+        S = lambda i, n, p, h, m, **kw: E.PlantSpec(i, n, p, 200, h, E.spacing_for(m), mature=m, **kw)
+        return [
+            S('fan', 'Fan palm', 900, 2.0, 6.0, flower='none', form='palm', role='specimen'),
+            S('bamboo', 'Bamboo', 1200, 5.0, 8.0, flower='none', form='upright', role='structure'),
+            S('red', 'Red shrub', 150, 1.2, 1.8, flower='red', form='mounding', role='filler'),
+            S('orange', 'Orange bold', 300, 1.2, 1.5, flower='orange', form='bold', role='accent'),
+            S('pink', 'Pink shrub', 150, 1.2, 1.8, flower='pink', form='mounding', role='filler'),
+            S('edge', 'Red edging', 80, 0.4, 0.5, flower='red', form='mounding', role='edging'),
+            S('lilac', 'Purple edging', 80, 0.4, 0.5, flower='purple', form='grassy', role='edging'),
+        ]
+
+    def test_one_flower_colour_family_per_design(self):
+        from apps.library import layout_engine as E
+        specs, by = self._specs(), None
+        by = {s.id: s for s in specs}
+        for seed in range(6):
+            for style in E.STYLES:
+                d = E.generate(style, specs, E.Site(10, 12), 60000, seed=seed)
+                families = {E.flower_family(by[p['plant_id']]) for p in d['plants']} - {None}
+                self.assertLessEqual(len(families), 1, (style, seed, families))
+                self.assertEqual(E.check(d['plants'], specs, E.Site(10, 12), 60000,
+                                         E.GardenPlan.from_dict(d['garden_plan'])), [], (style, seed))
+
+    def test_customer_picks_are_never_filtered_out(self):
+        from apps.library import layout_engine as E
+        specs = self._specs()
+        for style in E.STYLES:
+            # Picked a hot and a cool flower: both appear, the design doesn't pick a side
+            d = E.generate(style, specs, E.Site(10, 12), 60000, preferred_ids=['red', 'pink'], seed=2)
+            used = {p['plant_id'] for p in d['plants']}
+            self.assertTrue({'red', 'pink'} <= used, (style, used))
+
+    def test_roles(self):
+        from apps.library import layout_engine as E
+        specs = self._specs()
+        lay = E.Layout(E.Site(10, 12), specs)
+        # The specimen is the plant meant as one, not the dearer bamboo screen
+        self.assertEqual(E._specimen(specs, set(), lay).id, 'fan')
+        # Screens are made of structure plants; edging plants run along the border
+        self.assertEqual(E._screen_species(specs, 'tall', set(), lay).id, 'bamboo')
+        import random
+        pick = E._pick(specs, 'low', set(), lay, random.Random(0), role='edging')
+        self.assertIn(pick.id, {'edge', 'lilac'})
+        # No looks set anywhere: chosen exactly as before (the dearest tall plant is the specimen)
+        plain = [E.PlantSpec(s.id, s.name, s.price, s.stock, s.height, s.spacing, mature=s.mature) for s in specs]
+        self.assertEqual(E._specimen(plain, set(), E.Layout(E.Site(10, 12), plain)).id, 'bamboo')
+
+    def test_palette_contrasts_shapes(self):
+        import random
+        from apps.library import layout_engine as E
+        # (no pink: a pink first pick would rightly stand alone, the cool family having no other mid plant)
+        specs = [s for s in self._specs() if s.id != 'pink']
+        for seed in range(10):
+            lay = E.Layout(E.Site(10, 12), specs)
+            mids = E._palette(specs, 'mid', set(), random.Random(seed), lay, role='filler')
+            self.assertEqual(len(mids), 2)
+            self.assertNotEqual(mids[0].form, mids[1].form, seed)   # a mound and a bold plant, not two mounds
+
+    def test_inventory_api_and_sample_command(self):
+        from io import StringIO
+        from django.core.management import call_command
+        from apps.library.models import InventoryItem, StaffProfile
+        office = User.objects.create_user(username='looksoffice', password='pw', is_staff=True)
+        StaffProfile.objects.create(user=office, role='OFFICE_ADMIN')
+        self.client.credentials(HTTP_AUTHORIZATION=f'Bearer {RefreshToken.for_user(office).access_token}')
+        plant = InventoryItem.objects.create(name='Hibiscus', category='plant', unit_price=150, stock_quantity=3)
+        url = f'/api/inventory/{plant.id}/'
+        r = self.client.patch(url, {'flower_color': 'pink', 'plant_form': 'mounding'}, format='multipart')
+        self.assertEqual(r.status_code, 200, r.data)
+        self.assertEqual((r.data['flower_color'], r.data['plant_form'], r.data['design_role']), ('pink', 'mounding', ''))
+        self.assertEqual(self.client.patch(url, {'flower_color': 'blue'}, format='multipart').status_code, 400)
+        # The sample command fills only what's empty: the owner's pink hibiscus stays pink
+        call_command('load_sample_prices', stdout=StringIO())
+        plant.refresh_from_db()
+        self.assertEqual((plant.flower_color, plant.foliage_color, plant.plant_form, plant.design_role),
+                         ('pink', 'dark_green', 'mounding', 'filler'))
+        # Hardscape never keeps looks
+        rock = InventoryItem.objects.create(name='Rock', category='hardscape', unit_price=400, stock_quantity=3)
+        r = self.client.patch(f'/api/inventory/{rock.id}/', {'flower_color': 'red'}, format='multipart')
+        self.assertEqual(r.status_code, 200, r.data)
+        self.assertEqual(r.data['flower_color'], '')
+
+    def test_ai_prompt_lists_looks(self):
+        from apps.library import garden_ai, layout_engine as E
+        spec = self._specs()[3]
+        self.assertEqual(garden_ai._looks(spec), ', flowers orange, bold, role accent')
+        self.assertEqual(garden_ai._looks(E.PlantSpec('x', 'X', 1, 1, 1.0, 1.0)), '')
+
+
+
+class FeatureTypeTests(APITestCase):
+    """Pots, garden lights and water features (InventoryItem.feature_type): placed the way a designer places them —
+    a water feature where the eye lands across the lawn, pots framing the way in and the seating, lights along the
+    walkways and round the lawn — inside every layout rule, with limits by yard size and a power-point note."""
+
+    def _specs(self):
+        from apps.library import layout_engine as E
+        S = lambda i, n, p, h, m: E.PlantSpec(i, n, p, 300, h, E.spacing_for(m), mature=m)
+        plants = [S('palm', 'Palm', 900, 2.0, 6.0), S('shrub', 'Shrub', 150, 1.2, 1.8), S('edge', 'Edging', 80, 0.4, 0.5)]
+        F = lambda i, n, k, size: E.PlantSpec(i, n, 500, 60, size, E.feature_spacing(k, size), kind=k)
+        feats = {k: F(k, n, k, size) for k, n, size in (('seat', 'Bench', 0.9), ('pot', 'Urn', 0.7),
+                                                       ('light', 'Path light', 0.5), ('water', 'Fountain', 1.2),
+                                                       ('rock', 'Rock', 0.6))}
+        return plants, feats
+
+    def test_feature_kind_by_type_else_category(self):
+        from types import SimpleNamespace as N
+        from apps.library import layout_engine as E
+        self.assertEqual(E.feature_kind(N(category='furniture', feature_type='')), 'seat')
+        self.assertEqual(E.feature_kind(N(category='hardscape', feature_type='')), 'rock')
+        self.assertEqual(E.feature_kind(N(category='furniture', feature_type='pot')), 'pot')
+        self.assertEqual(E.feature_kind(N(category='hardscape', feature_type='water')), 'water')
+
+    def test_every_style_places_them_within_the_rules(self):
+        from apps.library import layout_engine as E
+        plants, f = self._specs()
+        feats = [(f['seat'], 1), (f['pot'], 4), (f['light'], 8), (f['water'], 1), (f['rock'], 3)]
+        every = plants + [s for s, _ in feats]
+        for site in (E.Site(10, 12), E.Site(16, 20), E.Site(3.5, 3.5)):
+            for style in E.STYLES:
+                for seed in (0, 1):
+                    d = E.generate(style, plants, site, 80000, seed=seed, features=feats)
+                    plan = E.GardenPlan.from_dict(d['garden_plan'])
+                    self.assertEqual(E.check(d['plants'], every, site, 80000, plan), [], (site.width, style, seed))
+                    if site.width >= 10:
+                        ids = [p['plant_id'] for p in d['plants']]
+                        self.assertEqual((ids.count('water'), ids.count('pot'), ids.count('light')), (1, 4, 8),
+                                         (site.width, style, seed))
+                        self.assertTrue(any('power point' in n for n in d['feature_notes']), d['feature_notes'])
+
+    def test_where_they_go(self):
+        from apps.library import layout_engine as E
+        plants, f = self._specs()
+        site = E.Site(16, 20)
+        d = E.generate('Symmetrical', plants, site, 80000, seed=1, features=[(f['water'], 1), (f['pot'], 2), (f['light'], 6)])
+        plan = E.GardenPlan.from_dict(d['garden_plan'])
+        cx = (plan.lawn[1] + plan.lawn[2]) / 2
+        water = [p for p in d['plants'] if p['plant_id'] == 'water'][0]
+        # The fountain heads the formal axis, in the back bed seen across the lawn
+        self.assertAlmostEqual(water['x'], cx, delta=0.3)
+        self.assertLess(water['z'], plan.lawn[3])
+        # A matching pair of specimens frames it (the axis is taken), mirrored about the axis
+        palms = sorted((p for p in d['plants'] if p['plant_id'] == 'palm'), key=lambda p: p['x'])
+        self.assertGreaterEqual(len(palms), 2)
+        self.assertAlmostEqual(palms[0]['x'] + palms[-1]['x'], 2 * cx, delta=0.05)
+        # The pair of pots frames the way in from the house, either side of the gap in the front border
+        x0, x1, z0, z1 = plan.entry
+        pots = sorted((p for p in d['plants'] if p['plant_id'] == 'pot'), key=lambda p: p['x'])
+        self.assertLess(pots[0]['x'], x0)
+        self.assertGreater(pots[1]['x'], x1)
+        self.assertTrue(all(z0 - 1.3 <= p['z'] <= z1 + 1.3 for p in pots), pots)
+        # Lights: the first ones line the way in, then round the lawn (in the beds, never on it)
+        lights = [p for p in d['plants'] if p['plant_id'] == 'light']
+        self.assertEqual(len(lights), 6)
+        self.assertTrue(any(z0 - 0.5 <= p['z'] <= z1 + 0.5 and abs(p['x'] - (x0 + x1) / 2) < 2.0 for p in lights))
+        self.assertFalse([p for p in lights if plan.depth_inside(p['x'], p['z']) > 0])
+
+    def test_lights_and_rocks_leave_room_for_tall_plants(self):
+        """A plant may spread over a light, a pot or a boulder at its foot: the tall layer survives them."""
+        from apps.library import layout_engine as E
+        plants, f = self._specs()
+        for style in E.STYLES:
+            d = E.generate(style, plants, E.Site(10, 12), 80000, seed=1, features=[(f['light'], 10), (f['rock'], 3)])
+            self.assertIn('palm', [p['plant_id'] for p in d['plants']], style)
+        self.assertLess(E.min_distance(f['light'], plants[0]), 0.6)
+        self.assertEqual(E.min_distance(f['water'], plants[0]), (f['water'].spacing + plants[0].spacing) / 2)
+
+    def test_api_limits_and_seat_count_by_kind(self):
+        from apps.library.models import InventoryItem
+        from apps.library.garden_ai import feature_limits
+        self.assertEqual(feature_limits(120), {'pot': 12, 'light': 20, 'water': 1})
+        self.assertEqual(feature_limits(20), {'pot': 2, 'light': 4, 'water': 1})
+        self.assertEqual(feature_limits(200)['water'], 2)
+        user = User.objects.create_user(username='featuser', password='pw')
+        self.client.credentials(HTTP_AUTHORIZATION=f'Bearer {RefreshToken.for_user(user).access_token}')
+        InventoryItem.objects.create(id=1, name='Palm', category='plant', unit_price=800, stock_quantity=10, real_world_size=4.0)
+        InventoryItem.objects.create(id=2, name='Rose', category='plant', unit_price=200, stock_quantity=60, real_world_size=0.5)
+        InventoryItem.objects.create(id=60, name='Bench', category='furniture', unit_price=3000, stock_quantity=4,
+                                     real_world_size=0.8, model_file='outdoor_bench.glb')
+        InventoryItem.objects.create(id=61, name='Glazed urn', category='furniture', feature_type='pot', unit_price=900,
+                                     stock_quantity=10, real_world_size=0.7, model_file='urn.glb')
+        InventoryItem.objects.create(id=62, name='Path light', category='hardscape', feature_type='light', unit_price=400,
+                                     stock_quantity=40, real_world_size=0.3, model_file='path_light.glb')
+        InventoryItem.objects.create(id=63, name='Fountain', category='hardscape', feature_type='water', unit_price=8000,
+                                     stock_quantity=3, real_world_size=1.2, model_file='fountain.glb')
+        url = reverse('generate-layouts')
+        base = {'budget': 120000, 'lot_width': 10, 'lot_length': 12}
+        # Two seats and four pots (furniture, but pots): not "too many seats"
+        r = self.client.post(url, {**base, 'features': [{'id': 60, 'quantity': 2}, {'id': 61, 'quantity': 4},
+                                                         {'id': 62, 'quantity': 6}, {'id': 63, 'quantity': 1}]}, format='json')
+        self.assertEqual(r.status_code, 200, r.data)
+        for d in r.data['designs']:
+            ids = [p['plant_id'] for p in d['plants']]
+            self.assertEqual((ids.count('60'), ids.count('61'), ids.count('62'), ids.count('63')), (2, 4, 6, 1), d['design_name'])
+            self.assertTrue(any('power point' in n for n in d['adjustments']), d['adjustments'])
+        for features, msg in [([{'id': 63, 'quantity': 2}], 'at most 1 water features'),
+                              ([{'id': 62, 'quantity': 21}], 'at most 20 garden lights'),
+                              ([{'id': 61, 'quantity': 13}], 'at most 12 pots')]:
+            r = self.client.post(url, {**base, 'features': features}, format='json')
+            self.assertEqual(r.status_code, 400, features)
+            self.assertIn(msg, r.data['error'])
+
+    def test_inventory_field_and_pricing(self):
+        from apps.library.models import InventoryItem, StaffProfile
+        from apps.library.pricing import is_small_stone, layer_of
+        office = User.objects.create_user(username='featoffice', password='pw', is_staff=True)
+        StaffProfile.objects.create(user=office, role='OFFICE_ADMIN')
+        self.client.credentials(HTTP_AUTHORIZATION=f'Bearer {RefreshToken.for_user(office).access_token}')
+        light = InventoryItem.objects.create(name='Solar light', category='hardscape', unit_price=400, stock_quantity=5,
+                                             real_world_size=0.3)
+        self.assertTrue(is_small_stone(light))   # no type yet: a small hardscape item is a stone, as before
+        r = self.client.patch(f'/api/inventory/{light.id}/', {'feature_type': 'light'}, format='multipart')
+        self.assertEqual(r.status_code, 200, r.data)
+        light.refresh_from_db()
+        self.assertEqual(light.feature_type, 'light')
+        self.assertFalse(is_small_stone(light))   # a small light is not a stone: placed and priced as a light
+        self.assertEqual(layer_of(light), 'other')
+        self.assertEqual(self.client.patch(f'/api/inventory/{light.id}/', {'feature_type': 'lamp'},
+                                           format='multipart').status_code, 400)
+        plant = InventoryItem.objects.create(name='Fern', category='plant', unit_price=150, stock_quantity=3)
+        r = self.client.patch(f'/api/inventory/{plant.id}/', {'feature_type': 'pot'}, format='multipart')
+        self.assertEqual(r.status_code, 200, r.data)
+        self.assertEqual(r.data['feature_type'], '')   # plants are placed as plants
+
+
+# ─── Move to Render: /media redirect, link rewrite, media copy, row counts ───────────────────────
+
+class RenderMoveTests(APITestCase):
+    """Helpers for moving off PythonAnywhere: uploads in R2, old links kept working, data checked."""
+
+    OLD = 'https://old.pythonanywhere.com/media/'
+
+    def test_media_redirect_points_at_storage_and_refuses_odd_paths(self):
+        from django.http import Http404
+        from django.test import RequestFactory
+        from apps.library import media_redirect as mr
+        request = RequestFactory().get('/media/thumbnails/a.jpg')
+        with patch.object(mr.default_storage, 'url', return_value='https://pub-media.r2.dev/thumbnails/a.jpg') as url:
+            r = mr.media_redirect(request, 'thumbnails/a.jpg')
+        url.assert_called_once_with('thumbnails/a.jpg')
+        self.assertEqual((r.status_code, r['Location']), (302, 'https://pub-media.r2.dev/thumbnails/a.jpg'))
+        for bad in ('../db.sqlite3', 'a/../../b', '/etc/passwd', 'a//b', r'a\b', 'thumbnails/'):
+            with self.assertRaises(Http404, msg=bad):
+                mr.media_redirect(request, bad)
+
+    def test_design_image_upload_returns_the_storages_address(self):
+        user = User.objects.create_user(username='refup', password='pw')
+        self.client.force_authenticate(user)
+        from PIL import Image
+        buf = io.BytesIO()
+        Image.new('RGB', (40, 30), 'green').save(buf, format='JPEG')
+        upload = SimpleUploadedFile('yard.jpg', buf.getvalue(), content_type='image/jpeg')
+        with self.settings(MEDIA_ROOT=tempfile.mkdtemp(prefix='design-ref-')):
+            r = self.client.post('/api/upload-design-image/', {'image': upload}, format='multipart')
+        self.assertEqual(r.status_code, 201, r.data)
+        self.assertRegex(r.data['url'], r'^http://testserver/media/design_refs/ref_\d+_[0-9a-f]{8}\.jpg$')
+
+    @override_settings(R2_MEDIA_PUBLIC_URL='https://pub-media.r2.dev')
+    def test_rewrite_old_media_urls_dry_run_then_apply(self):
+        from django.core.management import call_command
+        from apps.library.models import GardenDesign
+        design = GardenDesign.objects.create(
+            name='D', total_cost=1, reference_image_url=self.OLD + 'design_refs/ref_1.jpg',
+            depth_data={'depth_map_url': '/media/depth_maps/d.png', 'photo': self.OLD + 'gardens/g.jpg'})
+        other = GardenDesign.objects.create(name='Untouched', total_cost=1, reference_image_url='/media/x.jpg')
+        out = io.StringIO()
+        call_command('rewrite_old_media_urls', old=self.OLD, stdout=out)
+        design.refresh_from_db()
+        self.assertTrue(design.reference_image_url.startswith(self.OLD))          # dry run changes nothing
+        self.assertIn('1 row(s) would change', out.getvalue())
+        call_command('rewrite_old_media_urls', old=self.OLD, apply=True, stdout=io.StringIO())
+        design.refresh_from_db()
+        other.refresh_from_db()
+        self.assertEqual(design.reference_image_url, 'https://pub-media.r2.dev/design_refs/ref_1.jpg')
+        self.assertEqual(design.depth_data, {'depth_map_url': '/media/depth_maps/d.png',   # short links: redirected
+                                             'photo': 'https://pub-media.r2.dev/gardens/g.jpg'})
+        self.assertEqual(other.reference_image_url, '/media/x.jpg')
+
+    def test_rewrite_old_media_urls_needs_a_full_media_address(self):
+        from django.core.management import call_command
+        from django.core.management.base import CommandError
+        with self.assertRaises(CommandError):
+            call_command('rewrite_old_media_urls', old='pythonanywhere.com', stdout=io.StringIO())
+
+    def test_copy_media_to_r2_copies_photos_and_moves_server_models(self):
+        from pathlib import Path
+        from django.core.files.storage import FileSystemStorage
+        from django.core.management import call_command
+        from apps.library.management.commands import copy_media_to_r2 as cmd
+        src = Path(tempfile.mkdtemp(prefix='old-media-'))
+        (src / 'thumbnails').mkdir()
+        (src / 'thumbnails' / 'fern.jpg').write_bytes(b'jpg')
+        (src / 'models').mkdir()
+        (src / 'models' / 'fern.glb').write_bytes(b'glTF-fern')
+        admin = User.objects.create_superuser(username='mover', password='pw')
+        server_model = UploadedModel.objects.create(label='Fern', category='plant', file_name='fern.glb',
+                                                    size_bytes=9, storage='server', uploaded_by=admin)
+        bucket = FileSystemStorage(location=tempfile.mkdtemp(prefix='fake-media-bucket-'))
+        ok = MagicMock(status_code=200)
+        with override_settings(MEDIA_ON_R2=True, R2_MEDIA_BUCKET='media-bucket', **R2_TEST), \
+                patch.object(cmd, 'default_storage', bucket), patch.object(cmd.requests, 'put', return_value=ok) as put:
+            call_command('copy_media_to_r2', source=str(src), stdout=io.StringIO())   # dry run
+            self.assertFalse(bucket.exists('thumbnails/fern.jpg'))
+            put.assert_not_called()
+            call_command('copy_media_to_r2', source=str(src), apply=True, stdout=io.StringIO())
+            call_command('copy_media_to_r2', source=str(src), apply=True, stdout=io.StringIO())   # again: no-op
+        self.assertEqual(bucket.open('thumbnails/fern.jpg').read(), b'jpg')
+        self.assertFalse(bucket.exists('models/fern.glb'))          # models go to the models bucket, not here
+        self.assertEqual(put.call_count, 1)
+        self.assertIn('/models-bucket/models/fern.glb?', put.call_args.args[0])
+        self.assertEqual(put.call_args.kwargs['data'], b'glTF-fern')
+        server_model.refresh_from_db()
+        self.assertEqual(server_model.storage, 'r2')
+
+    def test_copy_media_to_r2_refuses_without_r2(self):
+        from django.core.management import call_command
+        from django.core.management.base import CommandError
+        with override_settings(MEDIA_ON_R2=False), self.assertRaises(CommandError):
+            call_command('copy_media_to_r2', source=tempfile.mkdtemp(), stdout=io.StringIO())
+
+
+# ─── When a job was finished (ServiceBooking.finished_at) ─────────────────────────────────────────
+
+class FinishedAtTests(APITestCase):
+    """finished_at: stamped on sign-off (every path), cleared on reopen, never re-dated by later edits;
+    analytics and reports date finished work by it, falling back to the scheduled date."""
+
+    def setUp(self):
+        from django.utils import timezone
+        from apps.library.models import ServiceBooking
+        self.admin = User.objects.create_superuser(username='fa-owner', password='pw')
+        self.customer = User.objects.create_user(username='fa-cust', password='pw')
+        self.today = timezone.localdate()
+        self.booking = ServiceBooking.objects.create(user=self.customer, service_type='landscaping',
+                                                     scheduled_date=self.today - timedelta(days=60), status='Installing')
+        self.client.force_authenticate(self.admin)
+
+    def test_sign_off_stamps_and_reopen_clears(self):
+        r = self.client.patch(f'/api/bookings/{self.booking.id}/update_status/', {'status': 'Finished'}, format='json')
+        self.assertEqual(r.status_code, 200, r.data)
+        self.booking.refresh_from_db()
+        self.assertIsNotNone(self.booking.finished_at)
+        self.assertEqual(self.booking.finish_date(), self.today)          # the sign-off day, not 60 days ago
+        detail = self.client.get(f'/api/bookings/{self.booking.id}/').data
+        self.assertIsNotNone(detail['finished_at'])                        # in the booking API (read-only)
+        self.client.patch(f'/api/bookings/{self.booking.id}/', {'finished_at': '2020-01-01T00:00:00Z'}, format='json')
+        self.booking.refresh_from_db()
+        self.assertEqual(self.booking.finish_date(), self.today)          # clients can't rewrite it
+        self.client.patch(f'/api/bookings/{self.booking.id}/update_status/', {'status': 'Installing'}, format='json')
+        self.booking.refresh_from_db()
+        self.assertIsNone(self.booking.finished_at)                       # reopened: not finished any more
+
+    def test_tracker_completion_stamps_it_too(self):
+        from apps.library.models import ProjectTracker
+        tracker = ProjectTracker.objects.create(booking=self.booking, total_price=5000, remaining_balance=0)
+        self.client.patch(f'/api/projects/{tracker.id}/update-status/', {'status': 'COMPLETED'}, format='json')
+        self.booking.refresh_from_db()
+        self.assertEqual((self.booking.status, self.booking.finish_date()), ('Finished', self.today))
+
+    def test_editing_a_finished_job_keeps_its_date_and_update_fields_saves_it(self):
+        import datetime
+        from django.utils import timezone
+        from apps.library.models import ServiceBooking
+        self.booking.status = 'Finished'
+        self.booking.save(update_fields=['status'])                       # finished_at must be saved too
+        stamped = ServiceBooking.objects.get(pk=self.booking.pk).finished_at
+        self.assertIsNotNone(stamped)
+        earlier = timezone.now() - datetime.timedelta(days=10)
+        ServiceBooking.objects.filter(pk=self.booking.pk).update(finished_at=earlier)
+        b = ServiceBooking.objects.get(pk=self.booking.pk)
+        b.staff_notes = 'touch-up'
+        b.save()
+        self.assertEqual(ServiceBooking.objects.get(pk=b.pk).finished_at, earlier)   # not re-dated
+
+    def test_created_as_finished_gets_no_made_up_date(self):
+        from apps.library.models import ServiceBooking
+        b = ServiceBooking.objects.create(user=self.customer, service_type='maintenance',
+                                          scheduled_date=self.today - timedelta(days=5), status='Finished')
+        self.assertIsNone(b.finished_at)
+        self.assertEqual(b.finish_date(), self.today - timedelta(days=5))  # falls back to the scheduled day
+
+    def test_migration_copies_first_sign_off_from_the_history(self):
+        import datetime
+        from importlib import import_module
+        from django.apps import apps as registry
+        from django.utils import timezone
+        from apps.library.models import ProjectHistoryLog, ProjectTracker, ServiceBooking
+        ServiceBooking.objects.filter(pk=self.booking.pk).update(status='Finished', finished_at=None)
+        tracker = ProjectTracker.objects.create(booking=self.booking, total_price=5000, remaining_balance=0)
+        first = ProjectHistoryLog.objects.create(project=tracker, status_reached='COMPLETED')
+        ProjectHistoryLog.objects.create(project=tracker, status_reached='CUSTOMER_FEEDBACK')
+        when = timezone.now() - datetime.timedelta(days=20)
+        ProjectHistoryLog.objects.filter(pk=first.pk).update(timestamp=when)
+        import_module('apps.library.migrations.0084_booking_finished_at').copy_sign_off_dates(registry, None)
+        self.assertEqual(ServiceBooking.objects.get(pk=self.booking.pk).finished_at, when)   # the first one
+
+    def test_income_counts_on_the_sign_off_day(self):
+        from apps.library.models import ServiceBooking
+        from django.utils import timezone
+        ServiceBooking.objects.filter(pk=self.booking.pk).update(status='Finished', finished_at=timezone.now())
+        ServiceBooking.objects.create(user=self.customer, service_type='maintenance',   # no sign-off date
+                                      scheduled_date=self.today - timedelta(days=3), status='Finished')
+        data = self.client.get(reverse('income-analytics'), {'range': '30d'}).data
+        self.assertEqual(data['landscape']['earned_count'], 2)   # scheduled 60 days ago, finished today: in
+        self.assertEqual(data['landscape']['finish_date_estimated_count'], 1)
+
+    def test_balance_ages_from_the_finish_day(self):
+        from apps.library.models import ProjectTracker, ServiceBooking
+        from django.utils import timezone
+        ServiceBooking.objects.filter(pk=self.booking.pk).update(
+            status='Finished', finished_at=timezone.now() - timedelta(days=5))
+        ProjectTracker.objects.create(booking=self.booking, total_price=5000, remaining_balance=2000)
+        data = self.client.get('/api/reports/balances/').data
+        row = data['owed'][0]
+        self.assertEqual((row['days_since_job'], row['job_date_estimated']), (5, False))   # not 60
+        self.assertEqual(data['aging'][0]['count'], 1)                                     # 0–30 days
+
+    def test_crew_output_counts_finished_jobs_in_the_month_they_were_finished(self):
+        from apps.library.models import ServiceBooking, StaffProfile
+        from django.utils import timezone
+        crew = User.objects.create_user(username='fa-crew', password='pw', is_staff=True)
+        StaffProfile.objects.create(user=crew, role='FIELD_CREW')
+        self.booking.assigned_crew.add(crew)
+        ServiceBooking.objects.filter(pk=self.booking.pk).update(status='Finished', finished_at=timezone.now())
+        start = (self.today - timedelta(days=6)).isoformat()
+        data = self.client.get('/api/reports/crew/', {'from': start, 'to': self.today.isoformat()}).data
+        row = next(r for r in data['crew'] if r['name'] == 'fa-crew')
+        self.assertEqual(row['jobs_finished'], 1)    # scheduled 60 days ago, but finished this week
+
+
+class ProjectsBoardTests(APITestCase):
+    """GET /api/projects/board/: the office's view of every project (project_board.py)."""
+
+    def setUp(self):
+        from apps.library.models import StaffProfile
+        from django.utils import timezone
+        self.today = timezone.localdate()
+        self.admin = User.objects.create_user(username='pb-admin', password='pw', is_staff=True)
+        StaffProfile.objects.create(user=self.admin, role='OFFICE_ADMIN')
+        self.crew = User.objects.create_user(username='pb-crew', password='pw', is_staff=True, first_name='Cris')
+        StaffProfile.objects.create(user=self.crew, role='FIELD_CREW')
+        self.customer = User.objects.create_user(username='pb-cust', password='pw', first_name='Ana')
+        self.client.force_authenticate(self.admin)
+
+    def job(self, status, days, end_in=None, crew=False, owed=1000, service='Softscape'):
+        from apps.library.models import ProjectTracker, ServiceBooking
+        b = ServiceBooking.objects.create(user=self.customer, service_type=service, status=status,
+                                          scheduled_date=self.today + timedelta(days=days))
+        ProjectTracker.objects.create(booking=b, total_price=5000, remaining_balance=owed, status='PLANTING',
+                                      estimated_end_date=None if end_in is None else self.today + timedelta(days=end_in))
+        if crew:
+            b.assigned_crew.add(self.crew)
+        return b
+
+    def board(self, **params):
+        res = self.client.get('/api/projects/board/', params)
+        self.assertEqual(res.status_code, 200, res.content)
+        return res.data
+
+    def row(self, data, booking):
+        return next(r for r in data['results'] if r['id'] == booking.id)
+
+    def test_only_the_office_and_admins_can_open_it(self):
+        for user in (self.crew, self.customer):
+            self.client.force_authenticate(user)
+            self.assertEqual(self.client.get('/api/projects/board/').status_code, 403)
+            self.assertEqual(self.client.get('/api/projects/board/export/').status_code, 403)
+        self.client.force_authenticate(None)
+        self.assertEqual(self.client.get('/api/projects/board/').status_code, 401)
+
+    def test_on_track_job_shows_both_progress_measures(self):
+        from apps.library.models import ProjectMilestone
+        b = self.job('Installing', -1, end_in=5, crew=True)
+        ProjectMilestone.objects.create(booking=b, phase='site_prep', completion_pct=100)
+        r = self.row(self.board(), b)
+        self.assertEqual(r['delays'], [])
+        self.assertEqual((r['office_stage'], r['office_pct'], r['crew_stages_done'], r['crew_stages_total']),
+                         ('PLANTING', 70, 1, 3))
+        self.assertEqual(r['crew'][0]['name'], 'Cris')
+        self.assertEqual((r['total_price'], r['paid'], r['balance']), (5000.0, 4000.0, 1000.0))
+
+    def test_overdue_uses_target_end_date_then_visit_date(self):
+        late = self.job('Preparing', -10, end_in=-4)
+        not_yet = self.job('Preparing', -10, end_in=3)       # visit passed, target not reached
+        no_target = self.job('Pending', -2)
+        data = self.board()
+        self.assertEqual((self.row(data, late)['delays'], self.row(data, late)['days_late']), (['overdue'], 4))
+        self.assertEqual(self.row(data, not_yet)['delays'], [])
+        self.assertEqual(self.row(data, no_target)['delays'], ['overdue'])
+
+    def test_stalled_when_the_crew_goes_quiet(self):
+        from apps.library.models import Attendance
+        from apps.library.project_board import STALL_DAYS
+        from django.utils import timezone
+        quiet = self.job('Installing', -6, end_in=10, crew=True)
+        Attendance.objects.create(staff=self.crew, booking=quiet, clock_in_time=timezone.now() - timedelta(days=4))
+        busy = self.job('Installing', -6, end_in=10, crew=True)
+        Attendance.objects.create(staff=self.crew, booking=busy, clock_in_time=timezone.now() - timedelta(hours=3))
+        never_started = self.job('Preparing', -STALL_DAYS, end_in=10, crew=True)
+        just_due = self.job('Preparing', -(STALL_DAYS - 1), end_in=10, crew=True)
+        no_crew = self.job('Preparing', -10, end_in=10)       # that is "needs crew", not stalled
+        data = self.board()
+        self.assertEqual(self.row(data, quiet)['delays'], ['stalled'])
+        self.assertEqual(self.row(data, busy)['delays'], [])
+        self.assertEqual(self.row(data, never_started)['delays'], ['stalled'])
+        self.assertEqual(self.row(data, just_due)['delays'], [])
+        self.assertEqual(self.row(data, no_crew)['delays'], [])
+        self.assertEqual(data['totals']['needs_crew'], 1)
+
+    def test_waiting_for_sign_off(self):
+        from apps.library.models import ProjectMilestone
+        from apps.library.project_board import REVIEW_DAYS
+        old = self.job('For Review', -8, end_in=10, crew=True)
+        m = ProjectMilestone.objects.create(booking=old, phase='final_inspection', completion_pct=100)
+        ProjectMilestone.objects.filter(pk=m.pk).update(updated_at=m.updated_at - timedelta(days=REVIEW_DAYS + 1))
+        fresh = self.job('For Review', -8, end_in=10, crew=True)
+        ProjectMilestone.objects.create(booking=fresh, phase='final_inspection', completion_pct=100)
+        data = self.board()
+        self.assertEqual(self.row(data, old)['delays'], ['review'])
+        self.assertEqual(self.row(data, fresh)['delays'], [])
+        self.assertEqual(data['results'][0]['id'], old.id)    # delayed first
+
+    def test_finished_and_cancelled_are_never_delayed_and_stay_out_of_open(self):
+        done = self.job('Finished', -30, end_in=-20)
+        gone = self.job('Cancelled', -30, end_in=-20)
+        self.assertEqual(self.board()['count'], 0)
+        self.assertEqual(self.row(self.board(scope='finished'), done)['delays'], [])
+        self.assertEqual(self.row(self.board(scope='cancelled'), gone)['delays'], [])
+        self.assertEqual(self.board(scope='all')['count'], 2)
+
+    def test_filters_and_totals(self):
+        a = self.job('Installing', -1, end_in=5, crew=True, service='hardscaping')
+        b = self.job('Preparing', -9, end_in=-1, owed=0)
+        self.job('Cancelled', -1, owed=9999)                  # cancelled balances are not owed
+        self.job('Finished', -40, owed=500)
+        self.assertEqual([r['id'] for r in self.board(crew=self.crew.id)['results']], [a.id])
+        self.assertEqual([r['id'] for r in self.board(service='hardscaping')['results']], [a.id])
+        self.assertEqual([r['id'] for r in self.board(delayed='1')['results']], [b.id])
+        self.assertEqual([r['id'] for r in self.board(owing='1')['results']], [a.id])
+        self.assertEqual(self.board(q=str(b.id))['results'][0]['id'], b.id)
+        t = self.board(scope='finished')['totals']           # totals ignore the filters
+        self.assertEqual((t['open'], t['delayed'], t['overdue'], t['in_field'], t['balance_owed']),
+                         (2, 1, 1, 1, 1500.0))
+
+    def test_paging_and_query_count_do_not_grow_with_rows(self):
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+        for i in range(30):
+            self.job('Preparing', -i, end_in=1, crew=i % 2 == 0)
+        data = self.board(page_size=10, page=3)
+        self.assertEqual((data['count'], data['pages'], data['page'], len(data['results'])), (30, 3, 3, 10))
+        with CaptureQueriesContext(connection) as small:
+            self.board(scope='all', page_size=5)
+        with CaptureQueriesContext(connection) as big:
+            self.board(scope='all', page_size=30)
+        self.assertEqual(len(small), len(big))
+
+    def test_booking_without_tracker_still_shows(self):
+        from apps.library.models import ServiceBooking
+        b = ServiceBooking.objects.create(user=self.customer, service_type='maintenance', status='Pending',
+                                          scheduled_date=self.today + timedelta(days=2))
+        r = self.row(self.board(), b)
+        self.assertEqual((r['tracker_id'], r['office_stage'], r['balance'], r['delays']), (None, None, None, []))
+
+    def test_csv_export(self):
+        self.job('Preparing', -9, end_in=-2)
+        self.job('Preparing', 2, end_in=5)
+        res = self.client.get('/api/projects/board/export/', {'delayed': '1'})
+        self.assertEqual(res.status_code, 200)
+        lines = b''.join(res.streaming_content).decode('utf-8-sig').strip().splitlines()
+        self.assertEqual(len(lines), 2)                       # header + the one delayed project
+        self.assertIn('Overdue', lines[1])
+
+
+class OverviewMonitoringTests(APITestCase):
+    """Business overview additions: collected vs earned, owed now, demand, and delayed projects."""
+
+    def setUp(self):
+        from apps.library.models import Order, ProjectPayment, ProjectTracker, ServiceBooking, StaffProfile
+        from django.utils import timezone
+        self.today = timezone.localdate()
+        now = timezone.now()
+        self.owner = User.objects.create_superuser(username='mon-owner', password='pw')
+        self.customer = User.objects.create_user(username='mon-cust', password='pw')
+        self.client.force_authenticate(self.owner)
+        o = dict(user=self.customer, customer_name='C', customer_email='c@example.com')
+        # Shop: one paid online today, one cash on delivery today, one refunded today (paid 40 days ago)
+        Order.objects.create(total_price=1000, payment_method='online', payment_status='Paid', status='Delivered',
+                             paid_at=now, **o)
+        Order.objects.create(total_price=300, payment_method='cod', payment_status='Paid', status='Delivered',
+                             delivered_at=now, **o)
+        Order.objects.create(total_price=200, payment_method='online', payment_status='Refunded', status='Cancelled',
+                             paid_at=now - timedelta(days=40), refunded_at=now, **o)
+        # Landscape: finished 50,000 job, 20,000 paid today → 30,000 owed; an open job owing 9,000
+        done = ServiceBooking.objects.create(user=self.customer, service_type='Softscape', status='Finished',
+                                             scheduled_date=self.today - timedelta(days=3), finished_at=now)
+        t = ProjectTracker.objects.create(booking=done, total_price=50000, remaining_balance=30000)
+        ProjectPayment.objects.create(project=t, amount=20000, method='cash', paid_at=now)
+        open_ = ServiceBooking.objects.create(user=self.customer, service_type='hardscaping', status='Preparing',
+                                              scheduled_date=self.today - timedelta(days=8))
+        ProjectTracker.objects.create(booking=open_, total_price=9000, remaining_balance=9000,
+                                      estimated_end_date=self.today - timedelta(days=2))   # overdue
+        gone = ServiceBooking.objects.create(user=self.customer, service_type='maintenance', status='Cancelled',
+                                             scheduled_date=self.today)
+        ProjectTracker.objects.create(booking=gone, total_price=7000, remaining_balance=7000)   # not owed
+        ServiceBooking.objects.create(user=self.customer, service_type='consultation', status='Pending',
+                                      scheduled_date=self.today + timedelta(days=5))
+        StaffProfile.objects.create(user=User.objects.create_user(username='mon-office', password='pw', is_staff=True),
+                                    role='OFFICE_ADMIN')
+
+    def analytics(self, rng='30d'):
+        res = self.client.get('/api/analytics/income/', {'range': rng})
+        self.assertEqual(res.status_code, 200, res.content)
+        return res.data
+
+    def test_collected_matches_the_money_report_to_the_peso(self):
+        d = self.analytics()
+        start = self.today - timedelta(days=29)
+        money = self.client.get('/api/reports/money/', {'from': start.isoformat(), 'to': self.today.isoformat()}).data
+        self.assertEqual(d['collected']['total'], money['net'])
+        self.assertEqual(d['collected']['landscape']['amount'], 20000.0)
+        self.assertEqual(d['collected']['ecommerce']['amount'], 1100.0)          # 1000 + 300 − 200 refund
+        self.assertEqual(sum(t['landscape_collected'] + t['ecommerce_collected'] for t in d['trend']), 21100.0)
+        self.assertEqual(d['landscape']['earned'], 50000.0)                      # earned ≠ collected
+
+    def test_owed_splits_finished_from_open_and_skips_cancelled(self):
+        self.assertEqual(self.analytics()['owed'],
+                         {'finished': 30000.0, 'finished_count': 1, 'open': 9000.0, 'open_count': 1})
+
+    def test_demand_counts_and_request_outcomes(self):
+        from apps.library.models import ServiceBooking
+        from django.utils import timezone
+        future = ServiceBooking.objects.create(user=self.customer, service_type='maintenance', status='Pending',
+                                               scheduled_date=self.today + timedelta(days=60))
+        ServiceBooking.objects.filter(pk=future.pk).update(created_at=timezone.now() + timedelta(days=20))  # bad data
+        old = ServiceBooking.objects.create(user=self.customer, service_type='maintenance', status='Finished',
+                                            scheduled_date=self.today - timedelta(days=70))
+        ServiceBooking.objects.filter(pk=old.pk).update(created_at=timezone.now() - timedelta(days=45))
+        d = self.analytics()['demand']
+        # 4 requests made in the last 30 days (finished, preparing, cancelled, pending); the future-dated
+        # one and the 45-day-old one are out
+        self.assertEqual((d['requests'], d['confirmed'], d['waiting'], d['cancelled']), (4, 2, 1, 1))
+        self.assertEqual((d['confirmed_pct'], d['cancelled_pct']), (50.0, 25.0))
+        self.assertEqual(d['orders'], 2)                                          # the refunded order is cancelled
+        self.assertEqual(d['requests_change_pct'], 300.0)                        # 1 in the previous 30 days
+        self.assertEqual(sum(t['requests'] for t in self.analytics()['trend']), 4)
+
+    def test_overview_lists_late_projects_with_the_projects_page_link(self):
+        from apps.library.project_board import totals
+        attention = {a['key']: a for a in self.client.get('/api/admin/overview/').data['attention']}
+        late = attention['delayed_projects']
+        self.assertEqual(late['count'], totals(self.today)['delayed'])
+        self.assertEqual(late['count'], 1)            # the overdue job; the pending one isn't due yet
+        self.assertEqual(late['link'], '/manage-projects?delayed=1')
+        self.assertIn('overdue', late['hint'])
+        self.assertEqual(attention['unpaid']['link'], '/manage-projects?scope=finished&owing=1')
+
+    def test_office_sees_the_late_projects_item_too(self):
+        self.client.force_authenticate(User.objects.get(username='mon-office'))
+        keys = [a['key'] for a in self.client.get('/api/admin/overview/').data['attention']]
+        self.assertIn('delayed_projects', keys)
+
+
+class SeedDemoBusinessTests(APITestCase):
+    """manage.py seed_demo_business: consistent, complete demo history that --clear removes entirely."""
+
+    @classmethod
+    def setUpTestData(cls):
+        from io import StringIO
+        from django.core.management import call_command
+        from apps.library.models import InventoryItem, StaffProfile
+        cls.owner = User.objects.create_superuser(username='seed-owner', password='pw', email='owner@example.com')
+        office = User.objects.create_user(username='seed-office', password='pw', is_staff=True)
+        StaffProfile.objects.create(user=office, role='OFFICE_ADMIN')
+        cls.office = office
+        cls.real_customer = User.objects.create_user(username='seed-real', password='pw', email='real@example.com')
+        for name, cat, price in (('Fern', 'plant', 120), ('Bench', 'furniture', 4500), ('Pebbles', 'hardscape', 300)):
+            InventoryItem.objects.create(name=name, category=cat, unit_price=price, stock_quantity=50)
+        call_command('seed_demo_business', '--months', '3', stdout=StringIO())
+
+    def demo(self, model, path):
+        return model.objects.filter(**{f'{path}__email__iendswith': '@demo.gardenstudio.test'})
+
+    def test_nothing_is_dated_in_the_future(self):
+        from django.utils import timezone
+        from apps.library.models import (Attendance, FunnelEvent, Order, ProjectHistoryLog, ProjectMilestone,
+                                         ProjectPayment, ServiceBooking)
+        now = timezone.now()
+        checks = [
+            (ServiceBooking.objects.all(), 'created_at'), (ServiceBooking.objects.all(), 'finished_at'),
+            (Order.objects.all(), 'created_at'), (Order.objects.all(), 'paid_at'),
+            (Order.objects.all(), 'delivered_at'), (Order.objects.all(), 'refunded_at'),
+            (ProjectPayment.objects.all(), 'paid_at'), (ProjectHistoryLog.objects.all(), 'timestamp'),
+            (ProjectMilestone.objects.all(), 'updated_at'), (Attendance.objects.all(), 'clock_in_time'),
+            (Attendance.objects.all(), 'clock_out_time'), (FunnelEvent.objects.all(), 'created_at'),
+        ]
+        for qs, field in checks:
+            self.assertFalse(qs.filter(**{f'{field}__gt': now}).exists(), f'{qs.model.__name__}.{field} in the future')
+
+    def test_dates_and_people_are_consistent(self):
+        from apps.library.models import Order, ServiceBooking
+        bookings = ServiceBooking.objects.all()
+        self.assertTrue(bookings.exists())
+        self.assertFalse(bookings.filter(status='Finished', finished_at__isnull=True).exists())
+        self.assertFalse(bookings.exclude(status='Finished').filter(finished_at__isnull=False).exists())
+        for b in bookings.filter(status='Finished'):
+            self.assertGreaterEqual(b.finished_at, b.created_at)
+        orders = Order.objects.all()
+        self.assertFalse(orders.filter(payment_method='online', payment_status__in=('Paid', 'Refunded'),
+                                       paid_at__isnull=True).exists())
+        self.assertFalse(orders.filter(status='Delivered', delivered_at__isnull=True).exists())
+        self.assertFalse(orders.filter(status='Delivered', delivered_by__isnull=True).exists())
+        self.assertFalse(orders.filter(payment_status='Refunded', refunded_at__isnull=True).exists())
+        # Customers live in the service area, with a pin
+        self.assertFalse(bookings.exclude(service_address__contains='Quezon').exists())
+        self.assertFalse(bookings.filter(site_lat__isnull=True).exists())
+        # Confirmed jobs mostly have a crew; finished work was clocked
+        under_way = bookings.filter(status__in=('Installing', 'For Review', 'Finished'))
+        self.assertFalse(under_way.filter(assigned_crew__isnull=True).exists())
+
+    def test_project_payments_add_up_to_what_was_paid(self):
+        from django.db.models import Sum
+        from apps.library.models import ProjectTracker
+        trackers = ProjectTracker.objects.annotate(paid_rows=Sum('payments__amount'))
+        self.assertTrue(trackers.exists())
+        for t in trackers:
+            self.assertEqual(t.paid_rows or 0, t.total_price - t.remaining_balance, f'tracker {t.id}')
+
+    def test_no_forgotten_shifts_and_stages_follow_status(self):
+        from apps.library import field_work
+        from apps.library.models import ProjectMilestone
+        self.assertEqual(field_work.forgotten_shifts().count(), 0)
+        # Nobody is on two jobs at once, and no shift is longer than a working day
+        from apps.library.models import Attendance
+        shifts = {}
+        for a in Attendance.objects.order_by('staff_id', 'clock_in_time'):
+            end = a.clock_out_time or a.clock_in_time
+            self.assertLessEqual((end - a.clock_in_time).total_seconds(), 11 * 3600)
+            previous = shifts.get(a.staff_id)
+            if previous:
+                self.assertGreaterEqual(a.clock_in_time, previous, f'overlapping shifts for crew {a.staff_id}')
+            shifts[a.staff_id] = end
+        self.assertFalse(ProjectMilestone.objects.filter(booking__status__in=('Pending', 'Cancelled')).exists())
+        for_review = ProjectMilestone.objects.filter(booking__status='For Review', phase__in=field_work.CREW_STAGES)
+        self.assertEqual(for_review.count(), 3 * for_review.values('booking').distinct().count())
+        # The office stage agrees with the booking: awaiting sign-off = final inspection, finished = completed
+        from apps.library.models import ProjectTracker
+        self.assertFalse(ProjectTracker.objects.filter(booking__status='For Review').exclude(status='FINAL_INSPECTION').exists())
+        self.assertFalse(ProjectTracker.objects.filter(booking__status='Finished').exclude(status='COMPLETED').exists())
+
+    def test_collected_shows_up_and_matches_reports(self):
+        from django.utils import timezone
+        self.client.force_authenticate(self.owner)
+        data = self.client.get('/api/analytics/income/', {'range': '30d'}).data
+        self.assertGreater(data['collected']['total'], 0)
+        self.assertGreater(data['collected']['landscape']['amount'], 0)
+        today = timezone.localdate()
+        money = self.client.get('/api/reports/money/', {'from': (today - timedelta(days=29)).isoformat(),
+                                                        'to': today.isoformat()}).data
+        self.assertEqual(data['collected']['total'], money['net'])
+        self.assertEqual(data['landscape']['finish_date_estimated_count'], 0)
+        self.assertGreater(self.client.get('/api/funnel-events/summary/').status_code, 0)
+
+    def test_reset_is_reproducible_and_clear_removes_everything_demo(self):
+        from io import StringIO
+        from django.core.management import call_command
+        from apps.library.models import (CashHandover, FunnelEvent, Order, ProjectPayment, ServiceBooking)
+        before = (ServiceBooking.objects.count(), Order.objects.count(), ProjectPayment.objects.count())
+        call_command('seed_demo_business', '--months', '3', '--reset', stdout=StringIO())
+        self.assertEqual((ServiceBooking.objects.count(), Order.objects.count(), ProjectPayment.objects.count()), before)
+        call_command('seed_demo_business', '--clear', stdout=StringIO())
+        self.assertFalse(User.objects.filter(email__iendswith='@demo.gardenstudio.test').exists())
+        self.assertEqual((ServiceBooking.objects.count(), Order.objects.count(), CashHandover.objects.count(),
+                          FunnelEvent.objects.count()), (0, 0, 0, 0))
+        # Real accounts are untouched
+        self.assertTrue(User.objects.filter(pk__in=[self.owner.pk, self.office.pk, self.real_customer.pk]).count() == 3)

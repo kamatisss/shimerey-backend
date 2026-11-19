@@ -72,6 +72,15 @@ SEAT_FACING = 0.0            # degrees: models face +z, i.e. towards the house /
 ROCK_GROUP = 3               # accent rocks in odd-numbered groups
 STONE_GROUP = 7              # small garden stones (< SMALL_STONE m) in looser clusters of about seven
 SMALL_STONE = 0.35           # m (pricing.SMALL_STONE)
+# Pots, garden lights and water features (InventoryItem.feature_type 'pot' / 'light' / 'water')
+FEATURE_KINDS = ('seat', 'rock', 'pot', 'light', 'water')
+POT_ROOM = 0.3               # m round a pot (watering, walking past)
+LIGHT_SPACING = 0.4          # m: a path or bollard light's own footprint
+LIGHT_EVERY = 2.5            # m between lights along a walkway (staggered, both sides): pools of light that just meet
+LIGHT_DEPTH = 1.2            # m into the beds from the lawn's edge: among the plants, behind the low border
+FOCAL_CLEAR = 1.2            # m either side of the lawn's centre line, in the back bed: no lights (the focal plant)
+WATER_ROOM = 1.0             # m round a water feature: splash, reaching the pump, room to stand and look
+POWERED = ('light', 'water')  # need an outdoor power point (pump, low-voltage transformer)
 
 # Garden plan: beds around the edges, open lawn in the middle
 MIN_OPEN = 2.0               # m: the smallest lawn worth keeping (room to stand, set a table, walk)
@@ -120,8 +129,13 @@ class PlantSpec:
     sunlight: str = 'full_sun'
     water_need: str = 'moderate'
     is_invasive: bool = False
-    kind: str = 'plant'   # 'plant', or a garden feature: 'seat' / 'rock'
+    kind: str = 'plant'   # 'plant', or a garden feature (FEATURE_KINDS): 'seat' / 'rock' / 'pot' / 'light' / 'water'
     mature: float = 0.0   # fully grown height (0 = unknown → the established height)
+    # Looks (InventoryItem.flower_color / foliage_color / plant_form / design_role); '' = not set
+    flower: str = ''
+    foliage: str = ''
+    form: str = ''
+    role: str = ''
 
     @property
     def grown(self):
@@ -160,8 +174,20 @@ def companion_gap(a, b):
     return gap
 
 
+# How close a plant's centre may come to a light, a pot or a rock (m, on top of the feature's own half-spacing): a
+# plant's spacing is its fully grown spread, and a palm may spread over a path light, stand beside a pot or have a
+# boulder at its foot — what keeps them apart is the stem and its root ball, not the canopy (a 3.5 m-spaced palm
+# would otherwise push every light and rock 2 m away, and small yards lost their tall plants to a few rocks).
+# Water features keep their full distance: leaves falling in the water, roots under the basin.
+NEAR_PLANTS = {'light': 0.3, 'pot': 0.6, 'rock': 0.6}
+
+
 def min_distance(a, b):
-    """Closest two plants may be, centre to centre."""
+    """Closest two plants (or features) may be, centre to centre."""
+    for f, o in ((a, b), (b, a)):
+        # (a light may also sit beside a pot, a bench or a fountain: it lights them)
+        if f.kind in NEAR_PLANTS and (o.is_plant or (f.kind == 'light' and o.kind != 'light')):
+            return f.spacing / 2 + min(o.spacing / 2, NEAR_PLANTS[f.kind]) + companion_gap(a, b)
     return (a.spacing + b.spacing) / 2 + companion_gap(a, b)
 
 
@@ -190,8 +216,35 @@ def specs_from_inventory(items, keep_all=False):
             sunlight=getattr(item, 'sunlight', 'full_sun') or 'full_sun',
             water_need=getattr(item, 'water_need', 'moderate') or 'moderate',
             is_invasive=bool(getattr(item, 'is_invasive', False)),
+            flower=getattr(item, 'flower_color', '') or '',
+            foliage=getattr(item, 'foliage_color', '') or '',
+            form=getattr(item, 'plant_form', '') or '',
+            role=getattr(item, 'design_role', '') or '',
         ))
     return [s for s in specs if keep_all or (s.stock > 0 and s.price > 0)]
+
+
+def feature_kind(item):
+    """What a furniture / hardscape item is in a design: its feature_type, else by category (furniture → seat,
+    hardscape → rock)."""
+    kind = getattr(item, 'feature_type', '') or ''
+    if kind in FEATURE_KINDS:
+        return kind
+    return 'seat' if item.category == 'furniture' else 'rock'
+
+
+def feature_spacing(kind, size):
+    """Room a feature needs round its centre (metres, centre to centre with its neighbours)."""
+    if kind == 'seat':
+        return SEAT_PAD
+    if kind == 'pot':
+        return round(max(0.5, min(2.5, size + POT_ROOM)), 2)
+    if kind == 'light':
+        return LIGHT_SPACING
+    if kind == 'water':
+        return round(max(1.5, min(4.0, size + WATER_ROOM)), 2)
+    # Small stones sit closer together (a cluster), boulders need room round them
+    return round(max(0.3, size + 0.1), 2) if size < SMALL_STONE else round(max(0.4, min(2.0, size + 0.2)), 2)
 
 
 def feature_specs_from_inventory(items, keep_all=False):
@@ -199,9 +252,8 @@ def feature_specs_from_inventory(items, keep_all=False):
     specs = []
     for item in items:
         size = float(item.real_world_size or 1.0)
-        kind = 'seat' if item.category == 'furniture' else 'rock'
-        # Small stones sit closer together (a cluster), boulders need room round them
-        spacing = SEAT_PAD if kind == 'seat' else (round(max(0.3, size + 0.1), 2) if size < SMALL_STONE else round(max(0.4, min(2.0, size + 0.2)), 2))
+        kind = feature_kind(item)
+        spacing = feature_spacing(kind, size)
         specs.append(PlantSpec(id=str(item.id), name=item.name, price=int(item.unit_price),
                                stock=max(0, int(item.stock_quantity or 0)), height=size, spacing=spacing,
                                kind=kind))
@@ -357,10 +409,11 @@ class GardenPlan:
         return any(_rect_depth(x, z, *p) > -edge + 1e-9 for p in self.paths)
 
     def blocks(self, spec, x, z):
-        """True when an item would sit on the open lawn (seats belong on it; plants and rocks don't) or on a path."""
+        """True when an item would sit on the open lawn (seats and pots stand on open ground; plants, rocks, lights
+        and water features belong in the beds) or on a path."""
         if self.on_walk(spec, x, z):
             return True
-        if not self.lawn or spec.kind == 'seat':
+        if not self.lawn or spec.kind in ('seat', 'pot'):
             return False
         return self.depth_inside(x, z) > -min(LAWN_EDGE, spec.spacing / 2) + 1e-9
 
@@ -763,6 +816,64 @@ def _shade_spot(layout, spec, x, z, rng):
     return host['x'] + r * math.cos(a), host['z'] + r * math.sin(a)
 
 
+# ── Looks (2026-11-19) ──────────────────────────────────────────────────────────────────────────────────────
+# What a planting designer does beyond "it fits": keeps the flowers to one colour family (hot or cool; white and
+# foliage plants go with either), sets contrasting shapes and leaf colours side by side (a palm beside a mound, not
+# two mounds), and gives each plant the job it is good at (a specimen at the focal point, a structure plant in the
+# screen and the formal frame, an edging plant along the border). All soft preferences: a plant with no looks set,
+# or a catalog with no better choice, is chosen exactly as before; the customer's own picks are never filtered out.
+
+HOT_FLOWERS = frozenset({'red', 'orange', 'yellow'})
+COOL_FLOWERS = frozenset({'pink', 'purple'})
+_ROLE_RANK = {'specimen': 2, '': 1}   # _specimen: a specimen first, an unset plant next, any other job last
+
+
+def flower_family(spec):
+    """'hot', 'cool', or None (white, no showy flowers, not set: goes with either)."""
+    return 'hot' if spec.flower in HOT_FLOWERS else 'cool' if spec.flower in COOL_FLOWERS else None
+
+
+def colour_scheme(layout, chosen=()):
+    """The design's flower-colour family: the one its plants so far belong to, placed or `chosen` for its palette (the
+    first coloured plant sets it; the customer's picks and the focal plant go in first). None while open, or when
+    the customer's own picks already mix both families."""
+    families = {flower_family(layout.specs[i]) for i, n in layout.count.items() if n > 0}
+    families = (families | {flower_family(s) for s in chosen if s}) - {None}
+    return families.pop() if len(families) == 1 else None
+
+
+def _in_scheme(pool, layout, preferred=(), chosen=()):
+    """Plants whose flowers suit the design's colour scheme (the customer's picks always do), else the whole pool.
+    `chosen`: plants already picked for the design's palette but not planted yet (they count towards the scheme)."""
+    scheme = colour_scheme(layout, chosen)
+    if scheme is None:
+        return pool
+    keep = [s for s in pool if s.id in preferred or flower_family(s) in (None, scheme)]
+    return keep or pool
+
+
+def _for_role(pool, role):
+    """The plants meant for this job, when there are any; else the whole pool."""
+    if not role:
+        return pool
+    return [s for s in pool if s.role == role] or pool
+
+
+def _clash(spec, others):
+    """How alike a plant is to the others: same shape, same leaf colour (an unset value never counts)."""
+    return sum((spec.form != '' and spec.form == o.form) + (spec.foliage != '' and spec.foliage == o.foliage)
+               for o in others if o is not spec)
+
+
+def _contrasting(pool, others):
+    """The plants that contrast most with `others` (shape and leaf colour), else the whole pool."""
+    others = [o for o in others if o]
+    if not others or not pool:
+        return pool
+    best = min(_clash(s, others) for s in pool)
+    return [s for s in pool if _clash(s, others) == best]
+
+
 def _varied(pool, specs, layout):
     """Variety: once a design has VARIETY_FROM plants, no tree or shrub species past MAX_SHARE of them, and
     no low border plant past MAX_SHARE_LOW (edging is massed on purpose) — repeated groups, not one plant
@@ -777,18 +888,24 @@ def _varied(pool, specs, layout):
     return varied or pool
 
 
-def _choose(specs, layer, preferred, rng, layout, prefer_price=None):
-    """Pick a species for a layer: preferred plants first, then the rest; respects stock and variety."""
-    pool = _varied([s for s in specs if s.is_plant and s.layer == layer and layout.has_stock(s)], specs, layout)
+def _choose(specs, layer, preferred, rng, layout, prefer_price=None, role=None, contrast=()):
+    """Pick a species for a layer: preferred plants first, then the rest; respects stock and variety, and the
+    looks: flowers in the design's colour scheme, a plant for `role` when there is one, and the most contrast with
+    the plants in `contrast`: the ones already chosen for the design's palette (see Looks)."""
+    pool = [s for s in specs if s.is_plant and s.layer == layer and layout.has_stock(s)]
     if not pool:
         # Small catalogs: borrow from the neighbouring layer rather than leave a gap
         neighbours = {'tall': ['mid'], 'mid': ['tall', 'low'], 'low': ['mid']}[layer]
-        pool = _varied([s for s in specs if s.is_plant and s.layer in neighbours and layout.has_stock(s)], specs, layout)
+        pool = [s for s in specs if s.is_plant and s.layer in neighbours and layout.has_stock(s)]
     if not pool:
         return None
+    # Colour scheme before variety: when the variety cap rules out the plants in the scheme, it keeps them anyway
+    # (it never empties a pool) rather than handing the pick to a clashing colour
+    pool = _varied(_in_scheme(pool, layout, preferred, contrast), specs, layout)
     fav = [s for s in pool if s.id in preferred]
     if fav and rng.random() < 0.8:
         pool = fav
+    pool = _contrasting(_for_role(pool, role), contrast)
     if prefer_price == 'high':
         pool = sorted(pool, key=lambda s: -s.price)[:max(1, len(pool) // 2 + 1)]
     return rng.choice(pool)
@@ -1002,9 +1119,10 @@ def _drift(layout, spec, cx, cz, n, plant_budget, rng):
 
 def _specimen(specs, preferred, layout):
     """The finest tall plant in stock (the customer's own picks first): the dearest, then the tallest grown."""
-    tall = [s for s in specs if s.is_plant and s.layer == 'tall' and layout.has_stock(s)]
+    tall = _in_scheme([s for s in specs if s.is_plant and s.layer == 'tall' and layout.has_stock(s)], layout, preferred)
     fav = [s for s in tall if s.id in preferred] or tall
-    return max(fav, key=lambda s: (s.price, s.grown, s.id), default=None)
+    # One meant as a specimen first (a fan palm, a plumeria; not a bamboo screen), then the dearest, the tallest
+    return max(fav, key=lambda s: (_ROLE_RANK.get(s.role, 0), s.price, s.grown, s.id), default=None)
 
 
 def _focal(layout, specs, plant_budget, preferred, rng, x, z):
@@ -1019,11 +1137,13 @@ def _focal(layout, specs, plant_budget, preferred, rng, x, z):
     return spec
 
 
-def _palette(specs, layer, preferred, rng, layout, k=2):
-    """Up to k species for a layer, chosen once and repeated through the design (rhythm, not a collection)."""
+def _palette(specs, layer, preferred, rng, layout, k=2, role=None, contrast=()):
+    """Up to k species for a layer, chosen once and repeated through the design (rhythm, not a collection): the
+    first for `role` when one fits, each next one contrasting with those before it and with `contrast`."""
     out = []
     for _ in range(k * 3):
-        spec = _choose(specs, layer, preferred, rng, layout)
+        spec = _choose(specs, layer, preferred, rng, layout, role=None if out else role,
+                       contrast=out + list(contrast))
         if spec is not None and spec not in out:
             out.append(spec)
         if len(out) >= k:
@@ -1039,18 +1159,26 @@ def _lush(layout, specs, plant_budget, preferred, rng):
     site, plan = layout.site, layout.plan
     # The focal specimen first, on the lawn's centre line (a big specimen needs its room before anything else; on a
     # narrow lot that can cost the screen one slot, the right trade), then a tall back screen in groups of one or three
+    focal = None
     if plan.lawn:
         cx = plan.lawn[1] if plan.lawn[0] == 'ellipse' else (plan.lawn[1] + plan.lawn[2]) / 2
-        _focal(layout, specs, plant_budget, preferred, rng, cx, max(0.5, plan.back * 0.45))
+        focal = _focal(layout, specs, plant_budget, preferred, rng, cx, max(0.5, plan.back * 0.45))
     z0, z1 = _band(site, 'tall')
+    backdrop = []
     for _ in range(2):
-        spec = _choose(specs, 'tall', preferred, rng, layout)
+        # The back screen: structure plants first, a different shape from the focal plant (so it stands out); not a
+        # spreading clump like bamboo when there's anything else (its root barrier leaves bare soil round it)
+        tame = [s for s in specs if not s.is_invasive]
+        spec = (_choose(tame, 'tall', preferred, rng, layout, role='structure', contrast=[focal] + backdrop)
+                or _choose(specs, 'tall', preferred, rng, layout, role='structure', contrast=[focal] + backdrop))
         if spec is None:
             break
+        backdrop.append(spec)
         gx, gz = _shade_spot(layout, spec, *_bed_point(layout, spec, z0, z1, rng), rng)
         _drift(layout, spec, gx, gz, rng.choice([1, 3]), plant_budget, rng)
-    mids = _palette(specs, 'mid', preferred, rng, layout)
-    lows = _palette(specs, 'low', preferred, rng, layout)
+    # Mid drifts: a filler and a contrasting accent; low drifts: an edging plant and a contrast to the mids
+    mids = _palette(specs, 'mid', preferred, rng, layout, role='filler', contrast=[focal] + backdrop)
+    lows = _palette(specs, 'low', preferred, rng, layout, role='edging', contrast=[focal] + backdrop + mids)
     if plan.lawn:
         span = 2 * math.pi * math.sqrt(((plan.lawn[3] ** 2 + plan.lawn[4] ** 2) / 2)) if plan.lawn[0] == 'ellipse' \
             else 2 * ((plan.lawn[2] - plan.lawn[1]) + (plan.lawn[4] - plan.lawn[3]))
@@ -1139,13 +1267,15 @@ def _evenly(a, b, every):
     return [a + (b - a) * k / n for k in range(n + 1)]
 
 
-def _pick(specs, layer, preferred, layout, rng, ok=lambda s: True, key=None):
-    """One species for a role: the customer's picks first, in stock, passing `ok`; the best by `key` (else at
-    random). Borrows the neighbouring layer when this one has nothing."""
+def _pick(specs, layer, preferred, layout, rng, ok=lambda s: True, key=None, role=None, contrast=()):
+    """One species for a role: the customer's picks first, in stock, passing `ok`; then a plant meant for `role`,
+    flowers in the colour scheme and the most contrast with `contrast` (Looks); the best by `key` (else at random).
+    Borrows the neighbouring layer when this one has nothing."""
     for layers in ((layer,), {'tall': ('mid',), 'mid': ('tall', 'low'), 'low': ('mid',)}[layer]):
         pool = [s for s in specs if s.is_plant and s.layer in layers and layout.has_stock(s) and ok(s)]
         if pool:
             pool = [s for s in pool if s.id in preferred] or pool
+            pool = _contrasting(_for_role(_in_scheme(pool, layout, preferred, contrast), role), contrast)
             return min(pool, key=key) if key else rng.choice(pool)
     return None
 
@@ -1165,16 +1295,27 @@ def _symmetrical(layout, specs, plant_budget, preferred, rng):
 
     # The palette, chosen once
     focal = _specimen(specs, preferred, layout)
-    frame = _pick(specs, 'tall', preferred, layout, rng, lambda s: sunny(s) and s is not focal) or focal
-    # Sentinels: a mid plant that fits the side bed between the fence and the lawn's edge
+    # (the frame: a structure plant, a different shape from the specimen it frames; matching formal pairs, so not a
+    # spreading clump like bamboo when there's anything else)
+    frame = (_pick(specs, 'tall', preferred, layout, rng, lambda s: sunny(s) and s is not focal and not s.is_invasive,
+                   role='structure', contrast=[focal])
+             or _pick(specs, 'tall', preferred, layout, rng, lambda s: sunny(s) and s is not focal,
+                      role='structure', contrast=[focal]) or focal)
+    # Sentinels: a mid plant that fits the side bed between the fence and the lawn's edge (an accent plant first)
     side_room = lambda s: plan.side - edge(s) - site.margin(s) >= -1e-9
-    accent = (_pick(specs, 'mid', preferred, layout, rng, lambda s: sunny(s) and side_room(s))
-              or _pick(specs, 'mid', preferred, layout, rng, sunny))
-    step_down = _pick(specs, 'mid', preferred, layout, rng, lambda s: sunny(s) and s is not accent) or accent
-    # Edging: the finest-leaved low plant that takes sun (a tidy line), the customer's picks first
-    edging = _pick(specs, 'low', preferred, layout, rng, sunny, key=lambda s: (s.spacing, s.price, s.id))
-    under = _pick(specs, 'low', preferred, layout, rng, lambda s: s.sunlight == 'full_shade') \
-        or _pick(specs, 'mid', preferred, layout, rng, lambda s: s.sunlight == 'full_shade')
+    accent = (_pick(specs, 'mid', preferred, layout, rng, lambda s: sunny(s) and side_room(s), role='accent',
+                    contrast=[focal, frame])
+              or _pick(specs, 'mid', preferred, layout, rng, sunny, role='accent', contrast=[focal, frame]))
+    step_down = _pick(specs, 'mid', preferred, layout, rng, lambda s: sunny(s) and s is not accent,
+                      role='filler', contrast=[focal, frame, accent]) or accent
+    # Edging: the finest-leaved low plant that takes sun (a tidy line), the customer's picks first, an edging
+    # plant before any other
+    chosen = [focal, frame, accent, step_down]   # the palette so far: its flower colours set the scheme
+    edging = _pick(specs, 'low', preferred, layout, rng, sunny, key=lambda s: (s.spacing, s.price, s.id), role='edging',
+                   contrast=chosen)
+    shady = lambda s: s.sunlight == 'full_shade'
+    under = _pick(specs, 'low', preferred, layout, rng, shady, contrast=chosen + [edging]) \
+        or _pick(specs, 'mid', preferred, layout, rng, shady, contrast=chosen + [edging])
 
     def bed_z(spec, depth):   # middle of the back bed for this plant, off the lawn
         return max(site.margin(spec), min(depth / 2, depth - edge(spec) - 0.01))
@@ -1188,6 +1329,13 @@ def _symmetrical(layout, specs, plant_budget, preferred, rng):
         # (along the axis as far as the back bed allows: a screen row along the fence pushes it forward)
         if _mirrored(layout, focal, cx, z, cx, plant_budget, radius=max(0.6, plan.back)):
             talls.append(layout.plants[-1])
+        else:
+            # The axis is taken (a fountain heads the view): a matching pair of specimens frames it instead
+            off = focal.spacing / 2
+            while not talls and off < site.width / 2 - site.margin(focal):
+                if _mirrored(layout, focal, cx - off, z, cx, plant_budget, radius=max(0.3, plan.back / 2)) == 2:
+                    talls += layout.plants[-2:]
+                off += focal.spacing / 4
     # 2 The tall frame: matching pairs outward from the specimen along the back
     if frame:
         z = bed_z(frame, plan.back)
@@ -1298,16 +1446,24 @@ def _minimalist(layout, specs, plant_budget, preferred, rng):
     dear = lambda s: (-s.price, s.id)
 
     # A sculptural focal plant (not a spreading clump), the customer's picks first
-    focal = _pick(specs, 'tall', preferred, layout, rng, lambda s: not s.is_invasive, key=dear) \
-        or _pick(specs, 'tall', preferred, layout, rng, key=dear)
-    mass = _pick(specs, 'mid', preferred, layout, rng, lambda s: s is not focal and s.sunlight != 'full_shade', key=dear)
-    ribbon = _pick(specs, 'low', preferred, layout, rng, key=lambda s: (s.sunlight == 'full_shade', s.spacing, s.id))
+    focal = _pick(specs, 'tall', preferred, layout, rng, lambda s: not s.is_invasive, key=dear, role='specimen') \
+        or _pick(specs, 'tall', preferred, layout, rng, key=dear, role='specimen')
+    # (the mass and the ribbon: different shapes and leaf colours from the focal plant and each other)
+    mass = _pick(specs, 'mid', preferred, layout, rng, lambda s: s is not focal and s.sunlight != 'full_shade', key=dear,
+                 contrast=[focal])
+    ribbon = _pick(specs, 'low', preferred, layout, rng, key=lambda s: (s.sunlight == 'full_shade', s.spacing, s.id),
+                   role='edging', contrast=[focal, mass])
     picked = [s for s in specs if s.is_plant and s.id in preferred and s not in (focal, mass, ribbon) and layout.has_stock(s)]
 
     left = lambda: cap - layout.plant_count()
     if focal and left() > 0 and _affords(layout, focal, 1, plant_budget):
         z = max(site.margin(focal), min(plan.back / 2, plan.back - edge(focal) - 0.01))
         spot = layout.find_spot(focal, third(1 / 3), z, max_radius=site.width / 4, rng=rng)
+        if spot is None:
+            # Its third is taken (rocks, a fountain): slide along the back bed at the same depth, nearest first (a
+            # big plant's ring search steps right over a shallow bed's narrow band of valid depths)
+            xs = sorted(_evenly(site.margin(focal), site.width - site.margin(focal), 0.25), key=lambda x: abs(x - third(1 / 3)))
+            spot = next(((_r(x), _r(z)) for x in xs if layout.fits(focal, x, z)), None)
         if spot:
             layout.add(focal, *spot, 0)
     # The mass: one mid plant in a block on the other third of the back bed (3 or 5)
@@ -1435,17 +1591,130 @@ def _group_spot(layout, specs, offsets, x, z, max_radius, step=0.25):
     return None
 
 
+def _lawn_box(plan):
+    """(centre x, half width, back edge z) of the lawn."""
+    if plan.lawn[0] == 'rect':
+        _, x0, x1, z0, _ = plan.lawn
+        return (x0 + x1) / 2, (x1 - x0) / 2, z0
+    _, cx, cz, rx, rz = plan.lawn
+    return cx, rx, cz - rz
+
+
+def _water_spots(style, layout, spec, n, rng):
+    """Where a water feature goes: where the eye lands from the house, at the front of the back bed across the lawn —
+    on the axis (Symmetrical: the fountain heads the formal view), on a third (Minimalist: balanced against the focal
+    plant), beside the focal plant (Lush). A second one balances the first. A courtyard: its middle, or a third."""
+    site, plan = layout.site, layout.plan
+    if plan.lawn:
+        cx, half, back = _lawn_box(plan)
+        z = max(site.margin(spec), back - max(LAWN_EDGE, spec.spacing / 2) - 0.05)
+        if style == 'Symmetrical':
+            xs = [cx, cx - half * 0.6, cx + half * 0.6]
+        elif style == 'Minimalist':
+            first = rng.choice([1 / 3, 2 / 3])
+            xs = [site.width * first, site.width * (1 - first)]
+        else:
+            side = rng.choice([-1, 1])
+            xs = [cx + side * half * 0.5, cx - side * half * 0.5]
+        return [(x, z) for x in xs][:max(1, n)]
+    if style == 'Symmetrical':
+        return [(site.width / 2, site.length * 0.42)][:1] + [(site.width / 4, site.length * 0.42)] * (n > 1)
+    return [(site.width / 3, site.length * 0.4), (site.width * 2 / 3, site.length * 0.4)][:max(1, n)]
+
+
+def _pot_spots(layout, spec, seats):
+    """Where pots go, in order: a pair framing the way in from the house (either side of the gap in the front
+    border), a pair either end of the seating, then evenly round the lawn's edge. A courtyard: round its middle."""
+    site, plan = layout.site, layout.plan
+    r = spec.spacing / 2 + 0.05
+    spots = []
+    if plan.entry:
+        x0, x1, z0, z1 = plan.entry
+        z = (z0 + z1) / 2
+        spots += [(x0 - r, z), (x1 + r, z)]
+    if seats:
+        xs = [p['x'] for p in seats]
+        z = sum(p['z'] for p in seats) / len(seats)
+        spots += [(min(xs) - SEAT_PAD / 2 - r, z), (max(xs) + SEAT_PAD / 2 + r, z)]
+    if plan.lawn:
+        spots += _lawn_ring(plan, site, 8, -r)   # just inside the lawn's edge
+    else:
+        spots += [(site.width / 2 + dx, site.length / 2 + dz) for dx, dz in
+                  ((-1.2, 0), (1.2, 0), (0, -1.2), (0, 1.2), (-1.2, -1.2), (1.2, 1.2))]
+    return spots
+
+
+def _light_spots(layout, spec):
+    """Where garden lights go, in order: both sides of every walkway through the beds (the way in from the house,
+    the paths from gates and doors), staggered every LIGHT_EVERY; then evenly round the lawn, tucked LIGHT_DEPTH into
+    the beds among the plants they light (right on the lawn's edge they'd take the low border's places); then, for a
+    shallow bed, on its edge."""
+    site, plan = layout.site, layout.plan
+    off = spec.spacing / 2 + 0.1
+    walks = ([plan.entry] if plan.entry else []) + list(plan.paths)
+    spots = []
+    for x0, x1, z0, z1 in walks:
+        if z1 - z0 >= x1 - x0:   # runs back to front
+            for k, z in enumerate(_evenly(z0 + 0.3, z1 - 0.3, LIGHT_EVERY / 2)):
+                spots.append((x0 - off if k % 2 == 0 else x1 + off, z))
+        else:
+            for k, x in enumerate(_evenly(x0 + 0.3, x1 - 0.3, LIGHT_EVERY / 2)):
+                spots.append((x, z0 - off if k % 2 == 0 else z1 + off))
+    if plan.lawn:
+        cx, half, back = _lawn_box(plan)
+        span = (2 * ((plan.lawn[2] - plan.lawn[1]) + (plan.lawn[4] - plan.lawn[3])) if plan.lawn[0] == 'rect'
+                else 2 * math.pi * math.sqrt((plan.lawn[3] ** 2 + plan.lawn[4] ** 2) / 2))
+        n = max(4, round(span / LIGHT_EVERY))
+        # (not at the head of the view across the lawn, in the back bed: that's the focal plant's place)
+        spots += [(x, z) for x, z in _lawn_ring(plan, site, n, LIGHT_DEPTH) + _lawn_ring(plan, site, n, off + 0.1)
+                  if not (abs(x - cx) < FOCAL_CLEAR and z < back)]
+    else:
+        spots += [(site.width * fx, site.length * fz) for fx in (0.2, 0.5, 0.8) for fz in (0.25, 0.75)]
+    return spots
+
+
+def _place_run(layout, group, spots, budget, rng, radius, short, rotation=0.0):
+    """Each (spec, quantity) in `group` takes the next spots in order (the nearest free place within `radius`);
+    what finds no spot, stock or budget is noted in `short`. Returns the plants placed."""
+    placed, spots = [], list(spots)
+    for spec, q in group:
+        for _ in range(q):
+            if not layout.has_stock(spec) or layout.cost() + spec.price > budget or not layout.room_for(0):
+                short.append(spec.name)
+                continue
+            spot = None
+            while spots and spot is None:
+                x, z = spots.pop(0)
+                spot = layout.find_spot(spec, x, z, max_radius=radius, rng=rng)
+            if spot is None:
+                short.append(spec.name)
+                continue
+            placed.append(layout.add(spec, *spot, rotation))
+    return placed
+
+
 def place_features(layout, features, budget, style, seed=0):
     """
     Put the customer's garden features in first. features: [(spec, quantity)].
+    A water feature goes first, where the eye lands across the lawn (it is the focal point).
     Seats make one seating spot (side by side, facing the house) with a walkway to the front;
-    rocks go in tight groups of about three in the beds. Returns customer-facing notes for
-    anything that didn't fit the space, stock or budget. Deterministic for (style, seed).
+    pots frame the way in from the house and the seating, then dot the lawn's edge; rocks go in tight
+    groups of about three in the beds; garden lights line the walkways and the lawn's edge. Returns
+    customer-facing notes for anything that didn't fit the space, stock or budget. Deterministic for (style, seed).
     """
     rng = random.Random(f'features|{style}|{seed}')
+    extra = random.Random(f'features+|{style}|{seed}')   # pots, lights, water: seats and rocks keep their own sequence
     site, notes, short = layout.site, [], []
     seats = [(s, q) for s, q in features if s.kind == 'seat']
     rocks = [(s, q) for s, q in features if s.kind == 'rock']
+    pots = [(s, q) for s, q in features if s.kind == 'pot']
+    lights = [(s, q) for s, q in features if s.kind == 'light']
+    water = [(s, q) for s, q in features if s.kind == 'water']
+
+    powered = []
+    for spec, q in water:
+        powered += _place_run(layout, [(spec, q)], _water_spots(style, layout, spec, q, extra), budget, extra,
+                              max(site.width, site.length) / 3, short, SEAT_FACING)
 
     placed_seats = []
     wanted = [s for s, q in seats for _ in range(q)]
@@ -1500,10 +1769,19 @@ def place_features(layout, features, budget, style, seed=0):
                 continue
             layout.add(spec, *spot, rng.uniform(0, 360))
 
+    if pots:
+        _place_run(layout, pots, _pot_spots(layout, pots[0][0], placed_seats), budget, extra, 1.2, short)
+    if lights:
+        powered += _place_run(layout, lights, _light_spots(layout, lights[0][0]), budget, extra, 0.8, short)
+
     if short:
         names = sorted(set(short))
         notes.append(f"Left out {len(short)} garden feature{'s' if len(short) > 1 else ''} ({', '.join(names)}) "
                      "that didn't fit the space, stock or budget.")
+    if powered:
+        names = sorted({layout.specs[p['plant_id']].name for p in powered})
+        notes.append(f"Needs an outdoor power point within reach: {', '.join(names)}. We'll confirm where yours is at "
+                     "the site visit.")
     return notes
 
 
@@ -1523,7 +1801,8 @@ def _screen_species(specs, layer, preferred, layout):
     if not pool:
         return None
     mine = [s for s in pool if s.id in preferred]
-    return max(mine or pool, key=lambda s: (s.grown / max(s.spacing, 0.1), s.grown))
+    # A structure plant first (bamboo, a palm row: what screens are made of), then tall for its width
+    return max(mine or pool, key=lambda s: (s.role == 'structure', s.grown / max(s.spacing, 0.1), s.grown))
 
 
 def plant_screens(layout, specs, plant_budget, preferred, rng):

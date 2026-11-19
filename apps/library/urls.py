@@ -17,6 +17,8 @@ from . import push
 from .overview import business_overview
 from .reports import balances, crew_output, customer_areas, money_in
 from .views_office import activity_list, business_profile, cash_overview, cash_receive
+from .model_uploads import (inventory_model_detail, inventory_models, model_file, model_upload_confirm,
+                            model_upload_url)
 from .pricing import budget_suggestion, pricing_estimate, pricing_settings, quick_estimate
 from .reviews import moderate_review, review_highlights, review_moderation_list
 from .views_api import (
@@ -45,6 +47,11 @@ router.register(r'business-credentials', BusinessCredentialViewSet, basename='bu
 router.register(r'addresses', SavedAddressViewSet, basename='address')
 
 urlpatterns = [
+    path('inventory-models/', inventory_models, name='inventory-models'),   # office: uploaded .glb models
+    path('inventory-models/upload-url/', model_upload_url, name='inventory-model-upload-url'),   # R2 step 1
+    path('inventory-models/confirm/', model_upload_confirm, name='inventory-model-confirm'),      # R2 step 2
+    path('inventory-models/<int:pk>/', inventory_model_detail, name='inventory-model-detail'),
+    path('model-files/<str:file_name>', model_file, name='model-file'),     # the .glb (3D Studio)
     path('', include(router.urls)),
     path('address-areas/', address_areas, name='address-areas'),
     path('address-locate/', address_locate, name='address-locate'),   # pin → town & barangay

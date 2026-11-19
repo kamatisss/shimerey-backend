@@ -52,7 +52,12 @@ def funnel_summary(request):
     except ValueError:
         days = 30
     since = timezone.now() - timedelta(days=days)
-    counts = dict(FunnelEvent.objects.filter(created_at__gte=since).values_list('name').annotate(n=Count('id')))
+    # A cohort: the visits that opened the Studio in the period, and what *those* visits did next.
+    # (Counting every event in the period on its own let a sign-up from a visit opened before the
+    # period count against nobody, so a step could pass 100% of "opened".)
+    cohort = FunnelEvent.objects.filter(name='studio_opened', created_at__gte=since).values('session_id')
+    in_cohort = FunnelEvent.objects.filter(session_id__in=cohort)
+    counts = dict(in_cohort.values_list('name').annotate(n=Count('session_id', distinct=True)))
     labels = dict(FunnelEvent.EVENT_CHOICES)
     opened = counts.get('studio_opened', 0)
     steps = [
@@ -60,9 +65,11 @@ def funnel_summary(request):
          'rate': round(counts.get(name, 0) / opened * 100, 1) if opened else None}
         for name in EVENT_NAMES
     ]
-    converted = counts.get('account_created', 0) + counts.get('signed_in', 0)
+    # Visits that created an account OR signed in, each once (one visit doing both isn't two)
+    converted = in_cohort.filter(name__in=('account_created', 'signed_in')).values('session_id').distinct().count()
     return Response({
         'days': days,
         'steps': steps,
+        'converted': converted,
         'conversion_rate': round(converted / opened * 100, 1) if opened else None,
     })

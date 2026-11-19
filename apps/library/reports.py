@@ -22,6 +22,7 @@ from collections import defaultdict
 from decimal import Decimal
 
 from django.contrib.auth.models import User
+from django.db.models import Q
 from django.http import HttpResponse
 from django.utils import timezone
 from rest_framework import status
@@ -164,16 +165,19 @@ def balance_rows():
     rows = []
     for t in trackers:
         b = t.booking
-        finished = b.status in ('Finished', 'Completed')
+        finished = b.status in ServiceBooking.DONE_STATUSES
         last = max((p.paid_at for p in t.payments.all()), default=None)
+        # A balance ages from the day the job was finished (sign-off), not the day it was scheduled to start
+        job_date = b.finish_date() if finished else b.scheduled_date
         rows.append({
             'booking_id': b.id, 'customer': _name(b.user),
             'service': b.get_service_type_display(), 'status': b.status, 'finished': finished,
-            'job_date': b.scheduled_date, 'total': _m(t.total_price), 'paid': _m(t.total_price - t.remaining_balance),
+            'job_date': job_date, 'job_date_estimated': finished and b.finished_at is None,
+            'total': _m(t.total_price), 'paid': _m(t.total_price - t.remaining_balance),
             'balance': _m(t.remaining_balance),
             'requested': _m(sum((r.amount for r in t.payment_requests.all() if r.status == 'PENDING'), Decimal('0'))),
             'last_payment': _local(last),
-            'days_since_job': (today - b.scheduled_date).days if finished else None,
+            'days_since_job': (today - job_date).days if finished else None,
         })
     rows.sort(key=lambda r: (not r['finished'], -r['balance']))
     return rows
@@ -210,10 +214,16 @@ def crew_report(start, end):
                     'jobs_open': 0, 'deliveries': 0, 'cash_collected': Decimal('0'), 'cash_short': Decimal('0'),
                     'hours': 0.0, 'days_worked': set()} for u in crew}
 
-    jobs = (ServiceBooking.objects.filter(assigned_crew__in=ids, scheduled_date__gte=start, scheduled_date__lte=end)
+    # Finished jobs count in the period they were finished (sign-off; older jobs: their scheduled date),
+    # open jobs in the period they're scheduled
+    done_q = Q(status__in=ServiceBooking.DONE_STATUSES)
+    in_period = ((done_q & (Q(finished_at__gte=lo, finished_at__lt=hi)
+                            | Q(finished_at__isnull=True, scheduled_date__gte=start, scheduled_date__lte=end)))
+                 | (~done_q & Q(scheduled_date__gte=start, scheduled_date__lte=end)))
+    jobs = (ServiceBooking.objects.filter(in_period, assigned_crew__in=ids)
             .exclude(status='Cancelled').select_related('tracker', 'design').prefetch_related('assigned_crew').distinct())
     for b in jobs:
-        done = b.status in ('Finished', 'Completed')
+        done = b.status in ServiceBooking.DONE_STATUSES
         value = _booking_value(b) if done else 0
         for u in b.assigned_crew.all():
             if u.id in stats:
@@ -359,9 +369,11 @@ def money_in(request):
 def balances(request):
     if _wants_csv(request):
         return _csv(f'balances_{timezone.localdate()}.csv',
-                    ['Booking', 'Customer', 'Service', 'Status', 'Job date', 'Days since job', 'Contract price', 'Paid',
+                    ['Booking', 'Customer', 'Service', 'Status', 'Job date (finished, or scheduled if open)',
+                     'Finish date is the scheduled date (not recorded)', 'Days since job', 'Contract price', 'Paid',
                      'Balance', 'Payment requested', 'Last payment'],
                     [[f"#{r['booking_id']}", r['customer'], r['service'], r['status'], r['job_date'],
+                      'yes' if r['job_date_estimated'] else '',
                       '' if r['days_since_job'] is None else r['days_since_job'], f"{r['total']:.2f}", f"{r['paid']:.2f}",
                       f"{r['balance']:.2f}", f"{r['requested']:.2f}", r['last_payment'].date() if r['last_payment'] else '']
                      for r in balance_rows()])

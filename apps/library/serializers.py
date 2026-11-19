@@ -143,7 +143,9 @@ class InventoryItemSerializer(serializers.ModelSerializer):
     # The photo is an upload (full URL in responses); the 3D model is the name of a model bundled with
     # the frontend (public/models, data/modelCatalog.js), e.g. "bamboo.glb". Blank = no 3D model.
     model_file = serializers.CharField(required=False, allow_blank=True, max_length=100)
-    thumbnail = serializers.ImageField(required=False, allow_null=True)
+    # FileField, not ImageField: validate_thumbnail checks the bytes itself and says plainly what is wrong
+    # (ImageField would answer every wrong file with one generic "not an image or corrupted" message)
+    thumbnail = serializers.FileField(required=False, allow_null=True)
     is_low_stock = serializers.BooleanField(read_only=True)
     # Populated by InventoryItemViewSet's annotated queryset (public product reviews)
     avg_rating = serializers.SerializerMethodField()
@@ -155,7 +157,8 @@ class InventoryItemSerializer(serializers.ModelSerializer):
                   'unit_price', 'image_url', 'model_file', 'thumbnail', 'real_world_size', 'spacing_cm',
                   'is_active', 'reorder_level', 'is_low_stock', 'avg_rating', 'review_count',
                   'sunlight', 'water_need', 'is_invasive', 'is_groundcover', 'planting_height', 'mature_height',
-                  'planting_spread', 'established_spread', 'mature_spread']
+                  'planting_spread', 'established_spread', 'mature_spread',
+                  'flower_color', 'foliage_color', 'plant_form', 'design_role', 'feature_type']
         read_only_fields = ['is_active']   # archive / restore have their own actions
 
     def validate_spacing_cm(self, value):
@@ -238,7 +241,9 @@ class InventoryItemSerializer(serializers.ModelSerializer):
         if category != 'plant':
             attrs['planting_height'] = attrs['mature_height'] = None
             attrs['planting_spread'] = attrs['established_spread'] = attrs['mature_spread'] = None
+            attrs['flower_color'] = attrs['foliage_color'] = attrs['plant_form'] = attrs['design_role'] = ''
             return attrs
+        attrs['feature_type'] = ''   # plants are placed as plants
         get = lambda k: attrs[k] if k in attrs else getattr(inst, k, None)
         planting, established, mature = get('planting_height'), get('real_world_size'), get('mature_height')
         errors = {}
@@ -402,13 +407,14 @@ class ServiceBookingSerializer(serializers.ModelSerializer):
             'design', 'design_details', 'clock_out_photo_url',
             'milestones', 'progress_pct', 'staff_notes',
             'project_milestones', 'tracker', 'sign_off_blockers', 'materials', 'design_review', 'crew_on_way_at', 'crew_arrived_at',
-            'created_at', 'updated_at',
+            'finished_at', 'created_at', 'updated_at',
         ]
         read_only_fields = [
             'id', 'user', 'customer_name', 'customer_email',
             'assigned_crew_names', 'created_at', 'updated_at',
             'crew_on_way_at', 'crew_arrived_at', 'service_address', 'site_lat', 'site_lng', 'address_detail',
             'design_details', 'clock_out_photo_url', 'tracker',
+            'finished_at',   # set by sign-off (ServiceBooking.save), never by the client
         ]
 
     def get_design_review(self, obj):

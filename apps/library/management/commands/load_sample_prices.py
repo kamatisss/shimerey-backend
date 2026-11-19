@@ -37,6 +37,10 @@ SAMPLE_PRICES = {
     'River stones (small)': 40,
     'Mossy stones (small)': 50,
     'Volcanic stones (small)': 30,
+    # Products for 3D models that already ship with the frontend — see MODEL_PRODUCTS
+    'Hibiscus': 150,              # gumamela, ~1 m in a 12" bag
+    'Livistona palm': 950,        # fan palm, ~1.5–2 m
+    'Coral stone': 500,           # quarried coral limestone accent, ~60 cm
     # Groundcover (priced per m² covered: about nine plugs or one nursery tray) — see GROUNDCOVERS
     'Mani-mani (Arachis pintoi)': 180,
     'Bangka-bangkaan (Rhoeo)': 220,
@@ -67,12 +71,61 @@ GROUNDCOVERS = {
 }
 GROUNDCOVER_STOCK = 300
 
+# Products for catalog models that ship with the frontend (public/models/..., modelCatalog.js) but had no product,
+# so the AI Designer and the Studio never used them. Created when missing — by name, or when some product already
+# uses the model (the owner made it under their own name). Sizes in metres, as Inventory: real_world_size is the
+# established height (hardscape: longest side); planting / mature heights and the three spreads as 0071/0072.
+# Hibiscus is kept pruned as a shrub (2 m grown → the 'mid' layer, not the tall back row).
+MODEL_PRODUCTS = {
+    'Hibiscus': dict(
+        category='plant', model_file='hibiscus.glb', sunlight='full_sun', water_need='moderate',
+        real_world_size=1.2, planting_height=0.5, mature_height=2.0,
+        planting_spread=0.4, established_spread=0.9, mature_spread=1.5, stock_quantity=40,
+        description='Gumamela (Hibiscus rosa-sinensis): large red or pink flowers almost all year. Full sun, '
+                    'kept pruned as a 1–2 m shrub or hedge.'),
+    'Livistona palm': dict(
+        category='plant', model_file='livistona.glb', sunlight='partial_shade', water_need='moderate',
+        real_world_size=2.0, planting_height=1.5, mature_height=6.0,
+        planting_spread=1.2, established_spread=1.8, mature_spread=3.0, stock_quantity=10,
+        description='Fan palm with round, pleated leaves: a slow-growing specimen for the back of a bed. Sun or '
+                    'part shade (young palms prefer some shade).'),
+    'Coral stone': dict(
+        category='hardscape', model_file='coral_stone.glb', sunlight='full_sun', water_need='moderate',
+        real_world_size=0.6, stock_quantity=20,
+        description='Pale, porous accent boulder of quarried coral limestone, about 60 cm. Never collected from '
+                    'the sea or the beach.'),
+}
+
 # Planting distances (cm) where the catalog has none and the height rule of thumb is wrong. Bamboo: an 8 m clump
 # came out 4 m apart (the rule's cap), so a design fitted two across a 10 m yard; clumping bamboo for a screen is
 # planted 0.9–1.5 m apart (bamboo.org, nurseries). Only filled when empty: the owner's own value always wins.
 SAMPLE_SPACING = {
     'Bamboo': 150,
 }
+
+# Looks (flower colour, leaf colour, shape, design role) for the sample catalog: how the AI Designer combines plants
+# for a pleasing design (layout_engine Looks). The usual nursery forms; the owner corrects them in Inventory (a pink
+# hibiscus or geranium changes its colour family). Only empty fields are filled: the owner's own values always win.
+SAMPLE_LOOKS = {
+    #                             flower    leaves        shape        role
+    'Bamboo':                     ('none',   'green',      'upright',   'structure'),
+    'Banana':                     ('none',   'lime',       'bold',      'filler'),
+    'Christmas Palm':             ('none',   'green',      'palm',      'structure'),
+    'Codiaeum variegatum':        ('none',   'variegated', 'upright',   'accent'),
+    'Geranium':                   ('red',    'green',      'mounding',  'edging'),
+    'Heliconia rostrata':         ('red',    'green',      'bold',      'accent'),
+    'Hibiscus':                   ('red',    'dark_green', 'mounding',  'filler'),
+    'Livistona palm':             ('none',   'green',      'palm',      'specimen'),
+    'Peace Lily':                 ('white',  'dark_green', 'mounding',  'filler'),
+    'Plumeria':                   ('white',  'green',      'spreading', 'specimen'),
+    'Strelitzia':                 ('orange', 'silver',     'bold',      'accent'),
+    # Groundcovers: carpets, never placed one by one, so no role
+    'Mani-mani (Arachis pintoi)': ('yellow', 'green',      'spreading', ''),
+    'Bangka-bangkaan (Rhoeo)':    ('none',   'red_purple', 'mounding',  ''),
+    'Mondo grass':                ('none',   'dark_green', 'grassy',    ''),
+    'Asiatic jasmine':            ('none',   'dark_green', 'spreading', ''),
+}
+LOOK_FIELDS = ('flower_color', 'foliage_color', 'plant_form', 'design_role')
 
 
 class Command(BaseCommand):
@@ -83,9 +136,21 @@ class Command(BaseCommand):
 
     def handle(self, *args, **options):
         dry = options['dry_run']
+        # A Windows console (cp1252) can't print ₱ / m²: without this the report crashed after the changes were saved
+        reconfigure = getattr(self.stdout, 'reconfigure', None)
+        if reconfigure:
+            reconfigure(errors='replace')
         changed, missing = [], []
         added = []
         with transaction.atomic():
+            for name, fields in MODEL_PRODUCTS.items():
+                if InventoryItem.objects.filter(name=name).exists() or \
+                        InventoryItem.objects.filter(model_file=fields['model_file']).exists():
+                    continue
+                added.append(name)
+                if not dry:
+                    InventoryItem.objects.create(name=name, unit_price=Decimal(SAMPLE_PRICES[name]),
+                                                 reorder_level=5, is_active=True, **fields)
             for name, (boulder, size, description) in SMALL_STONES.items():
                 if InventoryItem.objects.filter(name=name).exists():
                     continue
@@ -129,13 +194,31 @@ class Command(BaseCommand):
                 if not dry:
                     item.spacing_cm = cm
                     item.save(update_fields=['spacing_cm'])
+            looked = []
+            for name, values in SAMPLE_LOOKS.items():
+                item = InventoryItem.objects.filter(name=name, category='plant').first()
+                if item is None:
+                    continue
+                fill = {f: v for f, v in zip(LOOK_FIELDS, values) if v and not getattr(item, f)}
+                if not fill:
+                    continue
+                looked.append(name)
+                if not dry:
+                    for f, v in fill.items():
+                        setattr(item, f, v)
+                    item.save(update_fields=list(fill))
+            if looked and not dry:
+                activity.record(None, 'stock', 'sample_looks_loaded',
+                                f'Set sample flower colour, leaf colour, shape and design role for {len(looked)} plants '
+                                f'(demo; correct them in Inventory)',
+                                link='/inventory', products=looked)
             if spaced and not dry:
                 activity.record(None, 'stock', 'sample_spacing_loaded',
                                 f'Set sample planting distances for {len(spaced)} products (demo; set real ones in Inventory)',
                                 link='/inventory', products=[n for n, _ in spaced])
             if added and not dry:
                 activity.record(None, 'stock', 'sample_stones_added',
-                                f'Added {len(added)} sample products: small garden stones / groundcovers (demo; set real prices in Inventory)',
+                                f'Added {len(added)} sample products: small garden stones / groundcovers / catalog models (demo; set real prices in Inventory)',
                                 link='/inventory', products=added)
             if changed and not dry:
                 activity.record(None, 'stock', 'sample_prices_loaded',
@@ -147,6 +230,8 @@ class Command(BaseCommand):
             self.stdout.write(f'  {name:22} ₱{old:>9,.2f} → ₱{new:>9,.2f}')
         for name, cm in spaced:
             self.stdout.write(f'  {name:22} planting distance {cm} cm (was empty)')
+        for name in looked:
+            self.stdout.write(f'  {name:22} looks: {", ".join(v for v in SAMPLE_LOOKS[name] if v)}')
         missing = [m for m in missing if m not in added]
         if missing:
             self.stdout.write(f'Not in the catalog (skipped): {", ".join(missing)}')

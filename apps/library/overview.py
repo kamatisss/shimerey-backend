@@ -14,7 +14,7 @@ from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
-from . import cash, field_work, work_queues
+from . import cash, field_work, project_board, work_queues
 from .models import (
     GardenDesign, InventoryItem, Order, ProjectPayment, ProjectTracker, ServiceBooking,
 )
@@ -22,6 +22,7 @@ from .views_api import IsOfficeAdmin
 
 ORDERS = '/staff-dashboard?tab=orders'
 BOOKINGS = '/staff-dashboard?tab=bookings'
+PROJECTS = '/manage-projects'
 
 
 def _money(qs, field):
@@ -56,9 +57,17 @@ def attention(owner=False):
     unpaid = ProjectTracker.objects.filter(booking__status='Finished', remaining_balance__gt=0)
     held = cash.with_crew()
     held_crew = held.order_by().values('delivered_by').distinct().count()
+    # Same rules and count as the Projects page (project_board.py)
+    late = project_board.totals(timezone.localdate())
+    late_hint = ' · '.join(part for part in (
+        f"{late['overdue']} overdue" if late['overdue'] else '',
+        f"{late['stalled']} with no crew update" if late['stalled'] else '',
+        f"{late['review_waiting']} waiting for sign-off" if late['review_waiting'] else '',
+    ) if part) or 'Past their date or with no recent crew update'
     items = [
         ('needs_refund', 'red', 'Refunds to make in PayMongo', 'Paid online, then cancelled', oc['needs_refund'], f'{ORDERS}&queue=needs_refund'),
         ('review', 'violet', 'Jobs to sign off', 'The crew marked them finished', bc['review'], f'{BOOKINGS}&queue=review'),
+        ('delayed_projects', 'red', 'Projects running late', late_hint, late['delayed'], f'{PROJECTS}?delayed=1'),
         ('awaiting', 'amber', 'Bookings to confirm', 'New requests from customers', bc['awaiting'], f'{BOOKINGS}&queue=awaiting'),
         ('dispatch', 'amber', 'Bookings that need a crew', 'Confirmed but nobody assigned', bc['dispatch'], f'{BOOKINGS}&queue=dispatch'),
         ('cash', 'amber', 'Cash with crew to hand in',
@@ -69,7 +78,7 @@ def attention(owner=False):
          GardenDesign.objects.filter(status='submitted').count(), '/staff-dashboard?tab=designs'),
         ('low_stock', 'amber', 'Items low on stock', 'At or below their low-stock level', low.count(), '/inventory'),
         ('unpaid', 'red', 'Unpaid balances on finished jobs',
-         f'₱{_money(unpaid, "remaining_balance"):,.0f} still to collect', unpaid.count(), f'{BOOKINGS}&queue=completed'),
+         f'₱{_money(unpaid, "remaining_balance"):,.0f} still to collect', unpaid.count(), f'{PROJECTS}?scope=finished&owing=1'),
     ]
     if owner:
         forgotten = field_work.forgotten_shifts()

@@ -77,8 +77,10 @@ def sanitize_image(uploaded):
     orientation, strips all EXIF metadata (including GPS) and caps the size.
     Returns (ContentFile, None) or (None, error message).
     """
-    if uploaded.size > MAX_UPLOAD_BYTES:
-        return None, 'Image is larger than 15 MB.'
+    from .file_checks import image_problem   # checked from the bytes: a renamed file is refused plainly
+    problem = image_problem(uploaded, MAX_UPLOAD_BYTES)
+    if problem:
+        return None, problem
     try:
         img = Image.open(uploaded)
         img.load()
@@ -556,9 +558,13 @@ class BusinessCredentialSerializer(serializers.ModelSerializer):
         if upload is None:
             return upload
         if not upload.name.lower().endswith(CREDENTIAL_EXTENSIONS):
-            raise serializers.ValidationError('Upload a PDF or an image (JPG, PNG, WEBP).')
-        if upload.size > MAX_CREDENTIAL_BYTES:
-            raise serializers.ValidationError('The file is larger than 10 MB.')
+            raise serializers.ValidationError('Upload a PDF or a photo (JPG, PNG or WebP) of the document.')
+        # The name alone proves nothing (a renamed file passes it): check what the bytes really are,
+        # since these documents can be shown on the public site
+        from .file_checks import document_problem
+        problem = document_problem(upload, MAX_CREDENTIAL_BYTES)
+        if problem:
+            raise serializers.ValidationError(problem)
         return upload
 
     def validate(self, attrs):

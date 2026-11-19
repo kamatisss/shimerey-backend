@@ -263,8 +263,11 @@ def generate_depth(request):
         image_file = request.FILES['image']
         logger.info(f"Processing: {image_file.name} ({image_file.size} bytes)")
 
-        if not image_file.content_type.startswith('image/'):
-            return JsonResponse({'error': 'Must be an image'}, status=400)
+        # Checked from the bytes, not the type the browser claims (a renamed file is refused plainly)
+        from .file_checks import image_problem
+        problem = image_problem(image_file)
+        if problem:
+            return JsonResponse({'error': problem}, status=400)
 
         # ═══ LOAD ═══
         img = Image.open(image_file).convert('RGB')

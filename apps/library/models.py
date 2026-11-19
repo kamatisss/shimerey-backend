@@ -12,12 +12,23 @@ class InventoryItem(models.Model):
     ]
     name = models.CharField(max_length=100)
     category = models.CharField(max_length=20, choices=CATEGORY_CHOICES, default='plant')
+    # What a furniture / hardscape item is in a design: how the AI Designer places it (layout_engine.place_features).
+    # Empty = by category (furniture → seating, hardscape → accent rock). Plants never have one.
+    FEATURE_TYPE_CHOICES = [
+        ('seat', 'Seating'),
+        ('rock', 'Accent rock'),
+        ('pot', 'Pot / planter'),
+        ('light', 'Garden light'),
+        ('water', 'Water feature'),
+    ]
+    feature_type = models.CharField(max_length=10, choices=FEATURE_TYPE_CHOICES, blank=True, default='',
+                                    help_text="How the AI Designer places it. Empty = by category. Not for plants.")
     description = models.TextField(blank=True)
     stock_quantity = models.IntegerField(default=0)
     unit_price = models.DecimalField(max_digits=10, decimal_places=2)
     image_url = models.CharField(max_length=500, blank=True)
-    # A bundled 3D model's file name (e.g. "bamboo.glb"): the models ship with the frontend
-    # (public/models/<category>/, data/modelCatalog.js). Blank = sold in the shop, not placeable in 3D.
+    # A 3D model's file name: one bundled with the frontend (e.g. "bamboo.glb", public/models/, data/modelCatalog.js)
+    # or one the office uploaded (UploadedModel, e.g. "boston-fern-3fa9c1.glb"). Blank = shop only, not placeable in 3D.
     model_file = models.CharField(max_length=100, blank=True, default='')
     real_world_size = models.FloatField(default=1.0, help_text="Metres at established size (1–2 years after planting): height for plants and furniture, longest side for hardscape")
     spacing_cm = models.IntegerField(
@@ -65,6 +76,50 @@ class InventoryItem(models.Model):
                                            help_text="Metres wide about 2 years after planting. Plants only.")
     mature_spread = models.FloatField(null=True, blank=True,
                                       help_text="Metres wide when fully grown, in a home garden. Plants only.")
+
+    # Looks: how the AI Designer combines plants for a pleasing design, not just one that fits (layout_engine:
+    # one flower-colour family per design, contrasting shapes side by side, each plant in the job it's good at).
+    # Plants only; empty = not set yet (the plant is then chosen by its height alone, as before).
+    FLOWER_COLOR_CHOICES = [
+        ('none', 'No showy flowers'),
+        ('red', 'Red'),
+        ('orange', 'Orange'),
+        ('yellow', 'Yellow'),
+        ('pink', 'Pink'),
+        ('purple', 'Purple'),
+        ('white', 'White'),
+    ]
+    FOLIAGE_COLOR_CHOICES = [
+        ('green', 'Green'),
+        ('dark_green', 'Dark green'),
+        ('lime', 'Lime / golden'),
+        ('variegated', 'Variegated'),
+        ('red_purple', 'Red / purple'),
+        ('silver', 'Silver / grey'),
+    ]
+    FORM_CHOICES = [
+        ('upright', 'Upright'),
+        ('mounding', 'Mounding'),
+        ('spreading', 'Spreading / umbrella'),
+        ('palm', 'Palm'),
+        ('bold', 'Bold leaves (paddle, strap)'),
+        ('grassy', 'Grassy / fine'),
+    ]
+    ROLE_CHOICES = [
+        ('specimen', 'Specimen (focal point)'),
+        ('structure', 'Structure (screen, hedge, frame)'),
+        ('filler', 'Filler (fills the beds)'),
+        ('edging', 'Edging (front border)'),
+        ('accent', 'Accent (a spot of colour)'),
+    ]
+    flower_color = models.CharField(max_length=10, choices=FLOWER_COLOR_CHOICES, blank=True, default='',
+                                    help_text="Main flower colour; 'none' = grown for its leaves. Plants only.")
+    foliage_color = models.CharField(max_length=12, choices=FOLIAGE_COLOR_CHOICES, blank=True, default='',
+                                     help_text="Leaf colour. Plants only.")
+    plant_form = models.CharField(max_length=10, choices=FORM_CHOICES, blank=True, default='',
+                                  help_text="Shape of the plant. Plants only.")
+    design_role = models.CharField(max_length=10, choices=ROLE_CHOICES, blank=True, default='',
+                                   help_text="The job it does best in a design. Plants only; empty = by its height.")
 
     class Meta:
         ordering = ['category', 'name']
@@ -235,13 +290,42 @@ class ServiceBooking(models.Model):
     )
     staff_notes = models.TextField(blank=True, default='')
 
+    # When the office signed the job off (status became Finished). Set by save() on that change, on
+    # every path (booking sign-off, project tracker, Django admin); cleared if the job is reopened.
+    # Empty for jobs finished before this field existed and with no sign-off in ProjectHistoryLog
+    # (migration 0084 copies those it can): analytics then fall back to scheduled_date.
+    finished_at = models.DateTimeField(null=True, blank=True, db_index=True)
+
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
+
+    DONE_STATUSES = ('Finished', 'Completed')   # 'Completed' is the legacy value
 
     class Meta:
         ordering = ['-scheduled_date']
         # Staff work queues filter by status and sort by visit date (work_queues.py)
         indexes = [models.Index(fields=['status', 'scheduled_date'])]
+
+    def save(self, *args, **kwargs):
+        """Stamp finished_at when the job *becomes* done; clear it when a done job is reopened.
+        Only a change counts: editing a long-finished job (notes, price) never re-dates it, and a
+        booking created as Finished (imports, seed data) gets no made-up date."""
+        if self.pk:
+            was = type(self).objects.filter(pk=self.pk).values_list('status', flat=True).first()
+            done_now, done_before = self.status in self.DONE_STATUSES, was in self.DONE_STATUSES
+            changed = None
+            if done_now and not done_before and self.finished_at is None:
+                self.finished_at, changed = timezone.now(), True
+            elif done_before and not done_now and self.finished_at is not None:
+                self.finished_at, changed = None, True
+            update_fields = kwargs.get('update_fields')
+            if changed and update_fields is not None and 'finished_at' not in update_fields:
+                kwargs['update_fields'] = [*update_fields, 'finished_at']
+        super().save(*args, **kwargs)
+
+    def finish_date(self):
+        """The Manila day the job was finished: the sign-off date, else (older jobs) its scheduled date."""
+        return timezone.localdate(self.finished_at) if self.finished_at else self.scheduled_date
 
     def __str__(self):
         return f"{self.service_type} for {self.user.username} on {self.scheduled_date}"
@@ -1161,3 +1245,28 @@ class DesignShare(models.Model):
 
     def __str__(self):
         return f'Share {self.token} of design #{self.design_id}{" (stopped)" if self.revoked_at else ""}'
+
+
+class UploadedModel(models.Model):
+    """A 3D model (.glb) uploaded by the office from the Inventory page (model_uploads.py).
+
+    The file lives under `file_name` (always "<name>-<6 hex>.glb", so it never clashes with a model
+    bundled with the frontend) in Cloudflare R2 or, when R2 isn't set up, in MEDIA_ROOT/models/. An InventoryItem uses it by putting that same
+    name in its model_file, exactly like a bundled model.
+    """
+    CATEGORY_CHOICES = InventoryItem.CATEGORY_CHOICES
+    label = models.CharField(max_length=80)
+    category = models.CharField(max_length=20, choices=CATEGORY_CHOICES, default='plant')
+    file_name = models.CharField(max_length=100, unique=True)
+    size_bytes = models.PositiveIntegerField()
+    # Where the file is: this server's disk (media/models/) or Cloudflare R2 (models/<file_name>, r2.py)
+    STORAGE_CHOICES = [('server', 'This server'), ('r2', 'Cloudflare R2')]
+    storage = models.CharField(max_length=10, choices=STORAGE_CHOICES, default='server')
+    uploaded_by = models.ForeignKey(User, null=True, blank=True, on_delete=models.SET_NULL, related_name='+')
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['category', 'label']
+
+    def __str__(self):
+        return f'{self.label} ({self.file_name})'

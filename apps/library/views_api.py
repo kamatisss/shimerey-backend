@@ -105,7 +105,8 @@ from django.utils import timezone
 from rest_framework_simplejwt.views import TokenObtainPairView
 
 from .portfolio import create_portfolio_draft, sanitize_image
-from . import activity, addresses, cart, cash, design_lock, design_review, field_work, inventory, notifications, offline, paymongo, work_queues
+from .file_checks import image_from_data_url, image_problem
+from . import activity, addresses, cart, cash, design_lock, design_review, field_work, inventory, notifications, offline, paymongo, project_board, work_queues
 from .emails import send_payment_request_email
 
 from .models import (
@@ -1937,7 +1938,6 @@ def upload_design_image(request):
         return Response({'error': 'No image provided.'}, status=status.HTTP_400_BAD_REQUEST)
 
     from django.core.files.storage import default_storage
-    from django.conf import settings as django_settings
 
     # Re-encoded as JPEG: anything that isn't a real image is refused, and EXIF/GPS is stripped
     content, error = sanitize_image(request.FILES['image'])
@@ -1946,8 +1946,8 @@ def upload_design_image(request):
     filename = f"design_refs/ref_{int(time.time())}_{secrets.token_hex(4)}.jpg"
     saved_path = default_storage.save(filename, content)
 
-    media_url = getattr(django_settings, 'MEDIA_URL', '/media/').rstrip('/')
-    url = request.build_absolute_uri(f'{media_url}/{saved_path}')
+    # The storage's own address: this server's /media/… on disk, or the R2 bucket's (already absolute)
+    url = request.build_absolute_uri(default_storage.url(saved_path))
     return Response({'url': url}, status=status.HTTP_201_CREATED)
 
 
@@ -2363,8 +2363,6 @@ class AttendanceViewSet(viewsets.ModelViewSet):
     def clock_in(self, request):
         """POST /api/attendance/clock_in/"""
         from django.utils import timezone
-        import base64
-        from django.core.files.base import ContentFile
 
         user = request.user
         if Attendance.objects.filter(staff=user, clock_out_time__isnull=True).exists():
@@ -2422,16 +2420,17 @@ class AttendanceViewSet(viewsets.ModelViewSet):
                 )
 
                 if photo_data:
-                    if isinstance(photo_data, str) and photo_data.startswith('data:image'):
-                        try:
-                            format, imgstr = photo_data.split(';base64,')
-                            ext = format.split('/')[-1].split(';')[0]
-                            filename = f"clock_in_{user.id}_{int(timezone.now().timestamp())}.{ext}"
-                            attendance.clock_in_photo_url.save(filename, ContentFile(base64.b64decode(imgstr)), save=False)
-                        except Exception as e:
-                            return Response({'error': f'Failed to decode image: {str(e)}'}, status=status.HTTP_400_BAD_REQUEST)
-                    elif hasattr(photo_data, 'read'):
-                        attendance.clock_in_photo_url = photo_data
+                    # Always a re-encoded .jpg, checked from its bytes (file_checks.py): the type in the
+                    # data URL is never trusted, so nothing but a real photo is ever saved
+                    if isinstance(photo_data, str):
+                        clean, problem = image_from_data_url(photo_data)
+                    else:
+                        problem = image_problem(photo_data) if hasattr(photo_data, 'read') else 'Take the photo again.'
+                        clean, problem = (None, problem) if problem else sanitize_image(photo_data)
+                    if problem:
+                        return Response({'error': problem}, status=status.HTTP_400_BAD_REQUEST)
+                    clean.name = f"clock_in_{user.id}_{int(timezone.now().timestamp())}.jpg"
+                    attendance.clock_in_photo_url.save(clean.name, clean, save=False)
 
                 attendance.save()
 
@@ -2454,8 +2453,6 @@ class AttendanceViewSet(viewsets.ModelViewSet):
     def clock_out(self, request):
         """POST /api/attendance/clock_out/"""
         from django.utils import timezone
-        import base64
-        from django.core.files.base import ContentFile
 
         user = request.user
         active_session = Attendance.objects.filter(staff=user, clock_out_time__isnull=True).first()
@@ -2482,16 +2479,17 @@ class AttendanceViewSet(viewsets.ModelViewSet):
                 active_session.clock_out_address = address
 
                 if photo_data:
-                    if isinstance(photo_data, str) and photo_data.startswith('data:image'):
-                        try:
-                            format, imgstr = photo_data.split(';base64,')
-                            ext = format.split('/')[-1].split(';')[0]
-                            filename = f"clock_out_{user.id}_{int(timezone.now().timestamp())}.{ext}"
-                            active_session.clock_out_photo_url.save(filename, ContentFile(base64.b64decode(imgstr)), save=False)
-                        except Exception as e:
-                            return Response({'error': f'Failed to decode image: {str(e)}'}, status=status.HTTP_400_BAD_REQUEST)
-                    elif hasattr(photo_data, 'read'):
-                        active_session.clock_out_photo_url = photo_data
+                    # Always a re-encoded .jpg, checked from its bytes (file_checks.py): the type in the
+                    # data URL is never trusted, so nothing but a real photo is ever saved
+                    if isinstance(photo_data, str):
+                        clean, problem = image_from_data_url(photo_data)
+                    else:
+                        problem = image_problem(photo_data) if hasattr(photo_data, 'read') else 'Take the photo again.'
+                        clean, problem = (None, problem) if problem else sanitize_image(photo_data)
+                    if problem:
+                        return Response({'error': problem}, status=status.HTTP_400_BAD_REQUEST)
+                    clean.name = f"clock_out_{user.id}_{int(timezone.now().timestamp())}.jpg"
+                    active_session.clock_out_photo_url.save(clean.name, clean, save=False)
 
                 active_session.save()
 
@@ -2626,7 +2624,7 @@ class ProjectTrackerViewSet(viewsets.ModelViewSet):
     def get_permissions(self):
         # Write operations (create / edit / status advance) require admin/staff
         if self.action in ('create', 'update', 'partial_update', 'destroy', 'update_status', 'record_payment',
-                           'cancel_payment_request', 'email_payment_request'):
+                           'cancel_payment_request', 'email_payment_request', 'board', 'board_export'):
             return [IsAuthenticated(), IsOfficeAdmin()]
         return [IsAuthenticated()]
 
@@ -2651,6 +2649,21 @@ class ProjectTrackerViewSet(viewsets.ModelViewSet):
                             f'Changed the contract price of booking #{tracker.booking_id}: '
                             f'₱{old_price:,.2f} → ₱{tracker.total_price:,.2f}',
                             link=notifications.booking_office_path(tracker.booking_id), booking=tracker.booking_id)
+
+    # ── GET /api/projects/board/ ─────────────────────────────────────────────
+    @action(detail=False, methods=['get'])
+    def board(self, request):
+        """Projects board for the office and the owner (project_board.py): every project with both
+        progress measures, crew, dates, money and delay flags. ?scope=open|finished|cancelled|all
+        &delayed=1 &owing=1 &crew=<id> &service= &q= &page= &page_size="""
+        return Response(project_board.board(request.query_params))
+
+    # ── GET /api/projects/board/export/ ──────────────────────────────────────
+    @action(detail=False, methods=['get'], url_path='board/export')
+    def board_export(self, request):
+        """The board as CSV, with the same filters and no paging."""
+        header, rows = project_board.board_csv(request.query_params)
+        return work_queues.csv_response(header, rows, f'projects-{timezone.localdate():%Y%m%d}.csv')
 
     # ── GET /api/projects/supervisor-options/ ────────────────────────────────
     @action(detail=False, methods=['get'], url_path='supervisor-options')

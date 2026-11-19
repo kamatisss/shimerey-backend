@@ -164,6 +164,9 @@ STATIC_URL = 'static/'
 
 MEDIA_URL = '/media/'
 MEDIA_ROOT = os.path.join(BASE_DIR, 'media')
+# True when uploads live in Cloudflare R2 (prod.py). Then /media/<path> redirects there, so links saved
+# as "/media/…" (depth maps, older designs) keep working.
+MEDIA_ON_R2 = False
 
 
 # ─── PayMongo Configuration ───────────────────────────────────────────────────
@@ -242,3 +245,22 @@ DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 DATA_UPLOAD_MAX_MEMORY_SIZE = 52428800
 FILE_UPLOAD_MAX_MEMORY_SIZE = 52428800
 
+
+# ─── Cloudflare R2 (uploaded 3D models, apps/library/r2.py + model_uploads.py) ───────────────
+# All five set → the browser uploads .glb files straight to R2 and the 3D Studio loads them from
+# R2_PUBLIC_URL. Any missing → models are saved on this server's disk (media/models/) instead.
+R2_ACCOUNT_ID        = os.environ.get('R2_ACCOUNT_ID', '').strip()
+R2_ACCESS_KEY_ID     = os.environ.get('R2_ACCESS_KEY_ID', '').strip()
+R2_SECRET_ACCESS_KEY = os.environ.get('R2_SECRET_ACCESS_KEY', '').strip()
+R2_BUCKET            = os.environ.get('R2_BUCKET', '').strip()
+R2_PUBLIC_URL        = os.environ.get('R2_PUBLIC_URL', '').strip().rstrip('/')   # https://pub-….r2.dev
+R2_ENABLED = all([R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET, R2_PUBLIC_URL])
+# Photos and other uploads (thumbnails, site photos, attendance proofs, portfolio, credentials) go to a
+# second, public R2 bucket in production (config/settings/prod.py), same account. The API token must
+# be allowed to read & write both buckets.
+R2_MEDIA_BUCKET     = os.environ.get('R2_MEDIA_BUCKET', '').strip()
+R2_MEDIA_PUBLIC_URL = os.environ.get('R2_MEDIA_PUBLIC_URL', '').strip().rstrip('/')   # https://pub-….r2.dev
+# Size caps (bytes): per file, and all uploaded models together. R2's free plan holds 10 GB; this
+# server's disk (PythonAnywhere free: 512 MB shared with everything else) much less.
+MAX_MODEL_UPLOAD_BYTES = int(os.environ.get('MAX_MODEL_UPLOAD_BYTES') or (15 if R2_ENABLED else 5) * 1024 * 1024)
+MAX_TOTAL_MODEL_BYTES = int(os.environ.get('MAX_TOTAL_MODEL_BYTES') or (8192 if R2_ENABLED else 150) * 1024 * 1024)

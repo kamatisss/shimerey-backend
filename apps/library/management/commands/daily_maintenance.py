@@ -1,7 +1,8 @@
 """
 The one daily scheduled task (PythonAnywhere free accounts get a single scheduled task):
 
-  1. back up the database          (backups/db-YYYY-MM-DD.sqlite3.gz, newest 7 kept)
+  1. back up the database          (SQLite only: backups/db-YYYY-MM-DD.sqlite3.gz, newest 7 kept;
+                                    on Postgres the database host keeps the backups, so it is skipped)
   2. cancel expired unpaid online orders and return their stock
   3. forget crew-action retry keys older than 3 days
 
@@ -11,6 +12,7 @@ so PythonAnywhere's task log shows it.
 from datetime import timedelta
 
 from django.core.management.base import BaseCommand, CommandError
+from django.db import connection
 from django.utils import timezone
 
 from apps.library.backups import backup_database
@@ -24,8 +26,14 @@ class Command(BaseCommand):
     def handle(self, *args, **options):
         from apps.library.models import IdempotentRequest
 
+        def backup():
+            # Postgres (Render + Neon): Neon keeps the backups and point-in-time restore; nothing to do here
+            if connection.vendor != 'sqlite':
+                return f'skipped ({connection.vendor}: the database host keeps the backups)'
+            return f'{backup_database().name} written'
+
         steps = [
-            ('Backup', lambda: f'{backup_database().name} written'),
+            ('Backup', backup),
             ('Unpaid orders', lambda: f'{expire_unpaid_online_orders()} expired'),
             ('Retry keys', lambda: f'{IdempotentRequest.objects.filter(created_at__lt=timezone.now() - timedelta(days=KEEP_DAYS)).delete()[0]} removed'),
         ]

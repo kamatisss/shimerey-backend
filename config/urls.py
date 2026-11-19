@@ -15,7 +15,7 @@ Including another URLconf
     2. Add a URL to urlpatterns:  path('blog/', include('blog.urls'))
 """
 from django.contrib import admin
-from django.urls import path, include
+from django.urls import path, include, re_path
 from django.conf import settings
 from django.conf.urls.static import static
 from django.http import JsonResponse
@@ -41,5 +41,9 @@ urlpatterns = [
     path('api/token/refresh/', SessionTokenRefreshView.as_view(), name='token_refresh'),   # refuses signed-out sessions
     path('api/', include('apps.library.urls')),
 ]
-if settings.DEBUG:
+if settings.MEDIA_ON_R2:
+    # Uploads live in Cloudflare R2: old "/media/…" links (saved in designs, depth maps) redirect there
+    from apps.library.media_redirect import media_redirect
+    urlpatterns += [re_path(r'^media/(?P<path>.+)$', media_redirect, name='media-redirect')]
+elif settings.DEBUG:
     urlpatterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)

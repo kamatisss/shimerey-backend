@@ -53,7 +53,9 @@ STONE_LABOUR_SHARE = Decimal('0.2')   # placing a small stone takes a fifth of t
 
 
 def is_small_stone(item):
-    return item.category == 'hardscape' and float(item.real_world_size or 1.0) < SMALL_STONE
+    # (a rock: a small pot or garden light under 35 cm is not a stone)
+    return (item.category == 'hardscape' and float(item.real_world_size or 1.0) < SMALL_STONE
+            and (getattr(item, 'feature_type', '') or 'rock') == 'rock')
 
 
 def layer_of(item):

@@ -18,5 +18,9 @@ google-genai==2.10.0
 pydantic==2.13.4
 # Crew phone alerts (Web Push)
 pywebpush==2.5.0
-# Only for hosts that run gunicorn (Railway/Render); PythonAnywhere does not need it
+# Production on Render (DEPLOY.md): web server, Postgres, admin static files, uploads in Cloudflare R2
 gunicorn==26.0.0
+psycopg[binary]==3.3.9
+dj-database-url==3.1.2
+whitenoise==6.12.0
+django-storages[s3]==1.14.6
