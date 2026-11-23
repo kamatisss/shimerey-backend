@@ -7,8 +7,8 @@ services:
     runtime: python
     region: singapore
     plan: starter            # free instances sleep after 15 min: PayMongo webhooks and customers would wait
-    buildCommand: pip install --no-cache-dir -r requirements.txt && python manage.py collectstatic --noinput
-    preDeployCommand: python manage.py migrate --noinput
+    # build.sh: install, collectstatic, migrate (a failing migration stops the deploy)
+    buildCommand: bash build.sh
     # 2 processes × 4 threads: slow Gemini / PayMongo calls don't block other requests, within 512 MB
     startCommand: gunicorn config.wsgi:application --workers 2 --threads 4 --timeout 120 --bind 0.0.0.0:$PORT
     healthCheckPath: /api/business/

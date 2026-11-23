@@ -34,8 +34,8 @@ R2, and `REQUIRE_CLOUD_STORAGE=true` makes the server refuse to start if R2 isn'
 
 ### R3. Render services
 1. render.com → **New → Blueprint** → this repo. `render.yaml` creates:
-   - `garden-studio-api`: web service, Starter, Singapore. Build installs and runs `collectstatic`;
-     every deploy runs `migrate` first; health check `/api/business/`.
+   - `garden-studio-api`: web service, Starter, Singapore. Every deploy runs `build.sh`: install,
+     `collectstatic`, `migrate` (a failing step stops the deploy); health check `/api/business/`.
    - `garden-studio-daily`: cron job, 18:00 UTC (2 AM Manila), `manage.py daily_maintenance`
      (expires unpaid orders, clears old retry keys).
 2. Fill in the values it asks for (each service has the same list):

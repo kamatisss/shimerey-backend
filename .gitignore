@@ -11,6 +11,8 @@ __pycache__/
 *.sqlite3
 *.sqlite3-journal
 *.bak
+# Copies made before migrations / data changes (db.sqlite3.bak-before-<what>)
+*.sqlite3.bak*
 media/
 media_backup/
 staticfiles/
@@ -20,3 +22,7 @@ staticfiles/
 
 # Database backups (manage.py backup_db / daily_maintenance)
 backups/
+
+# Data exports for the move to Postgres (manage.py dumpdata): customers' personal details
+dump.json
+dump-*.json
