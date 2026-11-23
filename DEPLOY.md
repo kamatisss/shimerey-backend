@@ -33,12 +33,15 @@ R2, and `REQUIRE_CLOUD_STORAGE=true` makes the server refuse to start if R2 isn'
    over r2.dev, which is rate-limited) and update the two `*_PUBLIC_URL` settings.
 
 ### R3. Render services
-1. render.com → **New → Blueprint** → this repo. `render.yaml` creates:
-   - `garden-studio-api`: web service, Starter, Singapore. Every deploy runs `build.sh`: install,
+1. render.com → **New → Blueprint** → this repo. `render.yaml` creates one service:
+   - `garden-studio-api`: web service, **Free**, Singapore. Every deploy runs `build.sh`: install,
      `collectstatic`, `migrate` (a failing step stops the deploy); health check `/api/business/`.
-   - `garden-studio-daily`: cron job, 18:00 UTC (2 AM Manila), `manage.py daily_maintenance`
-     (expires unpaid orders, clears old retry keys).
-2. Fill in the values it asks for (each service has the same list):
+     It sleeps after 15 minutes without visitors; the next request wakes it (about a minute).
+   - No cron job: unpaid online orders expire when someone checks out or opens the orders list, and
+     old crew retry keys are cleared as crews use the app. To run the same clean-up by hand (free
+     instances have no Render Shell), from your computer with the database's **External** URL:
+     `DATABASE_URL=<external url> python manage.py daily_maintenance --settings=config.settings.dev`.
+2. Fill in the values it asks for:
    - **Copy from the old server unchanged:** `DJANGO_SECRET_KEY` (keeps everyone signed in),
      `VAPID_PUBLIC_KEY` / `VAPID_PRIVATE_KEY` / `VAPID_SUBJECT` (keeps crew phone alerts working),
      `PAYMONGO_SECRET_KEY`, `GEMINI_API_KEY`, the email settings, all `R2_*` model settings.
@@ -76,7 +79,7 @@ Rehearse it first against an empty Neon branch: same steps, without 5–7.
 6. Vercel → `VITE_API_BASE_URL = https://garden-studio-api.onrender.com/api` → redeploy the **newest**
    deployment.
 7. Smoke test: sign in; a test payment (receipt page + webhook marks it paid); upload a photo and a 3D
-   model; a crew alert reaches a phone; a password-reset email arrives; Render → cron → **Trigger Run**.
+   model; a crew alert reaches a phone; a password-reset email arrives.
 8. **Check the login limit:** type a wrong password 11 times on Wi-Fi until it says to wait, then try
    once on mobile data. If mobile data is blocked too, every visitor shares one limit: change
    `NUM_PROXIES` (try 2), redeploy, repeat.

@@ -1,4 +1,7 @@
-# Render Blueprint (DEPLOY.md → "Render"): the API and its daily task, both in Singapore.
+# Render Blueprint (DEPLOY.md → "Render"): the API only, on the free plan, in Singapore.
+# No daily cron job: its work already happens during normal use (unpaid online orders expire when
+# someone checks out or opens the orders list; old crew retry keys are cleared by the middleware), and
+# its backup step is skipped on Postgres anyway. Free plan: the service sleeps after 15 minutes idle.
 # Render → New → Blueprint → pick this repo. Values marked sync: false are asked for once, in the
 # dashboard; they never go into git. The database is a Render Postgres made in the dashboard (Singapore),
 # not part of this Blueprint: its Internal Database URL is DATABASE_URL. (A `databases:` section here
@@ -8,14 +11,14 @@ services:
     name: garden-studio-api
     runtime: python
     region: singapore
-    plan: starter            # free instances sleep after 15 min: PayMongo webhooks and customers would wait
+    plan: free               # sleeps after 15 min idle; the first request after that waits for it to wake
     # build.sh: install, collectstatic, migrate (a failing migration stops the deploy)
     buildCommand: bash build.sh
     # 2 processes × 4 threads: slow Gemini / PayMongo calls don't block other requests, within 512 MB
     startCommand: gunicorn config.wsgi:application --workers 2 --threads 4 --timeout 120 --bind 0.0.0.0:$PORT
     healthCheckPath: /api/business/
     autoDeploy: true
-    envVars: &env
+    envVars:
       - key: PYTHON_VERSION
         value: 3.13.14
       - key: DJANGO_SETTINGS_MODULE
@@ -64,13 +67,3 @@ services:
         sync: false
       - key: R2_MEDIA_PUBLIC_URL
         sync: false
-
-  - type: cron
-    name: garden-studio-daily
-    runtime: python
-    region: singapore
-    plan: starter
-    schedule: "0 18 * * *"         # 18:00 UTC = 2 AM Manila
-    buildCommand: pip install --no-cache-dir -r requirements.txt
-    startCommand: python manage.py daily_maintenance
-    envVars: *env
