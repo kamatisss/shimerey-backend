@@ -1,6 +1,8 @@
 # Render Blueprint (DEPLOY.md → "Render"): the API and its daily task, both in Singapore.
 # Render → New → Blueprint → pick this repo. Values marked sync: false are asked for once, in the
-# dashboard; they never go into git. The database is Neon (Postgres, AWS Singapore), set as DATABASE_URL.
+# dashboard; they never go into git. The database is a Render Postgres made in the dashboard (Singapore),
+# not part of this Blueprint: its Internal Database URL is DATABASE_URL. (A `databases:` section here
+# would make the Blueprint create a second, empty database.)
 services:
   - type: web
     name: garden-studio-api
@@ -30,7 +32,7 @@ services:
         sync: false
       - key: FRONTEND_URL            # https://shimereyslandscaping.vercel.app
         sync: false
-      - key: DATABASE_URL            # Neon → Connection string (direct, not pooled), sslmode=require
+      - key: DATABASE_URL            # Render Postgres → Connect → Internal Database URL (same region)
         sync: false
       - key: PAYMONGO_SECRET_KEY
         sync: false
