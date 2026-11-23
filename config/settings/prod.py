@@ -27,7 +27,8 @@ if not ALLOWED_HOSTS:
 
 # Only the real frontend may call the API from a browser (FRONTEND_URL, plus any extra origins)
 CORS_ALLOW_ALL_ORIGINS = False
-CORS_ALLOWED_ORIGINS = _list('CORS_ALLOWED_ORIGINS', FRONTEND_URL)
+# Trailing slashes are dropped (clean_origin, base.py): 'https://site.app/' would stop the server (corsheaders.E014)
+CORS_ALLOWED_ORIGINS = [clean_origin(o) for o in _list('CORS_ALLOWED_ORIGINS', FRONTEND_URL)]
 CSRF_TRUSTED_ORIGINS = CORS_ALLOWED_ORIGINS + [f'https://{h}' for h in ALLOWED_HOSTS]
 
 # HTTPS: the host terminates TLS in front of Django

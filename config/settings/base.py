@@ -194,8 +194,14 @@ EMAIL_BACKEND = os.environ.get('EMAIL_BACKEND') or (
 DEFAULT_FROM_EMAIL = os.environ.get('DEFAULT_FROM_EMAIL') or (
     f'Garden Studio <{EMAIL_HOST_USER}>' if EMAIL_HOST_USER else 'Garden Studio <noreply@gardenstudio.local>')
 
-# The base URL of your React frontend (used to build payment success/cancel redirect URLs)
-FRONTEND_URL = os.environ.get('FRONTEND_URL', 'http://localhost:5173')
+def clean_origin(value):
+    """'https://site.app/ ' → 'https://site.app'. A trailing slash is easy to paste into a dashboard, but an
+    origin has no path (corsheaders.E014 stops the server) and links built as FRONTEND_URL + '/path' get '//'."""
+    return value.strip().rstrip('/')
+
+
+# The base URL of your React frontend (used to build payment success/cancel redirect URLs and email links)
+FRONTEND_URL = clean_origin(os.environ.get('FRONTEND_URL', 'http://localhost:5173'))
 
 # Web Push (phone alerts for field crew). Without keys, push is simply off; email and the bell still work.
 VAPID_PUBLIC_KEY  = os.environ.get('VAPID_PUBLIC_KEY', '')

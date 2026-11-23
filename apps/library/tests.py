@@ -7200,3 +7200,31 @@ class CrewSyncStatusTests(APITestCase):
             self.assertEqual(self.client.get('/api/crew-sync/').status_code, 403)
         self.client.force_authenticate(None)
         self.assertEqual(self.client.get('/api/crew-sync/').status_code, 401)
+
+
+class ProductionOriginSettingsTests(APITestCase):
+    """A trailing slash pasted into Render's FRONTEND_URL must not stop the server (corsheaders.E014)."""
+
+    def test_clean_origin(self):
+        from config.settings.base import clean_origin
+        self.assertEqual(clean_origin(' https://site.vercel.app/ '), 'https://site.vercel.app')
+        self.assertEqual(clean_origin('https://site.vercel.app//'), 'https://site.vercel.app')
+        self.assertEqual(clean_origin('http://localhost:5173'), 'http://localhost:5173')
+
+    def test_production_settings_accept_a_trailing_slash(self):
+        import os, subprocess, sys, tempfile
+        from pathlib import Path
+        base = Path(__file__).resolve().parents[2]
+        env = {**os.environ, 'DJANGO_SETTINGS_MODULE': 'config.settings.prod',
+               'DJANGO_SECRET_KEY': 'x' * 60, 'ALLOWED_HOSTS': 'api.example.com',
+               'FRONTEND_URL': 'https://site.vercel.app/',
+               'CORS_ALLOWED_ORIGINS': 'https://site.vercel.app/, https://www.site.app/',
+               'DATABASE_PATH': str(Path(tempfile.gettempdir()) / 'origin-check.sqlite3')}
+        for k in ('DATABASE_URL', 'R2_MEDIA_BUCKET', 'REQUIRE_CLOUD_STORAGE'):
+            env.pop(k, None)
+        code = ('import django; django.setup(); from django.conf import settings as s; '
+                'from django.core.management import call_command; call_command("check"); '
+                'print(s.FRONTEND_URL, s.CORS_ALLOWED_ORIGINS)')
+        r = subprocess.run([sys.executable, '-c', code], cwd=base, env=env, capture_output=True, text=True, timeout=120)
+        self.assertEqual(r.returncode, 0, r.stderr[-2000:])
+        self.assertIn("https://site.vercel.app ['https://site.vercel.app', 'https://www.site.app']", r.stdout)
