@@ -16,6 +16,7 @@ from django.utils import timezone
 
 from collections import Counter
 
+from . import pricing
 from .models import Attendance, InventoryItem, ProjectMilestone, ProjectProgressMedia
 
 CREW_STAGES = ['site_prep', 'installation', 'final_inspection']
@@ -125,23 +126,26 @@ def plant_breakdown_for(placed_items, previous=None):
     office's plant list and the customer's review never show the old version's plants.
     Prices: today's catalog price, else the price the old list had.
     """
-    counts = Counter()
+    counts = Counter()   # (plant id, size): a specimen-size plant is its own row (pricing.py)
     for item in placed_items or []:
         if not isinstance(item, dict) or item.get('is_existing'):
             continue
         pid = item.get('plant_id') or item.get('productId') or item.get('product_id')
         if pid not in (None, ''):
-            counts[str(pid)] += 1
-    numeric = [int(p) for p in counts if str(p).isdigit()]
+            counts[(str(pid), pricing.SPECIMEN if item.get('size') == pricing.SPECIMEN else '')] += 1
+    numeric = [int(p) for p, _ in counts if str(p).isdigit()]
     catalog = {str(i.id): i for i in InventoryItem.objects.filter(id__in=numeric)}
-    old = {str(r.get('plant_id')): r for r in (previous or []) if isinstance(r, dict)}
+    old = {(str(r.get('plant_id')), r.get('size') or ''): r for r in (previous or []) if isinstance(r, dict)}
     rows = []
-    for pid, qty in counts.items():
-        item, before = catalog.get(pid), old.get(pid, {})
-        name = item.name if item else before.get('name')
+    for (pid, size), qty in counts.items():
+        item, before = catalog.get(pid), old.get((pid, size), {})
+        if item:
+            size = pricing.size_of(item, size)
+        name = pricing.line_name(item, size) if item else before.get('name')
         if not name:
             continue
-        price = float(item.unit_price) if item else float(before.get('unit_price') or 0)
+        price = float(pricing.unit_price_for(item, size)) if item else float(before.get('unit_price') or 0)
         rows.append({'plant_id': pid, 'name': name, 'category': item.category if item else before.get('category', 'plant'),
-                     'quantity': qty, 'unit_price': price, 'subtotal': round(price * qty, 2)})
+                     'quantity': qty, 'unit_price': price, 'subtotal': round(price * qty, 2),
+                     **({'size': size} if size else {})})
     return sorted(rows, key=lambda r: (r['category'] != 'plant', r['name']))

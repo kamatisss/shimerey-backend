@@ -157,7 +157,7 @@ class InventoryItemSerializer(serializers.ModelSerializer):
                   'unit_price', 'image_url', 'model_file', 'thumbnail', 'real_world_size', 'spacing_cm',
                   'is_active', 'reorder_level', 'is_low_stock', 'avg_rating', 'review_count',
                   'sunlight', 'water_need', 'is_invasive', 'is_groundcover', 'planting_height', 'mature_height',
-                  'planting_spread', 'established_spread', 'mature_spread',
+                  'planting_spread', 'established_spread', 'mature_spread', 'years_to_mature', 'specimen_price', 'specimen_height',
                   'flower_color', 'foliage_color', 'plant_form', 'design_role', 'feature_type']
         read_only_fields = ['is_active']   # archive / restore have their own actions
 
@@ -234,6 +234,14 @@ class InventoryItemSerializer(serializers.ModelSerializer):
     def validate_mature_spread(self, value):
         return self._spread(value)
 
+    def validate_years_to_mature(self, value):
+        # Years after planting until fully grown (the 3D "Fully grown" card). Empty = unknown.
+        if value in (None, ''):
+            return None
+        if not 1 <= int(value) <= 60:
+            raise serializers.ValidationError('Enter 1 to 60 years, or leave it empty.')
+        return int(value)
+
     def validate(self, attrs):
         # Growth heights belong to plants and must read: at planting ≤ established ≤ fully grown
         inst = self.instance
@@ -241,6 +249,8 @@ class InventoryItemSerializer(serializers.ModelSerializer):
         if category != 'plant':
             attrs['planting_height'] = attrs['mature_height'] = None
             attrs['planting_spread'] = attrs['established_spread'] = attrs['mature_spread'] = None
+            attrs['years_to_mature'] = None
+            attrs['specimen_price'] = attrs['specimen_height'] = None
             attrs['flower_color'] = attrs['foliage_color'] = attrs['plant_form'] = attrs['design_role'] = ''
             return attrs
         attrs['feature_type'] = ''   # plants are placed as plants
@@ -259,6 +269,23 @@ class InventoryItemSerializer(serializers.ModelSerializer):
             errors['mature_spread'] = 'Should be at least the width after about 2 years.'
         if (ps is not None or ms is not None) and es is None:
             errors['established_spread'] = 'Needed with the other widths: the 3D view grows from this one.'
+        # Specimen size (bigger stock, its own price): both or neither, dearer than the standard size, and a
+        # height between planting and fully grown. Groundcover is sold by the m², never as specimens.
+        sp, sh = get('specimen_price'), get('specimen_height')
+        if get('is_groundcover'):
+            attrs['specimen_price'] = attrs['specimen_height'] = None
+        elif sp is not None or sh is not None:
+            price = attrs.get('unit_price', getattr(inst, 'unit_price', None))
+            if sp is None:
+                errors['specimen_price'] = 'Enter the specimen price too, or clear the specimen height.'
+            elif price is not None and sp <= price:
+                errors['specimen_price'] = 'Should cost more than the standard size.'
+            if sh is None:
+                errors['specimen_height'] = 'Enter how tall the specimen is when planted, or clear its price.'
+            elif sh <= 0 or (planting is not None and sh <= planting):
+                errors['specimen_height'] = 'Should be taller than the standard plant at planting.'
+            elif mature is not None and sh >= mature:
+                errors['specimen_height'] = 'Should be shorter than when it is fully grown.'
         if errors:
             raise serializers.ValidationError(errors)
         return attrs
@@ -304,17 +331,23 @@ class GardenDesignSerializer(serializers.ModelSerializer):
     # Booked designs are locked (design_lock.py): the Studio offers "save as a new design" instead
     locked = serializers.SerializerMethodField()
     locked_for = serializers.SerializerMethodField()
+    # The design card's picture (design_preview.py); set only through POST /designs/:id/preview/
+    preview_url = serializers.SerializerMethodField()
 
     class Meta:
         model = GardenDesign
         fields = ['id', 'name', 'original_image_url', 'reference_image_url',
                   'depth_data', 'placed_items', 'plant_breakdown', 'dimensions', 'total_cost',
                   'cost_estimate', 'terrain_height', 'time_of_day', 'status',
-                  'locked', 'locked_for', 'created_at', 'updated_at']
-        read_only_fields = ['id', 'created_at', 'updated_at']
+                  'locked', 'locked_for', 'revision', 'preview_url', 'preview_revision', 'created_at', 'updated_at']
+        read_only_fields = ['id', 'revision', 'preview_revision', 'created_at', 'updated_at']
 
     def get_locked(self, obj):
         return _design_locked(obj)
+
+    def get_preview_url(self, obj):
+        from .design_preview import preview_url
+        return preview_url(obj, self.context.get('request'))
 
     def get_locked_for(self, obj):
         if not _design_locked(obj):
@@ -327,13 +360,19 @@ class GardenDesignListSerializer(serializers.ModelSerializer):
     """Lighter serializer for list views (no placed_items blob)."""
     customer_name = serializers.SerializerMethodField()
     locked = serializers.SerializerMethodField()
+    preview_url = serializers.SerializerMethodField()
 
     class Meta:
         model = GardenDesign
-        fields = ['id', 'name', 'total_cost', 'status', 'created_at', 'updated_at', 'dimensions', 'original_image_url', 'reference_image_url', 'customer_name', 'locked']
+        fields = ['id', 'name', 'total_cost', 'status', 'created_at', 'updated_at', 'dimensions', 'original_image_url', 'reference_image_url', 'customer_name', 'locked',
+                  'revision', 'preview_url', 'preview_revision']
 
     def get_locked(self, obj):
         return _design_locked(obj)
+
+    def get_preview_url(self, obj):
+        from .design_preview import preview_url
+        return preview_url(obj, self.context.get('request'))
 
     def get_customer_name(self, obj):
         if obj.user:

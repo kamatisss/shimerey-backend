@@ -232,9 +232,10 @@ def create_portfolio_draft(booking, user=None):
         )
         PortfolioConsent.objects.create(project=project, customer=booking.user)
         import_progress_media(project)
-        notifications.notify([booking.user], 'booking_finished', (
-            f"Your {label.lower()} project is complete! We'd love to feature your garden in our "
-            f"project portfolio — open My Bookings to choose your privacy options."
+        # The "project complete" message itself is sent on sign-off (notifications.booking_status_changed)
+        notifications.notify([booking.user], 'portfolio_consent', (
+            f"We'd love to feature your garden ({label.lower()}) in our project portfolio. "
+            f"Open My Bookings to choose your privacy options."
         ), link=notifications.MY_BOOKINGS)
     return project
 

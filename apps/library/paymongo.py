@@ -163,9 +163,11 @@ def mark_order_paid(order, payment):
             logger.error('PayMongo payment %s for order #%s is short: %s < %s centavos',
                          payment.get('id'), order.id, amount, _centavos(order.total_price))
             return order
-        if order.payment_status == 'Expired':
-            # Paid at the last second after we released the stock: keep the money, flag it for staff
-            logger.error('Order #%s was paid after it expired; stock must be re-checked by staff.', order.id)
+        # Paid at the last second after the order expired or the customer cancelled it, so its stock
+        # was already released: keep the money, flag it for staff
+        paid_after_expiry = order.payment_status == 'Expired' or order.status == 'Cancelled'
+        if paid_after_expiry:
+            logger.error('Order #%s was paid after it expired or was cancelled; stock must be re-checked by staff.', order.id)
         order.payment_status = 'Paid'
         order.paymongo_payment_id = payment.get('id', '')
         order.paid_at = timezone.now()
@@ -173,6 +175,9 @@ def mark_order_paid(order, payment):
             order.status = 'Paid'
         order.save(update_fields=['payment_status', 'paymongo_payment_id', 'paid_at', 'status'])
         notifications.order_new(order)   # online orders reach the office once they are paid
+        notifications.order_paid(order)
+        if paid_after_expiry:
+            notifications.order_late_payment(order)
     return order
 
 
@@ -225,7 +230,7 @@ def mark_project_request_paid(req, payment):
                     f"(balance ₱{tracker.remaining_balance:,.2f}, PayMongo {req.paymongo_payment_id})"
                     + (f" — ₱{over:,.2f} over the balance: refund or credit it" if over > 0 else ''),
         )
-        notifications.payment_received(req)
+        notifications.payment_received(req, balance=tracker.remaining_balance)
     return req
 
 
@@ -280,6 +285,7 @@ def expire_unpaid_online_orders():
             locked.status = 'Cancelled'
             locked.payment_status = 'Expired'
             locked.save(update_fields=['status', 'payment_status'])
+            notifications.order_expired(locked, settings.PAYMONGO_ORDER_TTL_MINUTES)
             expired += 1
     return expired
 

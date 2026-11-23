@@ -9,10 +9,11 @@ from .cart import my_cart
 from .share import design_share, shared_design
 from .proposal import design_proposal
 from .crew_location import arrived, live_locations, report_location
+from .crew_sync import crew_sync
 from .analytics import income_analytics
 from .portfolio import BusinessCredentialViewSet, PortfolioViewSet
 from .funnel import funnel_summary, record_funnel_event
-from .garden_ai import ai_designer_health, layout_place, layout_review, scan_zones
+from .garden_ai import ai_designer_health, layout_place, layout_review, photo_objects, scan_zones
 from . import push
 from .overview import business_overview
 from .reports import balances, crew_output, customer_areas, money_in
@@ -66,10 +67,12 @@ urlpatterns = [
     path('crew-location/', report_location, name='crew-location'),
     path('crew-location/live/', live_locations, name='crew-location-live'),
     path('crew-location/arrived/', arrived, name='crew-arrived'),
+    path('crew-sync/', crew_sync, name='crew-sync'),
     path('generate-depth/', generate_depth, name='generate-depth'),
     path('generate-layouts/', GenerateLayoutsView.as_view(), name='generate-layouts'),
     path('sun-map/', sun_map_view, name='sun-map'),   # Mark your yard → Show sun & shade
     path('scan-zones/', scan_zones, name='scan-zones'),
+    path('photo-objects/', photo_objects, name='photo-objects'),
     path('layout-review/', layout_review, name='layout-review'),
     path('layout-place/', layout_place, name='layout-place'),
     path('pricing/', pricing_settings, name='pricing'),

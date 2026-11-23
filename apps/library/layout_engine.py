@@ -26,6 +26,7 @@ Every layout this module returns satisfies, by construction and by repair:
 """
 import math
 import random
+import time
 from dataclasses import dataclass, replace
 
 from . import lot_shape, sun_map
@@ -2310,8 +2311,10 @@ def review(plants, specs, site, plan=None):
     Soft notes on a customer-edited layout: the same rules check() enforces on the engine's own designs,
     worded for the customer. Never blocks anything: the design is theirs.
     plants: [{plant_id, x, z, ...}] (is_existing markers are skipped). Returns
-    [{'kind', 'items': [index, ...], 'message'}]; kinds: spacing, lawn, path, forward, walkway, keep_clear, edge,
-    house, view, sun, outside.
+    [{'kind', 'items': [index, ...], 'message', 'short': {index: headline}, 'advice'?}]; kinds: spacing, lawn, path,
+    forward, walkway, keep_clear, edge, house, view, sun, outside. `message` is the whole note (the Designer's notes
+    list); `short` is a few words per item, from that item's side ("Too close to the Livistona palm: 3.1 m apart,
+    needs 3.5 m"), for the plant's own details panel; `advice` (spacing) is the why, without the numbers again.
     """
     plan = plan or GardenPlan()
     by_id = {s.id: s for s in specs}
@@ -2319,60 +2322,119 @@ def review(plants, specs, site, plan=None):
     placed = [(i, p, s) for i, p, s in placed if s is not None]
     path = seat_path([p for _, p, s in placed if s.kind == 'seat'], site)
     notes = []
+
+    def add(kind, i, short, message):
+        notes.append({'kind': kind, 'items': [i], 'message': message, 'short': {i: short}})
+
     for n, (i, p, spec) in enumerate(placed):
         x, z = float(p['x']), float(p['z'])
         # Seats belong on the lawn and set the walkway, so only their room and the edges apply to them
         if plan.on_walk(spec, x, z):
-            notes.append({'kind': 'path', 'items': [i], 'message':
-                          f'{spec.name} is on the path from your gate or door. It is kept clear for walking.'})
+            add('path', i, 'On the path from your gate or door',
+                f'{spec.name} is on the path from your gate or door. It is kept clear for walking.')
         elif plan.blocks(spec, x, z):
-            notes.append({'kind': 'lawn', 'items': [i], 'message':
-                          f'{spec.name} is on the open lawn. The lawn is kept clear for walking and sitting, '
-                          'with the planting in the beds around it.'})
+            add('lawn', i, 'On the open lawn',
+                f'{spec.name} is on the open lawn. The lawn is kept clear for walking and sitting, '
+                'with the planting in the beds around it.')
         elif too_far_forward(spec, site, z, plan):
-            notes.append({'kind': 'forward', 'items': [i], 'message':
-                          f'{spec.name} grows to about {_m(spec.grown)}. This far forward it will block the view '
-                          'from the house: tall plants go at the back.'})
+            add('forward', i, f'Too tall this far forward (grows to {_m(spec.grown)})',
+                f'{spec.name} grows to about {_m(spec.grown)}. This far forward it will block the view '
+                'from the house: tall plants go at the back.')
         if on_path(path, spec, x, z):
-            notes.append({'kind': 'walkway', 'items': [i], 'message': f'{spec.name} is on the walkway to the seating.'})
+            add('walkway', i, 'On the walkway to the seating', f'{spec.name} is on the walkway to the seating.')
         if not site.is_clear(spec, x, z):
-            notes.append({'kind': 'keep_clear', 'items': [i], 'message':
-                          f'{spec.name} is in an area you asked us to keep clear.'})
+            add('keep_clear', i, 'In an area you asked us to keep clear',
+                f'{spec.name} is in an area you asked us to keep clear.')
         if not site.inside(x, z):
-            notes.append({'kind': 'outside', 'items': [i], 'message':
-                          f'{spec.name} is outside your yard. Move it inside the outline.'})
+            add('outside', i, 'Outside your yard', f'{spec.name} is outside your yard. Move it inside the outline.')
         elif not site.in_bounds(spec, x, z):
-            notes.append({'kind': 'edge', 'items': [i], 'message':
-                          f'{spec.name} is close to the edge of the lot: when grown it will spread over the boundary.'})
+            add('edge', i, 'Will spread over the boundary',
+                f'{spec.name} is close to the edge of the lot: when grown it will spread over the boundary.')
         if site.near_house(spec, x, z):
-            notes.append({'kind': 'house', 'items': [i], 'message':
-                          f'{spec.name} is very close to the house. Keep plants about {_m(HOUSE_SETBACK)} from the wall '
-                          'for drainage, termites and room to work.'})
+            add('house', i, f'Too close to the house (keep {_m(HOUSE_SETBACK)} away)',
+                f'{spec.name} is very close to the house. Keep plants about {_m(HOUSE_SETBACK)} from the wall '
+                'for drainage, termites and room to work.')
         if not sun_suits(spec, x, z, site, [p for _, p, _ in placed], by_id):
             hours = site.sun_hours(x, z)
             need = {'full_sun': f'at least {sun_map.SUN_PLANT_MIN:g} hours of sun',
                     'full_shade': 'shade (or the shelter of a tree)',
                     'partial_shade': f'at least {sun_map.PART_PLANT_MIN:g} hours of sun'}[spec.sunlight]
-            notes.append({'kind': 'sun', 'items': [i], 'message':
-                          f'{spec.name} needs {need}; this spot gets about {hours:.1f} hours of direct sun a day.'})
+            add('sun', i, (f'Too much sun here (about {hours:.1f} h a day)' if spec.sunlight == 'full_shade'
+                           else f'Not enough sun here (about {hours:.1f} h a day)'),
+                f'{spec.name} needs {need}; this spot gets about {hours:.1f} hours of direct sun a day.')
         if site.blocks_view(spec, x, z):
-            notes.append({'kind': 'view', 'items': [i], 'message':
-                          f'{spec.name} grows to about {_m(spec.grown)}: it will block the view you wanted to keep. '
-                          'Only low plants go there.'})
+            add('view', i, 'Blocks the view you wanted to keep',
+                f'{spec.name} grows to about {_m(spec.grown)}: it will block the view you wanted to keep. '
+                'Only low plants go there.')
         for j, q, other in placed[n + 1:]:
             need = min_distance(spec, other)
             d = math.hypot(x - float(q['x']), z - float(q['z']))
             if d < need - 0.05:   # a few cm of slack: the customer is dragging by hand
                 both = spec.is_plant and other.is_plant
                 pair = f'Two {spec.name} plants are' if spec.id == other.id else f'{spec.name} and {other.name} are'
+                gap = f'{_m(d)} apart, needs {_m(need)}'
+                near = (lambda me, them: f'Too close to another {them.name}: {gap}' if me.id == them.id
+                        else f'Too close to the {them.name}: {gap}')
                 notes.append({'kind': 'spacing', 'items': [i, j], 'message':
                               f'{pair} {_m(d)} apart; they need about {_m(need)}'
                               + (' so they don\'t crowd each other when fully grown.' if both else '.')
-                              + _why_apart(spec, other)})
+                              + _why_apart(spec, other),
+                              'short': {i: near(spec, other), j: near(other, spec)},
+                              'advice': (("They'd crowd each other when fully grown. " if both else '')
+                                         + _why_apart(spec, other).strip()).strip()})
     return notes
 
 
-def tidy(plants, specs, site, plan=None):
+FIT_REACH = 3.0      # m: the fine search's least reach (tidy)
+FIT_BUDGET_S = 1.5   # s: and its most time
+
+
+def _nearest_fit(layout, spec, x, z):
+    """Last resort for tidy in a tightly packed garden: the nearest spot on a fine grid where the item fits.
+    find_spot walks outward in rings about a third of the item's spacing apart, so it can step over a spot that
+    only just fits (an engine design packs plants at exactly their minimum distances: a palm dragged out of its
+    place found no spot at all, its own old one included). A 5 cm grid (coarser on big lots) finds those.
+    Only within reach (twice its spacing, at least 3 m: a short move, which is what tidy promises) and within a
+    time budget, so a garden with no room anywhere answers "no room" in about a second, not half a minute."""
+    site = layout.site
+    reach = max(FIT_REACH, 2 * spec.spacing)
+    deadline = time.monotonic() + FIT_BUDGET_S
+    step = max(0.05, max(site.width, site.length) / 400)
+    nx, nz = int(site.width / step), int(site.length / step)
+    gx0, gz0 = round(x / step), round(z / step)
+
+    need = {}   # min_distance per neighbour kind: a handful of kinds, thousands of checks
+
+    def spaced(cx, cz):   # the cheap rule first (most spots in a crowd fail it); fits() checks everything
+        kx, kz = layout._key(cx, cz)
+        for dx in (-1, 0, 1):
+            for dz in (-1, 0, 1):
+                for p in layout.buckets.get((kx + dx, kz + dz), ()):
+                    pid = p['plant_id']
+                    if pid not in need:
+                        need[pid] = min_distance(spec, layout.specs[pid]) - 1e-6
+                    if math.hypot(p['x'] - cx, p['z'] - cz) < need[pid]:
+                        return False
+        return True
+
+    best = None
+    for k in range(min(max(nx, nz) + 2, int(reach / step) + 2)):   # square rings outward, nearest first
+        if best is not None and (k - 1) * step > math.sqrt(best[0]):
+            break   # no ring from here on can be nearer than the best
+        if time.monotonic() > deadline:
+            break
+        for gx in range(gx0 - k, gx0 + k + 1):
+            for gz in (range(gz0 - k, gz0 + k + 1) if abs(gx - gx0) == k else (gz0 - k, gz0 + k)):
+                if not (0 <= gx <= nx and 0 <= gz <= nz):
+                    continue
+                cx, cz = gx * step, gz * step
+                d = (cx - x) ** 2 + (cz - z) ** 2
+                if (best is None or d < best[0]) and spaced(cx, cz) and layout.fits(spec, cx, cz):
+                    best = (d, cx, cz)
+    return (_r(best[1]), _r(best[2])) if best else None
+
+
+def tidy(plants, specs, site, plan=None, only=None):
     """
     "Tidy up" for a customer-edited layout: move as few items as possible, each the shortest distance
     that satisfies the rules, keeping everything they chose (nothing added, swapped or removed).
@@ -2381,6 +2443,8 @@ def tidy(plants, specs, site, plan=None):
        note is left among the rest. Seats never move: they set the walkway.
     2. Everything else stays exactly where it is; the culprits, tallest first, go to the nearest
        spot that fits (anywhere when on the lawn or tall at the front); with no room, they stay put.
+    only: a set of indexes to fix and nothing else ("Move apart" on one plant): just those move, the shortest
+    distance, around everything else as it stands (a neighbour that is the "real" culprit stays too).
     Returns (positions, notes): positions = {index: (x, z)} for the items that moved.
     """
     plan = plan or GardenPlan()
@@ -2392,6 +2456,9 @@ def tidy(plants, specs, site, plan=None):
     open_notes = [set(n['items']) & movable for n in review(plants, specs, site, plan)]
     open_notes = [n for n in open_notes if n]   # a seat's own problem can't be fixed by moving plants
     culprits = []
+    if only is not None:
+        culprits = [i for i in sorted(only) if i in movable and any(i in n for n in open_notes)]
+        open_notes = []
     while open_notes:
         count = {}
         for n in open_notes:
@@ -2415,6 +2482,8 @@ def tidy(plants, specs, site, plan=None):
             # On the lawn or (tall) at the front: the nearest bed, wherever it is
             spot = layout.find_spot(spec, x, min(z, tall_limit(site, plan)) if spec.layer == 'tall' else z,
                                     max_radius=far, rng=rng)
+        if spot is None and not layout.full():
+            spot = _nearest_fit(layout, spec, x, z)
         if spot is None:
             stuck += 1
             layout.add(spec, x, z, 0)   # no room anywhere: left where they put it (the note stays)
@@ -2423,6 +2492,16 @@ def tidy(plants, specs, site, plan=None):
         layout.add(spec, *spot, 0)
 
     notes = []
+    if only is not None:
+        for i, (x, z) in moved.items():
+            p, spec = items[i]
+            far_m = math.hypot(x - float(p['x']), z - float(p['z']))
+            notes.append(f'Moved {spec.name} {_m(far_m)}: it now has room to grow. Undo puts it back.')
+        if stuck:
+            notes.append('No room nearby: removing or swapping a plant next to it would help.')
+        if not moved and not stuck:
+            notes.append('It already has room: nothing to move.')
+        return moved, notes
     if moved:
         n = len(moved)
         notes.append(f"Moved {n} item{'s' if n > 1 else ''} the shortest distance that gives "

@@ -141,6 +141,17 @@ class GenerateLayoutsViewTests(APITestCase):
         self.assertEqual(r.data['ai_status'], 'disabled')
         mock_client_class.assert_not_called()
 
+    @patch.dict(os.environ, {'GEMINI_API_KEY': 'test_api_key'})
+    @patch('google.genai.Client')
+    def test_example_yard_uses_the_engine_only(self, mock_client_class):
+        # "Try an example yard": three engine designs, no Gemini call, so the customer's daily AI designs stay unused
+        r = self.client.post(self.url, {**self.valid, 'example': '1'}, format='json')
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.data['ai_status'], 'disabled')
+        self.assertEqual(len(r.data['designs']), 3)
+        self.assertTrue(all(d['source'] == 'engine' for d in r.data['designs']))
+        mock_client_class.assert_not_called()
+
     # ── quotas ───────────────────────────────────────────────────────────────
     @patch.dict(os.environ, {'GEMINI_API_KEY': 'test_api_key'})
     @patch('google.genai.Client')
@@ -816,6 +827,64 @@ class CustomerEditReviewTests(APITestCase):
         self.assertIn('root barrier', spacing[0]['message'])
         self.assertIn('1 m apart', spacing[0]['message'])
 
+    def test_notes_have_a_short_headline_for_each_plant(self):
+        """The plant's details panel shows a few words from that plant's side, then the reason."""
+        from apps.library import layout_engine as E
+        croton = E.PlantSpec('croton', 'Croton', 300, 9, 1.0, E.spacing_for(1.8), mature=1.8)
+        bamboo = E.PlantSpec('bamboo', 'Bamboo', 800, 9, 5.0, E.spacing_for(8.0), is_invasive=True, mature=8.0)
+        plan = E.GardenPlan(lawn=('rect', 3.0, 7.0, 3.0, 7.0))
+        notes = E.review([{'plant_id': 'croton', 'x': 9.0, 'z': 1.2}, {'plant_id': 'bamboo', 'x': 9.0, 'z': 2.2}],
+                         [croton, bamboo], E.Site(10, 10), plan)
+        spacing = next(n for n in notes if n['kind'] == 'spacing')
+        self.assertTrue(spacing['short'][0].startswith('Too close to the Bamboo: 1 m apart, needs'), spacing['short'])
+        self.assertTrue(spacing['short'][1].startswith('Too close to the Croton: 1 m apart, needs'), spacing['short'])
+        self.assertIn('root barrier', spacing['advice'])
+        self.assertNotIn('apart', spacing['advice'])          # the numbers are in the headline, not repeated
+        lawn = E.review([{'plant_id': 'croton', 'x': 5, 'z': 5}], [croton], E.Site(10, 10), plan)
+        self.assertEqual(lawn[0]['short'], {0: 'On the open lawn'})
+        twins = E.review([{'plant_id': 'croton', 'x': 9, 'z': 1}, {'plant_id': 'croton', 'x': 9, 'z': 1.2}], [croton], E.Site(10, 10), plan)
+        self.assertTrue(twins[0]['short'][0].startswith('Too close to another Croton'))
+
+    def test_tidy_one_plant_moves_only_that_plant(self):
+        """"Move apart" on one plant: it moves the shortest distance, nothing else does."""
+        from apps.library import layout_engine as E
+        croton = E.PlantSpec('croton', 'Croton', 300, 99, 1.0, E.spacing_for(1.8), mature=1.8)
+        geranium = E.PlantSpec('ger', 'Geranium', 80, 99, 0.4, E.spacing_for(0.5), mature=0.5)
+        site = E.Site(10, 10)
+        plan = E.GardenPlan(lawn=('rect', 2.5, 7.5, 2.5, 7.5))
+        edited = [{'plant_id': 'ger', 'x': 9.2, 'z': 3.0 + 0.8 * k} for k in range(6)] + [{'plant_id': 'croton', 'x': 9.1, 'z': 4.2}]
+        specs = [croton, geranium]
+        moved, notes = E.tidy(edited, specs, site, plan, only={6})
+        self.assertEqual(list(moved), [6])
+        self.assertTrue(notes[0].startswith('Moved Croton '), notes)
+        after = [dict(p) for p in edited]
+        after[6].update(x=moved[6][0], z=moved[6][1])
+        self.assertFalse(any(6 in n['items'] for n in E.review(after, specs, site, plan)))
+        # A geranium next to the croton: only that geranium may move, the croton stays where they put it
+        moved, _ = E.tidy(edited, specs, site, plan, only={1})
+        self.assertLessEqual(set(moved), {1})
+        # A plant with nothing wrong: nothing moves
+        moved, notes = E.tidy(after, specs, site, plan, only={0})
+        self.assertEqual(moved, {})
+        self.assertEqual(notes, ['It already has room: nothing to move.'])
+
+    def test_tidy_finds_a_tight_spot_the_ring_search_steps_over(self):
+        """Browser finding 2026-11-22: in a packed engine design a palm dragged out of place found no spot at all
+        (its old one only just fits); tidy now falls back to a fine search of the whole yard."""
+        from unittest.mock import patch
+        from apps.library import layout_engine as E
+        croton = E.PlantSpec('croton', 'Croton', 300, 99, 1.0, E.spacing_for(1.8), mature=1.8)
+        geranium = E.PlantSpec('ger', 'Geranium', 80, 99, 0.4, E.spacing_for(0.5), mature=0.5)
+        site, plan = E.Site(10, 10), E.GardenPlan(lawn=('rect', 2.5, 7.5, 2.5, 7.5))
+        edited = [{'plant_id': 'ger', 'x': 9.2, 'z': 3.0 + 0.8 * k} for k in range(6)] + [{'plant_id': 'croton', 'x': 9.1, 'z': 4.2}]
+        with patch.object(E.Layout, 'find_spot', return_value=None):   # the coarse search misses everything
+            moved, notes = E.tidy(edited, [croton, geranium], site, plan, only={6})
+        self.assertEqual(list(moved), [6], notes)
+        after = [dict(p) for p in edited]
+        after[6].update(x=moved[6][0], z=moved[6][1])
+        self.assertFalse(any(6 in n['items'] for n in E.review(after, [croton, geranium], site, plan)))
+        self.assertLess(((moved[6][0] - 9.1) ** 2 + (moved[6][1] - 4.2) ** 2) ** 0.5, 3.0)   # near, not anywhere
+
     def test_review_endpoint_notes_and_tidy(self):
         from apps.library.models import InventoryItem
         palm = InventoryItem.objects.create(name='Christmas Palm', category='plant', unit_price=900, stock_quantity=5,
@@ -840,6 +909,18 @@ class CustomerEditReviewTests(APITestCase):
         self.assertEqual({m['uid'] for m in tidy.data['moves']}, {'p1', 'p2'})   # the palm (tallest, fine) stays
         self.assertEqual(tidy.data['notes'], [])
         self.assertTrue(tidy.data['tidy_notes'][0].startswith('Moved 2 items'))
+        # "Move apart" on one plant (its uid): only that one moves; the headlines come per uid
+        self.assertEqual(by_kind['spacing']['short_by_uid'], {
+            'p0': by_kind['spacing']['short_by_uid']['p0'], 'p1': by_kind['spacing']['short_by_uid']['p1']})
+        self.assertTrue(by_kind['spacing']['short_by_uid']['p1'].startswith('Too close to the Christmas Palm'))
+        self.assertNotIn('short', by_kind['spacing'])
+        one = self.client.post('/api/layout-review/', {**body, 'tidy_uid': 'p1'}, format='json')
+        self.assertEqual(one.status_code, 200, one.data)
+        self.assertEqual([m['uid'] for m in one.data['moves']], ['p1'])
+        self.assertTrue(one.data['tidy_notes'][0].startswith('Moved Croton'))
+        self.assertEqual([n['kind'] for n in one.data['notes']], ['lawn'])   # p2 on the lawn was left alone
+        gone = self.client.post('/api/layout-review/', {**body, 'tidy_uid': 'nope'}, format='json')
+        self.assertEqual((gone.data['moves'], gone.data['tidy_notes']), ([], ['That plant is no longer in this design.']))
         for bad in ({**body, 'plants': 'x'}, {**body, 'lot_width': 0}, {**body, 'plants': [{'plant_id': 'a', 'x': 1, 'z': 1}]},
                     {**body, 'plants': [{'plant_id': palm.id, 'x': 'nan', 'z': 1}]}):
             self.assertEqual(self.client.post('/api/layout-review/', bad, format='json').status_code, 400, bad)
@@ -1907,6 +1988,11 @@ class PayMongoTests(APITestCase):
         self.assertEqual(self.client.delete(f"/api/orders/{first['order_id']}/").status_code, 204)
         self.plant.refresh_from_db()
         self.assertEqual(self.plant.stock_quantity, 8)
+        # Kept as Cancelled, not deleted: it stays in the history and the reports
+        self.assertEqual(Order.objects.get(pk=first['order_id']).status, 'Cancelled')
+        self.assertEqual(self.client.delete(f"/api/orders/{first['order_id']}/").status_code, 400)   # once only
+        self.plant.refresh_from_db()
+        self.assertEqual(self.plant.stock_quantity, 8)                     # stock not returned twice
         Order.objects.filter(pk=second['order_id']).update(payment_status='Paid')
         self.assertEqual(self.client.delete(f"/api/orders/{second['order_id']}/").status_code, 400)
 
@@ -2061,6 +2147,29 @@ class PricingTests(APITestCase):
         self.bench = InventoryItem.objects.create(name='Bench', category='furniture', unit_price=3000, stock_quantity=3)
         self.admin = User.objects.create_user(username='office', password='pw', is_staff=True)
         StaffProfile.objects.create(user=self.admin, role='OFFICE_ADMIN')
+
+    def test_specimen_size_is_its_own_line(self):
+        """A specimen-size plant (bigger stock): its own price and line, labour by its bigger size, installed only."""
+        self.fern.specimen_price, self.fern.specimen_height = 400, 1.5
+        self.fern.save()
+        items = [{'product_id': self.fern.id, 'quantity': 3}, {'product_id': self.fern.id, 'quantity': 1, 'size': 'specimen'}]
+        r = self.client.post('/api/pricing/estimate/', {'area_sqm': 50, 'items': items}, format='json')
+        self.assertEqual(r.status_code, 200, r.data)
+        lines = {l['key']: l['amount'] for l in r.data['lines']}
+        self.assertEqual(lines['plants'], 3 * 100 + 400)
+        self.assertEqual(lines['labour'], 3 * 40 + 120)   # the 1.5 m specimen is planted at the mid rate
+        rows = {(row['name'], row.get('size', '')): row for row in r.data['plant_breakdown']}
+        self.assertEqual(rows[('Fern', '')]['quantity'], 3)
+        self.assertEqual(rows[('Fern — specimen size', 'specimen')]['unit_price'], 400)
+        # Plants only: specimens are planted by our crew, so all are the standard size
+        r = self.client.post('/api/pricing/estimate/', {'area_sqm': 50, 'items': items, 'install': False}, format='json')
+        self.assertEqual(r.data['plant_cost'], 4 * 100)
+        self.assertEqual([row['quantity'] for row in r.data['plant_breakdown']], [4])
+        # A plant that doesn't offer the size: priced as standard
+        r = self.client.post('/api/pricing/estimate/', {'area_sqm': 50, 'items': [
+            {'product_id': self.palm.id, 'quantity': 1, 'size': 'specimen'}]}, format='json')
+        self.assertEqual(r.data['plant_cost'], 1000)
+        self.assertNotIn('size', r.data['plant_breakdown'][0])
 
     def test_estimate_lines_with_sample_rates(self):
         r = self.client.post('/api/pricing/estimate/', {'area_sqm': 50, 'items': [
@@ -2511,6 +2620,41 @@ class InventoryUploadTests(APITestCase):
         self.assertEqual(r.status_code, 200, r.data)
         self.assertIsNone(r.data['mature_height'])
 
+    def test_specimen_size_is_checked(self):
+        """Specimen price and planted height: both or neither, dearer than standard, between planting and grown."""
+        self._as(self.office)
+        self.item.planting_height, self.item.real_world_size, self.item.mature_height = 0.4, 1.0, 2.0
+        self.item.save()
+        patch = lambda data: self.client.patch(self.url, data, format='json')  # noqa: E731
+        ok = patch({'specimen_price': '1200', 'specimen_height': 1.2})
+        self.assertEqual(ok.status_code, 200, ok.data)
+        self.assertEqual((float(ok.data['specimen_price']), ok.data['specimen_height']), (1200.0, 1.2))
+        self.assertIn('specimen_price', patch({'specimen_price': '400', 'specimen_height': 1.2}).data)    # cheaper than ₱500
+        self.assertIn('specimen_height', patch({'specimen_price': '900', 'specimen_height': 0.3}).data)   # not bigger
+        self.assertIn('specimen_height', patch({'specimen_price': '900', 'specimen_height': 2.5}).data)   # past grown
+        self.assertIn('specimen_height', patch({'specimen_price': '900', 'specimen_height': None}).data)  # price alone
+        cleared = patch({'specimen_price': None, 'specimen_height': None})
+        self.assertEqual(cleared.status_code, 200, cleared.data)
+        self.assertIsNone(cleared.data['specimen_price'])
+        r = patch({'category': 'furniture', 'specimen_price': '900', 'specimen_height': 1.2})
+        self.assertEqual(r.status_code, 200, r.data)
+        self.assertIsNone(r.data['specimen_price'])
+
+    def test_years_to_mature_is_checked(self):
+        """Years after planting until fully grown (the 3D "Fully grown" card): 1–60, empty = unknown, plants only."""
+        self._as(self.office)
+        ok = self.client.patch(self.url, {'years_to_mature': '12'}, format='multipart')
+        self.assertEqual(ok.status_code, 200, ok.data)
+        self.assertEqual(ok.data['years_to_mature'], 12)
+        cleared = self.client.patch(self.url, {'years_to_mature': ''}, format='multipart')
+        self.assertEqual(cleared.status_code, 200, cleared.data)
+        self.assertIsNone(cleared.data['years_to_mature'])
+        self.assertEqual(self.client.patch(self.url, {'years_to_mature': 0}, format='json').status_code, 400)
+        self.assertEqual(self.client.patch(self.url, {'years_to_mature': 61}, format='json').status_code, 400)
+        r = self.client.patch(self.url, {'category': 'furniture', 'years_to_mature': 5}, format='json')
+        self.assertEqual(r.status_code, 200, r.data)
+        self.assertIsNone(r.data['years_to_mature'])
+
     def test_growth_spreads_are_checked(self):
         """Widths at planting / ~2 years / fully grown (the 3D growth view widens plants at their own pace)."""
         self._as(self.office)
@@ -2598,7 +2742,8 @@ class NotificationTests(APITestCase):
         self.assertEqual(n.count, 2)
         self.assertIn('2 new orders', n.message)
         self.assertIn(f'#{second}', n.message)
-        self.assertEqual(self._notes(self.customer), [])   # the buyer is not told about their own order
+        # The buyer gets their own confirmation: in the bell and by email to the checkout address
+        self.assertEqual(len(self._notes(self.customer, 'order_placed')), 2)
 
     def test_online_order_reaches_the_office_only_once_paid(self):
         from apps.library import paymongo
@@ -2696,6 +2841,155 @@ class NotificationTests(APITestCase):
         self.assertIn('650.00 cash', n.message)
         self.assertEqual(n.link, '/my-orders')
 
+    # ── The customer side: every step of an order or booking reaches the buyer ──
+
+    def test_cod_order_confirms_to_the_buyer_by_bell_and_email(self):
+        from django.core import mail
+        from apps.library.models import Order
+        order_id = self._cod_order()
+        [n] = self._notes(self.customer, 'order_placed')
+        self.assertIn(f'#{order_id}', n.message)
+        self.assertIn('cash on delivery', n.message)
+        self.assertEqual(n.link, '/my-orders')
+        [email] = [m for m in mail.outbox if m.to == ['m@example.com']]   # the address typed at checkout
+        self.assertIn(f'Order received (order #{order_id})', email.subject)
+        token = Order.objects.get(pk=order_id).receipt_token
+        self.assertIn(f'/order-success?order_id={order_id}&token={token}', email.body)
+
+    def test_paid_online_order_confirms_to_a_guest_by_email(self):
+        from django.core import mail
+        from apps.library import paymongo
+        from apps.library.models import Order
+        order = Order.objects.create(customer_name='Guest', customer_email='guest@example.com', total_price=650,
+                                     payment_method='online', receipt_token='tok123')
+        with self.captureOnCommitCallbacks(execute=True):
+            paymongo.mark_order_paid(order, {'id': 'pay_1', 'attributes': {'amount': 65000}})
+            paymongo.mark_order_paid(order, {'id': 'pay_1', 'attributes': {'amount': 65000}})   # webhook + sync
+        guest_mail = [m for m in mail.outbox if m.to == ['guest@example.com']]
+        self.assertEqual(len(guest_mail), 1)
+        self.assertIn('Payment received', guest_mail[0].subject)
+        self.assertIn(f'order_id={order.id}&token=tok123', guest_mail[0].body)
+
+    def test_online_order_paid_after_expiry_warns_the_office(self):
+        from apps.library import paymongo
+        from apps.library.models import Order
+        order = Order.objects.create(user=self.customer, customer_name='Maria', customer_email='m@example.com',
+                                     total_price=650, payment_method='online', status='Cancelled', payment_status='Expired')
+        paymongo.mark_order_paid(order, {'id': 'pay_1', 'attributes': {'amount': 65000}})
+        [n] = self._notes(self.office, 'order_late_payment')
+        self.assertIn('Check the stock', n.message)
+        self.assertEqual(len(self._notes(self.customer, 'order_paid')), 1)
+
+    def test_expired_online_order_tells_the_buyer(self):
+        import datetime
+        from django.utils import timezone
+        from apps.library import paymongo
+        from apps.library.models import Order
+        order = Order.objects.create(user=self.customer, customer_name='Maria', customer_email='m@example.com',
+                                     total_price=650, payment_method='online')
+        Order.objects.filter(pk=order.pk).update(created_at=timezone.now() - datetime.timedelta(days=1))
+        self.assertEqual(paymongo.expire_unpaid_online_orders(), 1)
+        [n] = self._notes(self.customer, 'order_expired')
+        self.assertIn('not charged', n.message)
+
+    def test_every_order_step_reaches_the_buyer_and_refund_is_confirmed(self):
+        from django.core import mail
+        from apps.library.models import Order
+        order = Order.objects.create(user=self.customer, customer_name='Maria', customer_email='m@example.com',
+                                     total_price=650, payment_method='online', status='Paid', payment_status='Paid')
+        self._as(self.office)
+        with self.captureOnCommitCallbacks(execute=True):
+            self.client.patch(f'/api/orders/{order.id}/update_status/', {'status': 'Shipped'}, format='json')
+        self.assertEqual(len(self._notes(self.customer, 'order_packed')), 1)
+        self.assertEqual(mail.outbox, [])                                  # packed: the bell only
+        with self.captureOnCommitCallbacks(execute=True):
+            self.client.patch(f'/api/orders/{order.id}/update_status/', {'status': 'Cancelled'}, format='json')
+            self.client.patch(f'/api/orders/{order.id}/update_status/', {'payment_status': 'Refunded'}, format='json')
+        [c] = self._notes(self.customer, 'order_cancelled')
+        self.assertIn('will be refunded', c.message)
+        [r] = self._notes(self.customer, 'order_refunded')
+        self.assertIn('650.00', r.message)
+        self.assertEqual([m.subject.split(':', 1)[1].strip() for m in mail.outbox],
+                         [f'Order cancelled (order #{order.id})', f'Refund sent (order #{order.id})'])
+
+    def test_customer_cancelling_a_cod_order_keeps_it_and_tells_the_office(self):
+        from apps.library.models import ActivityLog, Order
+        order_id = self._cod_order()
+        self._as(self.customer)
+        self.assertEqual(self.client.delete(f'/api/orders/{order_id}/').status_code, 204)
+        self.assertEqual(Order.objects.get(pk=order_id).status, 'Cancelled')
+        [n] = self._notes(self.office, 'order_withdrawn')
+        self.assertIn(f'#{order_id}', n.message)
+        self.assertIn("Don't pack it", n.message)
+        self.assertTrue(n.link.endswith(f'&open={order_id}'))              # the order still exists to open
+        log = ActivityLog.objects.get(action='order_cancelled')
+        self.assertEqual((log.actor, log.details['by_customer']), (self.customer, True))
+
+    def test_new_order_is_emailed_to_the_office_with_what_packing_needs(self):
+        from django.core import mail
+        order_id = self._cod_order()
+        [email] = [m for m in mail.outbox if m.to == ['office@example.com']]
+        self.assertIn(f'New order #{order_id}', email.subject)
+        self.assertIn('cash on delivery', email.subject)
+        self.assertIn('1 × Fern', email.body)
+        self.assertIn('Phone: 09171234567', email.body)
+        self.assertIn(f'/staff-dashboard?tab=orders&queue=all&q={order_id}&open={order_id}', email.body)
+        self.assertFalse([m for m in mail.outbox if m.to == ['jun@example.com']])   # crew are not emailed
+
+    def test_online_order_paid_after_the_customer_cancelled_warns_the_office(self):
+        from apps.library import paymongo
+        from apps.library.models import Order
+        order = Order.objects.create(user=self.customer, customer_name='Maria', customer_email='m@example.com',
+                                     total_price=650, payment_method='online')
+        self._as(self.customer)
+        self.assertEqual(self.client.delete(f'/api/orders/{order.id}/').status_code, 204)
+        self.assertEqual(self._notes(self.office, 'order_withdrawn'), [])   # unpaid online: the office never had it
+        paymongo.mark_order_paid(order, {'id': 'pay_1', 'attributes': {'amount': 65000}})
+        self.assertEqual(len(self._notes(self.office, 'order_late_payment')), 1)
+
+    def test_booking_request_is_acknowledged_to_the_customer(self):
+        self._as(self.customer)
+        r = self.client.post('/api/bookings/', {'service_type': 'maintenance', 'scheduled_date': '2026-12-01',
+                                                'address': QUEZON_ADDRESS}, format='json')
+        [n] = self._notes(self.customer, 'booking_received')
+        self.assertIn(f"#{r.data['id']}", n.message)
+
+    def test_customer_reschedule_and_address_change_reach_the_office_not_the_customer(self):
+        self._as(self.customer)
+        self.client.patch(f'/api/bookings/{self.booking.id}/', {'scheduled_date': '2026-11-27'}, format='json')
+        [n] = self._notes(self.office, 'booking_changed')
+        self.assertIn('Nov 27', n.message)
+        self.assertEqual(self._notes(self.customer, 'booking_rescheduled'), [])   # they made the change
+        self.client.patch(f'/api/bookings/{self.booking.id}/', {'address': QUEZON_ADDRESS}, format='json')
+        self.assertEqual(len(self._notes(self.office, 'booking_changed')), 2)
+
+    def test_sign_off_tells_the_customer_the_project_is_complete(self):
+        self.booking.status = 'For Review'
+        self.booking.save()
+        self._as(self.office)
+        self.client.patch(f'/api/bookings/{self.booking.id}/update_status/', {'status': 'Finished'}, format='json')
+        [n] = self._notes(self.customer, 'booking_finished')
+        self.assertIn('is complete', n.message)
+
+    def test_project_payments_give_the_customer_a_receipt(self):
+        from apps.library import paymongo
+        from apps.library.models import ProjectPaymentRequest, ProjectTracker
+        tracker = ProjectTracker.objects.create(booking=self.booking, total_price=50000, remaining_balance=50000)
+        self._as(self.office)
+        r = self.client.post(f'/api/projects/{tracker.id}/record-payment/', {'amount': '10000', 'method': 'cash'},
+                             format='json')
+        self.assertEqual(r.status_code, 200, r.data)
+        [n] = self._notes(self.customer, 'payment_receipt')
+        self.assertIn('₱10,000.00', n.message)
+        self.assertIn('Remaining balance: ₱40,000.00', n.message)
+        req = ProjectPaymentRequest.objects.create(project=tracker, label='Downpayment', amount=40000, token='t1')
+        paymongo.mark_project_request_paid(req, {'id': 'pay_2', 'attributes': {'amount': 4000000}})
+        latest = self._notes(self.customer, 'payment_receipt')[0]
+        self.assertIn('fully paid', latest.message)
+        req2 = ProjectPaymentRequest.objects.create(project=tracker, label='Extra', amount=100, token='t2')
+        self.client.post(f'/api/projects/{tracker.id}/payment-requests/{req2.id}/cancel/')
+        self.assertEqual(len(self._notes(self.customer, 'payment_request_withdrawn')), 1)
+
     def test_bell_api_is_paged_private_and_counts_unread(self):
         from apps.library.models import Notification
         for i in range(25):
@@ -2714,6 +3008,65 @@ class NotificationTests(APITestCase):
         self.assertEqual(self.client.patch(f'/api/notifications/{not_mine}/mark_read/').status_code, 404)
         self.client.post('/api/notifications/mark_all_read/')
         self.assertEqual(self.client.get('/api/notifications/unread_count/').data['unread'], 0)
+
+
+class AfterCommitTests(APITestCase):
+    """Emails and pushes must actually run on PythonAnywhere, whose uWSGI workers never run app threads."""
+
+    def setUp(self):
+        from apps.library import after_commit
+        after_commit._THREADS = None
+        self.addCleanup(setattr, after_commit, '_THREADS', None)
+
+    def _fake_uwsgi(self, **opt):
+        import sys, types
+        mod = types.ModuleType('uwsgi')
+        mod.opt = opt
+        return patch.dict(sys.modules, {'uwsgi': mod})
+
+    def test_threads_are_detected_per_server(self):
+        from apps.library.after_commit import threads_run_here
+        self.assertTrue(threads_run_here())                                   # no uWSGI: gunicorn / runserver
+        with self._fake_uwsgi(socket=b'/tmp/x'):
+            self.assertFalse(threads_run_here())                              # PythonAnywhere
+        with self._fake_uwsgi(**{'enable-threads': True}):
+            self.assertTrue(threads_run_here())
+        with self._fake_uwsgi(**{'threads': b'4'}):
+            self.assertTrue(threads_run_here())
+
+    @override_settings(NOTIFY_EMAIL_ASYNC=True)
+    def test_without_threads_the_work_runs_right_after_the_commit(self):
+        from apps.library.after_commit import run_after_commit
+        ran = []
+        with self._fake_uwsgi(socket=b'/tmp/x'), patch('threading.Thread') as thread:
+            with self.captureOnCommitCallbacks(execute=True):
+                run_after_commit(lambda: ran.append('sent'))
+        self.assertEqual(ran, ['sent'])
+        thread.assert_not_called()
+
+    @override_settings(NOTIFY_EMAIL_ASYNC=True)
+    def test_with_threads_the_work_goes_to_a_background_thread(self):
+        from apps.library.after_commit import run_after_commit
+        with patch('threading.Thread') as thread:
+            with self.captureOnCommitCallbacks(execute=True):
+                run_after_commit(lambda: None)
+        thread.assert_called_once()
+        thread.return_value.start.assert_called_once()
+
+    @override_settings(NOTIFY_EMAIL_ASYNC=False, EMAIL_BACKEND='django.core.mail.backends.locmem.EmailBackend')
+    def test_one_email_per_recipient_and_a_bad_address_does_not_stop_the_rest(self):
+        from django.core import mail
+        from apps.library import notifications
+        real_send = mail.EmailMessage.send
+
+        def send(msg, *a, **k):
+            if msg.to == ['bad@example.com']:
+                raise OSError('rejected')
+            return real_send(msg, *a, **k)
+        with patch('django.core.mail.EmailMessage.send', send), self.captureOnCommitCallbacks(execute=True):
+            notifications._email_addresses(['a@example.com', 'bad@example.com', 'b@example.com', 'a@example.com'],
+                                           'Hello', 'Body', '/x')
+        self.assertEqual([m.to for m in mail.outbox], [['a@example.com'], ['b@example.com']])
 
 
 TEST_VAPID = dict(VAPID_PUBLIC_KEY='BPublicKeyForTests', VAPID_PRIVATE_KEY='private-key-for-tests', VAPID_SUBJECT='mailto:test@example.com')
@@ -2820,6 +3173,22 @@ def finish_crew_work(booking, with_after_photo=True):
 @override_settings(MEDIA_ROOT=tempfile.mkdtemp(prefix='fieldwork-tests-'))
 class FieldWorkTests(APITestCase):
     """Crew job rules (field_work.py): when a job can start, who updates which stage, the sign-off gate."""
+
+    def test_saved_plant_list_counts_specimens_apart(self):
+        """A Studio save counts specimen-size plants as their own row, at the specimen price."""
+        from apps.library import field_work
+        from apps.library.models import InventoryItem
+        hib = InventoryItem.objects.create(name='Hibiscus', category='plant', unit_price=150, stock_quantity=9,
+                                           specimen_price=450, specimen_height=1.2)
+        rows = field_work.plant_breakdown_for([
+            {'productId': hib.id, 'position': {'x': 0, 'z': 0}},
+            {'productId': hib.id, 'position': {'x': 1, 'z': 0}, 'size': 'specimen'},
+            {'productId': hib.id, 'position': {'x': 2, 'z': 0}, 'size': 'specimen'},
+        ])
+        by = {(r['name'], r.get('size', '')): r for r in rows}
+        self.assertEqual(by[('Hibiscus', '')]['quantity'], 1)
+        self.assertEqual((by[('Hibiscus — specimen size', 'specimen')]['quantity'],
+                          by[('Hibiscus — specimen size', 'specimen')]['unit_price']), (2, 450.0))
 
     def setUp(self):
         from django.utils import timezone
@@ -4375,7 +4744,8 @@ class DesignProposalTests(APITestCase):
         self.owner = User.objects.create_user(username='propowner', password='pw', first_name='Ana', last_name='Cruz')
         self.other = User.objects.create_user(username='propother', password='pw')
         self.palm = InventoryItem.objects.create(name='Christmas Palm', category='plant', unit_price=500, stock_quantity=5,
-                                                 planting_height=1.2, mature_height=5, mature_spread=2, established_spread=1.5)
+                                                 planting_height=1.2, mature_height=5, mature_spread=2, established_spread=1.5,
+                                                 years_to_mature=8)
         self.bench = InventoryItem.objects.create(name='Bench', category='furniture', unit_price=3000, stock_quantity=2, real_world_size=1.6)
         self.design = GardenDesign.objects.create(
             user=self.owner, name='Lush <Tropical> & Co',
@@ -5228,6 +5598,169 @@ class SiteSurveyTests(APITestCase):
         self.assertTrue(any(n['kind'] == 'keep_clear' for n in r.data['notes']), r.data['notes'])
 
 
+class PhotoBasisTests(APITestCase):
+    """The yard photo shapes the design: marks on it, what its reading found (accepted), its size or shape and its
+    grass; the results and the proposal say so ("Based on your yard photo, we …")."""
+
+    setUp = GenerateLayoutsViewTests.setUp
+
+    PHOTO_SURVEY = {
+        'items': [
+            {'kind': 'clear', 'x0': 0, 'z0': 8, 'x1': 3, 'z1': 12, 'label': 'Patio', 'src': 'found'},
+            {'kind': 'clear', 'x0': 6, 'z0': 10, 'x1': 7, 'z1': 12, 'label': 'Path', 'src': 'found'},
+            {'kind': 'keep', 'x': 8, 'z': 2.5, 'r': 1.5, 'label': 'Mango tree', 'src': 'photo'},
+            {'kind': 'entry', 'x': 5, 'z': 12, 'edge': 'front'},                      # marked on the plan
+        ],
+        'photo': {'lined_up': True, 'sized': True, 'shaped': False, 'grass': 0.72},
+    }
+
+    def test_parse_keeps_where_marks_came_from(self):
+        from apps.library import site_survey as S
+        s = S.parse(self.PHOTO_SURVEY, 10, 12)
+        self.assertEqual([i.get('src') for i in s['items']], ['found', 'found', 'photo', None])
+        self.assertEqual(s['photo'], {'lined_up': True, 'sized': True, 'shaped': False, 'grass': 0.72})
+        # Unknown sources dropped; a photo never lined up counts as no photo; odd grass values cleaned
+        odd = S.parse({'items': [{'kind': 'keep', 'x': 1, 'z': 1, 'r': 1, 'src': 'gemini'}],
+                       'photo': {'lined_up': 'yes', 'grass': 3}}, 10, 12)
+        self.assertNotIn('src', odd['items'][0])
+        self.assertNotIn('photo', odd)
+        self.assertEqual(S.parse({'photo': {'lined_up': True, 'grass': 'lots'}}, 10, 12)['photo']['grass'], None)
+        self.assertEqual(S.parse({'photo': {'lined_up': True, 'grass': 7}}, 10, 12)['photo']['grass'], 1.0)
+
+    def test_photo_facts_say_what_the_photo_did(self):
+        from apps.library import site_survey as S
+        s = S.parse(self.PHOTO_SURVEY, 10, 12)
+        facts = S.photo_facts(s, new_lawn=False)
+        self.assertEqual(facts, [
+            'used the yard size your photo measured',
+            'kept clear the patio and path we found in it',
+            'planted around the 1 tree or plant you marked on it',
+            'kept your existing lawn (about 72% of your yard looks like grass)',
+        ])
+        # New grass laid: the lawn isn't claimed; no photo: nothing at all
+        self.assertNotIn('lawn', ' '.join(S.photo_facts(s, new_lawn=True)))
+        self.assertEqual(S.photo_facts(S.parse({'items': self.PHOTO_SURVEY['items']}, 10, 12)), [])
+        self.assertIsNone(S.photo_note(S.parse(None, 10, 12)))
+        self.assertTrue(S.photo_note(s, new_lawn=False).startswith('Based on your yard photo, we used the yard size'))
+
+    def test_designs_report_their_photo_basis(self):
+        r = self.client.post(self.url, {**self.valid, 'site_survey': self.PHOTO_SURVEY, 'lawn': 'keep'}, format='json')
+        self.assertEqual(r.status_code, 200, r.data)
+        self.assertIn('kept clear the patio and path we found in it', r.data['photo_basis'])
+        self.assertTrue(any('existing lawn' in f for f in r.data['photo_basis']), r.data['photo_basis'])
+        # The found patio is kept clear like any marked area
+        for d in r.data['designs']:
+            for p in d['plants']:
+                if not p.get('is_existing'):
+                    self.assertFalse(0 <= p['x'] <= 3 and 8 <= p['z'] <= 12, (d['design_name'], p))
+        # No photo: no basis
+        plain = self.client.post(self.url, self.valid, format='json')
+        self.assertEqual(plain.data['photo_basis'], [])
+
+    def test_proposal_says_what_came_from_the_photo(self):
+        from apps.library.proposal import _photo_note
+        dims = {'siteSurvey': self.PHOTO_SURVEY, 'gardenPlan': {'newLawn': False}}
+        note = _photo_note(dims, 10, 12)
+        self.assertTrue(note.startswith('Based on your yard photo, we'), note)
+        self.assertIn('existing lawn', note)
+        self.assertNotIn('existing lawn', _photo_note({'siteSurvey': self.PHOTO_SURVEY}, 10, 12))   # new grass
+        self.assertIsNone(_photo_note({}, 10, 12))
+        self.assertIsNone(_photo_note({'siteSurvey': 'not json'}, 10, 12))   # never breaks the proposal
+
+
+class PhotoObjectsTests(APITestCase):
+    """POST /api/photo-objects/: the AI's look at the yard photo (boxes on the picture), cached per photo, within
+    the daily photo-scan limit, and never a dead end when the AI is out."""
+
+    def setUp(self):
+        from django.core.cache import cache
+        cache.clear()
+        keys = patch.dict(os.environ, {'GOOGLE_API_KEY': '', 'GEMINI_API_KEY': 'test_api_key', 'AI_MODE': 'auto'})
+        keys.start()
+        self.addCleanup(keys.stop)
+        self.user = User.objects.create_user(username='photouser', password='pw')
+        self.client.credentials(HTTP_AUTHORIZATION=f'Bearer {RefreshToken.for_user(self.user).access_token}')
+        self.url = reverse('photo-objects')
+
+    def _jpeg(self, colour=(90, 140, 60)):
+        import io
+        from PIL import Image
+        out = io.BytesIO()
+        Image.new('RGB', (320, 240), colour).save(out, 'JPEG')
+        out.seek(0)
+        out.name = 'yard.jpg'
+        return out
+
+    def _answer(self, text):
+        response = MagicMock()
+        response.text = text
+        return response
+
+    def test_clean_objects_keeps_only_good_entries(self):
+        from apps.library.utils import clean_objects
+        objects = clean_objects([
+            {'kind': 'tree', 'label': 'mango   tree', 'box_2d': [100, 600, 700, 900]},
+            {'kind': 'paving', 'label': 'Patio', 'box_2d': [650, 200, 900, 1200]},    # clamped to the picture
+            {'kind': 'house', 'label': 'House', 'box_2d': [0, 0, 500, 500]},          # not a kind we plan around
+            {'kind': 'shrub', 'label': 'Bush', 'box_2d': [10, 10, 12, 400]},          # too thin to be real
+            {'kind': 'utility', 'label': 'Meter', 'box_2d': 'nowhere'},
+            'junk',
+        ])
+        self.assertEqual(objects, [
+            {'kind': 'tree', 'label': 'Mango tree', 'box': [100, 600, 700, 900]},
+            {'kind': 'paving', 'label': 'Patio', 'box': [650, 200, 900, 1000]},
+        ])
+
+    @patch('google.genai.Client')
+    def test_scan_returns_boxes_and_the_same_photo_is_free(self, client_class):
+        client_class.return_value.models.generate_content.return_value = self._answer(
+            '[{"kind": "tree", "label": "Mango tree", "box_2d": [100, 600, 700, 900]}]')
+        r = self.client.post(self.url, {'image': self._jpeg()}, format='multipart')
+        self.assertEqual(r.status_code, 200, r.data)
+        self.assertEqual(r.data, {'status': 'ok', 'objects': [{'kind': 'tree', 'label': 'Mango tree', 'box': [100, 600, 700, 900]}]})
+        again = self.client.post(self.url, {'image': self._jpeg()}, format='multipart')
+        self.assertEqual(again.data['objects'], r.data['objects'])
+        self.assertEqual(client_class.return_value.models.generate_content.call_count, 1)   # cached: no second call
+
+    @patch('google.genai.Client')
+    def test_out_of_quota_or_no_ai_is_never_an_error(self, client_class):
+        from apps.library.garden_ai import ZoneScanThrottle, breaker_open
+        client_class.return_value.models.generate_content.side_effect = Exception('429 RESOURCE_EXHAUSTED PerDay')
+        r = self.client.post(self.url, {'image': self._jpeg()}, format='multipart')
+        self.assertEqual(r.data, {'status': 'quota', 'objects': []})
+        self.assertTrue(breaker_open())                     # paused: the next photo doesn't wait on Gemini
+        r = self.client.post(self.url, {'image': self._jpeg((10, 10, 10))}, format='multipart')
+        self.assertEqual(r.data['status'], 'unavailable')
+        # The customer's daily photo scans used up
+        from django.core.cache import cache
+        cache.clear()
+        with patch.object(ZoneScanThrottle, 'get_rate', return_value='1/day'):
+            ZoneScanThrottle.rate, ZoneScanThrottle.num_requests = None, None
+            client_class.return_value.models.generate_content.side_effect = None
+            client_class.return_value.models.generate_content.return_value = self._answer('[]')
+            self.assertEqual(self.client.post(self.url, {'image': self._jpeg((1, 2, 3))}, format='multipart').data['status'], 'ok')
+            self.assertEqual(self.client.post(self.url, {'image': self._jpeg((4, 5, 6))}, format='multipart').data['status'], 'quota')
+        ZoneScanThrottle.rate, ZoneScanThrottle.num_requests = None, None
+        with patch.dict(os.environ, {'AI_MODE': 'engine_only'}):
+            self.assertEqual(self.client.post(self.url, {'image': self._jpeg((7, 8, 9))}, format='multipart').data['status'], 'unavailable')
+
+    def test_needs_a_signed_in_customer_and_a_real_photo(self):
+        from django.core.files.uploadedfile import SimpleUploadedFile
+        bad = self.client.post(self.url, {'image': SimpleUploadedFile('x.jpg', b'%PDF-1.4 not a photo', content_type='image/jpeg')},
+                               format='multipart')
+        self.assertEqual(bad.status_code, 400)
+        self.assertEqual(self.client.post(self.url, {}, format='multipart').status_code, 400)
+        self.client.credentials()
+        self.assertEqual(self.client.post(self.url, {'image': self._jpeg()}, format='multipart').status_code, 401)
+
+    def test_trees_found_in_the_photo_are_reported(self):
+        from apps.library import site_survey as S
+        s = S.parse({'items': [{'kind': 'keep', 'x': 8, 'z': 2.5, 'r': 2, 'label': 'Mango tree', 'src': 'found'},
+                               {'kind': 'clear', 'x0': 0, 'z0': 8, 'x1': 3, 'z1': 12, 'label': 'Shed', 'src': 'found'}],
+                     'photo': {'lined_up': True}}, 10, 12)
+        self.assertEqual(S.photo_facts(s), ['kept clear the shed we found in it', 'planted around the mango tree we found in it'])
+
+
 class SiteSurveyEngineTests(APITestCase):
     """Phase 2: the engine plans around the marks: paths from gates, screens, low views, the house setback."""
 
@@ -5738,6 +6271,19 @@ class PlantLooksTests(APITestCase):
         plant.refresh_from_db()
         self.assertEqual((plant.flower_color, plant.foliage_color, plant.plant_form, plant.design_role),
                          ('pink', 'dark_green', 'mounding', 'filler'))
+        # …and the years until fully grown, only where empty: the owner's own value stays
+        self.assertEqual(plant.years_to_mature, 3)
+        plant.years_to_mature = 5
+        plant.save(update_fields=['years_to_mature'])
+        call_command('load_sample_prices', stdout=StringIO())
+        plant.refresh_from_db()
+        self.assertEqual(plant.years_to_mature, 5)
+        # …and a sample specimen size, also only where empty
+        self.assertEqual((int(plant.specimen_price), plant.specimen_height), (450, 1.2))
+        # Groundcovers get theirs too: the years until they close into a carpet (fast mani-mani, slow mondo)
+        years = dict(InventoryItem.objects.filter(is_groundcover=True).values_list('name', 'years_to_mature'))
+        self.assertEqual(years.get('Mani-mani (Arachis pintoi)'), 1)
+        self.assertEqual(years.get('Mondo grass'), 3)
         # Hardscape never keeps looks
         rock = InventoryItem.objects.create(name='Rock', category='hardscape', unit_price=400, stock_quantity=3)
         r = self.client.patch(f'/api/inventory/{rock.id}/', {'flower_color': 'red'}, format='multipart')
@@ -6438,3 +6984,219 @@ class SeedDemoBusinessTests(APITestCase):
                           FunnelEvent.objects.count()), (0, 0, 0, 0))
         # Real accounts are untouched
         self.assertTrue(User.objects.filter(pk__in=[self.owner.pk, self.office.pk, self.real_customer.pk]).count() == 3)
+
+
+@override_settings(MEDIA_ROOT=TEMP_MEDIA)
+class DesignPreviewTests(APITestCase):
+    """Design card pictures (design_preview.py): owner or office only, cleaned and shrunk, never a 'change'."""
+
+    def setUp(self):
+        from apps.library.models import GardenDesign
+        self.owner = User.objects.create_user(username='prevowner', password='pw')
+        self.other = User.objects.create_user(username='prevother', password='pw')
+        self.office = User.objects.create_user(username='prevoffice', password='pw', is_staff=True)
+        self.design = GardenDesign.objects.create(user=self.owner, name='Front yard', placed_items=[],
+                                                  dimensions={'width': 10, 'length': 8}, revision=3)
+        self.url = f'/api/designs/{self.design.id}/preview/'
+
+    def _as(self, user):
+        self.client.credentials(HTTP_AUTHORIZATION=f'Bearer {RefreshToken.for_user(user).access_token}')
+
+    def _png(self, size=(1600, 1000)):
+        from PIL import Image
+        buf = io.BytesIO()
+        Image.new('RGBA', size, (40, 160, 90, 255)).save(buf, format='PNG')
+        return SimpleUploadedFile('shot.png', buf.getvalue(), content_type='image/png')
+
+    def test_owner_sets_a_small_clean_jpeg_without_touching_edited_date(self):
+        from PIL import Image
+        before = self.design.updated_at
+        self._as(self.owner)
+        r = self.client.post(self.url, {'image': _photo_with_gps('shot.jpg'), 'revision': 3}, format='multipart')
+        self.assertEqual(r.status_code, 200, r.data)
+        self.assertTrue(r.data['preview_url'].endswith('.jpg'))
+        self.design.refresh_from_db()
+        self.assertEqual(self.design.updated_at, before)   # a picture is not an edit
+        self.assertEqual((self.design.revision, self.design.preview_revision), (3, 3))
+        with Image.open(self.design.preview.path) as img:
+            self.assertEqual(img.format, 'JPEG')
+            self.assertNotIn(0x8825, img.getexif())   # no GPS or other metadata kept
+
+    def test_big_picture_is_shrunk_and_old_file_removed(self):
+        import os
+        from PIL import Image
+        self._as(self.owner)
+        self.client.post(self.url, {'image': self._png()}, format='multipart')
+        self.design.refresh_from_db()
+        first = self.design.preview.path
+        with Image.open(first) as img:
+            self.assertLessEqual(img.width, 800)
+            self.assertLessEqual(img.height, 500)
+        self.client.post(self.url, {'image': self._png((400, 250))}, format='multipart')
+        self.design.refresh_from_db()
+        self.assertNotEqual(self.design.preview.path, first)
+        self.assertFalse(os.path.exists(first))
+
+    def test_revision_from_the_future_or_missing_falls_back(self):
+        self._as(self.owner)
+        self.client.post(self.url, {'image': self._png(), 'revision': 99}, format='multipart')
+        self.design.refresh_from_db()
+        self.assertEqual(self.design.preview_revision, 3)
+
+    def test_not_a_picture_is_refused(self):
+        self._as(self.owner)
+        r = self.client.post(self.url, {'image': SimpleUploadedFile('x.jpg', b'<html>hi</html>')}, format='multipart')
+        self.assertEqual(r.status_code, 400)
+        r = self.client.post(self.url, {}, format='multipart')
+        self.assertEqual(r.status_code, 400)
+
+    def test_only_owner_or_office(self):
+        self._as(self.other)
+        self.assertEqual(self.client.post(self.url, {'image': self._png()}, format='multipart').status_code, 404)
+        self._as(self.office)
+        self.assertEqual(self.client.post(self.url, {'image': self._png()}, format='multipart').status_code, 200)
+        self.client.credentials()
+        self.assertEqual(self.client.post(self.url, {'image': self._png()}, format='multipart').status_code, 401)
+
+    def test_listed_with_the_design_and_deleted_with_it(self):
+        import os
+        self._as(self.owner)
+        self.client.post(self.url, {'image': self._png()}, format='multipart')
+        rows = self.client.get('/api/designs/').data
+        rows = rows.get('results', rows) if isinstance(rows, dict) else rows
+        row = next(d for d in rows if d['id'] == self.design.id)
+        self.assertTrue(row['preview_url'])
+        self.assertEqual(row['preview_revision'], 3)
+        self.design.refresh_from_db()
+        path = self.design.preview.path
+        self.assertEqual(self.client.delete(f'/api/designs/{self.design.id}/').status_code, 204)
+        self.assertFalse(os.path.exists(path))
+
+    def test_crew_on_the_job_can_open_the_design_but_not_change_its_picture(self):
+        from apps.library.models import ServiceBooking, StaffProfile
+        crew = User.objects.create_user(username='prevcrew', password='pw', is_staff=True)
+        StaffProfile.objects.create(user=crew, role='FIELD_CREW')
+        booking = ServiceBooking.objects.create(user=self.owner, service_type='Softscape', scheduled_date='2026-12-01',
+                                                design=self.design)
+        booking.assigned_crew.add(crew)
+        self._as(crew)
+        self.assertEqual(self.client.get(f'/api/designs/{self.design.id}/').status_code, 200)
+        self.assertEqual(self.client.post(self.url, {'image': self._png()}, format='multipart').status_code, 403)
+
+
+class DesignPreviewOnCloudStorageTests(APITestCase):
+    """Same pictures when uploads live in R2 (prod.py S3Storage): full https links, no files on this disk.
+    Django's InMemoryStorage stands in for the bucket (no network)."""
+
+    def setUp(self):
+        from django.conf import settings as dj
+        from apps.library.models import GardenDesign
+        self._storage = override_settings(STORAGES={
+            'default': {'BACKEND': 'django.core.files.storage.InMemoryStorage',
+                        'OPTIONS': {'base_url': 'https://pub-test.r2.dev/'}},
+            'staticfiles': dj.STORAGES['staticfiles'],
+        })
+        self._storage.enable()
+        self.addCleanup(self._storage.disable)
+        self.owner = User.objects.create_user(username='cloudowner', password='pw')
+        self.design = GardenDesign.objects.create(user=self.owner, name='Cloud yard', placed_items=[],
+                                                  dimensions={'width': 10, 'length': 8})
+        self.url = f'/api/designs/{self.design.id}/preview/'
+        self.client.credentials(HTTP_AUTHORIZATION=f'Bearer {RefreshToken.for_user(self.owner).access_token}')
+
+    def _png(self):
+        from PIL import Image
+        buf = io.BytesIO()
+        Image.new('RGB', (1200, 750), (40, 160, 90)).save(buf, format='PNG')
+        return SimpleUploadedFile('shot.png', buf.getvalue(), content_type='image/png')
+
+    def test_link_is_the_buckets_own_and_replacing_removes_the_old_object(self):
+        from django.core.files.storage import default_storage
+        r = self.client.post(self.url, {'image': self._png()}, format='multipart')
+        self.assertEqual(r.status_code, 200, r.data)
+        self.assertTrue(r.data['preview_url'].startswith('https://pub-test.r2.dev/design_previews/'), r.data)
+        self.design.refresh_from_db()
+        first = self.design.preview.name
+        self.assertTrue(default_storage.exists(first))
+        rows = self.client.get('/api/designs/').data
+        rows = rows.get('results', rows) if isinstance(rows, dict) else rows
+        self.assertEqual(next(d for d in rows if d['id'] == self.design.id)['preview_url'], r.data['preview_url'])
+        self.client.post(self.url, {'image': self._png()}, format='multipart')
+        self.design.refresh_from_db()
+        self.assertNotEqual(self.design.preview.name, first)
+        self.assertFalse(default_storage.exists(first))
+        self.assertTrue(default_storage.exists(self.design.preview.name))
+        self.assertEqual(self.client.delete(f'/api/designs/{self.design.id}/').status_code, 204)
+        self.assertFalse(default_storage.exists(self.design.preview.name))
+
+
+class CrewSyncStatusTests(APITestCase):
+    """Crew phones report their offline outbox (counts only); the office sees who has unsent work."""
+
+    def setUp(self):
+        from apps.library.models import StaffProfile
+        self.crew = User.objects.create_user(username='syncrew', password='pw', first_name='Jun', is_staff=True)
+        StaffProfile.objects.create(user=self.crew, role='FIELD_CREW')
+        self.crew2 = User.objects.create_user(username='syncrew2', password='pw', first_name='Ana', is_staff=True)
+        StaffProfile.objects.create(user=self.crew2, role='FIELD_CREW')
+        self.office = User.objects.create_superuser(username='syncboss', password='pw', email='b@example.com')
+        self.customer = User.objects.create_user(username='synccust', password='pw')
+
+    def _rows(self):
+        self.client.force_authenticate(self.office)
+        r = self.client.get('/api/crew-sync/')
+        self.assertEqual(r.status_code, 200, r.data)
+        return {row['user_id']: row for row in r.data['crew']}
+
+    def test_phone_report_is_kept_and_unsent_work_comes_first(self):
+        from django.utils import timezone
+        self.client.force_authenticate(self.crew2)
+        self.assertEqual(self.client.post('/api/crew-sync/', {'waiting': 0, 'failed': 0}, format='json').status_code, 200)
+        self.client.force_authenticate(self.crew)
+        oldest = (timezone.now() - timezone.timedelta(hours=3)).isoformat()
+        self.assertEqual(self.client.post('/api/crew-sync/', {'waiting': 4, 'failed': 0, 'oldest_waiting_at': oldest},
+                                          format='json').status_code, 200)
+        self.client.force_authenticate(self.office)
+        crew = self.client.get('/api/crew-sync/').data['crew']
+        self.assertEqual([c['user_id'] for c in crew], [self.crew.id, self.crew2.id])   # unsent first
+        self.assertEqual((crew[0]['state'], crew[0]['waiting']), ('unsent', 4))
+        self.assertIsNotNone(crew[0]['oldest_waiting_at'])
+        self.assertEqual(crew[1]['state'], 'ok')
+
+    def test_refused_and_never_reported(self):
+        self.client.force_authenticate(self.crew)
+        self.client.post('/api/crew-sync/', {'waiting': 1, 'failed': 2}, format='json')
+        rows = self._rows()
+        self.assertEqual(rows[self.crew.id]['state'], 'refused')
+        self.assertEqual(rows[self.crew2.id]['state'], 'never')
+
+    def test_bad_values_are_cleaned(self):
+        from django.utils import timezone
+        self.client.force_authenticate(self.crew)
+        future = (timezone.now() + timezone.timedelta(days=2)).isoformat()
+        self.client.post('/api/crew-sync/', {'waiting': '-3', 'failed': 'x', 'oldest_waiting_at': future}, format='json')
+        row = self._rows()[self.crew.id]
+        self.assertEqual((row['waiting'], row['failed'], row['oldest_waiting_at']), (0, 0, None))
+        self.client.force_authenticate(self.crew)
+        self.client.post('/api/crew-sync/', {'waiting': 99999, 'oldest_waiting_at': future}, format='json')
+        row = self._rows()[self.crew.id]
+        self.assertEqual(row['waiting'], 500)
+        self.assertLessEqual(row['oldest_waiting_at'], timezone.now())   # a fast phone clock can't set the future
+
+    def test_quiet_while_on_a_job(self):
+        from django.utils import timezone
+        from apps.library.models import Attendance, StaffProfile
+        Attendance.objects.create(staff=self.crew, clock_in_time=timezone.now() - timezone.timedelta(hours=3))
+        StaffProfile.objects.filter(user=self.crew).update(sync_at=timezone.now() - timezone.timedelta(minutes=90))
+        row = self._rows()[self.crew.id]
+        self.assertEqual((row['state'], row['on_shift']), ('quiet', True))
+
+    def test_only_crew_report_and_only_office_reads(self):
+        for user in (self.customer, self.office):
+            self.client.force_authenticate(user)
+            self.assertEqual(self.client.post('/api/crew-sync/', {'waiting': 1}, format='json').status_code, 403)
+        for user in (self.customer, self.crew):
+            self.client.force_authenticate(user)
+            self.assertEqual(self.client.get('/api/crew-sync/').status_code, 403)
+        self.client.force_authenticate(None)
+        self.assertEqual(self.client.get('/api/crew-sync/').status_code, 401)

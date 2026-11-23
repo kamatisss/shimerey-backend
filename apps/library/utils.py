@@ -241,3 +241,76 @@ ZONE_SCAN_PROMPT = (
             "No coordinates. No sizes. No explanations.\n"
             'Example: [{"zone":"blocked","label":"patio","blocks_planting":true,"is_existing":true}]'
         )
+
+
+# ── What's in the yard photo, as boxes on the picture (AI Designer, after the photo is lined up) ──
+# Gemini only says WHAT it sees and WHERE in the picture (its native box_2d detection format: [ymin, xmin, ymax,
+# xmax], 0–1000 of the image). Turning a box into metres needs the photo's line-up, which only the browser has
+# (data/photoObjects.js): a tree's trunk is the bottom middle of its box, a patio's corners are its box corners.
+# Everything found is a suggestion the customer confirms; nothing goes into the design unconfirmed.
+OBJECT_KINDS = ('tree', 'shrub', 'structure', 'paving', 'water', 'utility')
+MAX_OBJECTS = 15
+OBJECT_SCAN_PROMPT = """You look at a photo of a residential yard in the Philippines, taken to plan a new garden.
+Find the things already in the yard that a garden designer must plan around:
+- tree: a tree (give its common name if you can tell, e.g. "Mango tree", "Coconut palm")
+- shrub: a large existing shrub or clump of plants worth keeping
+- structure: a shed, gazebo, water tank, dog house, built planter or other built thing standing in the yard
+- paving: a patio, path, driveway, concrete slab or gravel area on the ground
+- water: a pool or pond
+- utility: a septic tank lid, water meter, manhole or drain cover
+Only things inside the yard, on its ground: not the house, walls, fences, gates, sky, or anything beyond the fence.
+Return a JSON list, at most 15 entries, each {"kind": one of the kinds above, "label": a short name in plain
+English (max 4 words), "box_2d": [ymin, xmin, ymax, xmax] as integers 0-1000 of the image}.
+Return [] when there is nothing to report. Never guess at things you cannot see."""
+
+
+def scan_image_objects(image_bytes, mime_type='image/jpeg', timeout_ms=25_000):
+    """
+    Gemini Vision: the existing things in a yard photo with their boxes on the picture.
+
+    Returns (objects, error): objects = [{kind, label, box: [ymin, xmin, ymax, xmax]}] (0–1000, checked);
+    error = None, or 'no_key' | 'quota' | 'unavailable' | 'bad_response'. [] with None = nothing found.
+    """
+    api_key = os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")
+    if not api_key or api_key == "your_gemini_api_key_here":
+        return [], 'no_key'
+    try:
+        client = genai.Client(api_key=api_key, http_options=types.HttpOptions(timeout=timeout_ms))
+        response = client.models.generate_content(
+            model='gemini-2.5-flash',
+            contents=[types.Part.from_bytes(data=image_bytes, mime_type=mime_type),
+                      "List the existing things in this yard as JSON."],
+            config={"system_instruction": OBJECT_SCAN_PROMPT, "response_mime_type": "application/json", "temperature": 0.1},
+        )
+    except Exception as e:  # network, timeout, quota…
+        text = str(e)
+        logger.warning("Object scan failed: %s", text[:200])
+        return [], 'quota' if ('429' in text or 'RESOURCE_EXHAUSTED' in text) else 'unavailable'
+    try:
+        cleaned = (response.text or '').strip().removeprefix('```json').removesuffix('```').strip()
+        parsed = json.loads(cleaned or '[]')
+        if not isinstance(parsed, list):
+            raise ValueError('not a list')
+    except (ValueError, json.JSONDecodeError):
+        return [], 'bad_response'
+    return clean_objects(parsed), None
+
+
+def clean_objects(parsed):
+    """Keep only well-formed entries: a known kind, a short label, a box inside the picture with some size."""
+    out = []
+    for item in parsed:
+        if not isinstance(item, dict) or item.get('kind') not in OBJECT_KINDS:
+            continue
+        box = item.get('box_2d')
+        try:
+            ymin, xmin, ymax, xmax = (max(0, min(1000, int(round(float(v))))) for v in box)
+        except (TypeError, ValueError):
+            continue
+        if ymax - ymin < 5 or xmax - xmin < 5:
+            continue
+        label = ' '.join(str(item.get('label') or item['kind']).split())[:40] or item['kind']
+        out.append({'kind': item['kind'], 'label': label[0].upper() + label[1:], 'box': [ymin, xmin, ymax, xmax]})
+        if len(out) >= MAX_OBJECTS:
+            break
+    return out

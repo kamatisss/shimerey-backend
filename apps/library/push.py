@@ -14,16 +14,15 @@ notifications.py decides who gets an alert; this module only delivers it.
 """
 import json
 import logging
-import threading
 
 from django.conf import settings
-from django.db import transaction
 from django.utils import timezone
 from rest_framework import status
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
+from .after_commit import run_after_commit
 from .models import PushSubscription
 
 logger = logging.getLogger(__name__)
@@ -79,10 +78,7 @@ def send(users, title, body, url='', tag=''):
         for sub in PushSubscription.objects.filter(user_id__in=ids):
             _deliver(sub, payload)
 
-    if getattr(settings, 'NOTIFY_EMAIL_ASYNC', True):
-        transaction.on_commit(lambda: threading.Thread(target=run, daemon=True).start())
-    else:
-        transaction.on_commit(run)
+    run_after_commit(run)   # a thread where the server runs them; in the request on PythonAnywhere
 
 
 # ── API ─────────────────────────────────────────────────────────────────────

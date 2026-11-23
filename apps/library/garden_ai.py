@@ -46,7 +46,7 @@ from .pricing import (
     EXISTING, MAKEOVER, SCOPES, fixed_costs, installed_price, is_small_stone, plant_budget_from_all_in, plants_only_estimate,
     project_estimate,
 )
-from .utils import scan_image_zones
+from .utils import scan_image_objects, scan_image_zones
 from . import groundcover as gcover, site_survey, sun_map
 
 logger = logging.getLogger(__name__)
@@ -512,6 +512,8 @@ class GenerateLayoutsView(APIView):
             return Response({'error': msg}, status=status.HTTP_400_BAD_REQUEST)
         # "installed by our crew" (default) or "plants only — I'll plant them myself"
         installed = str(data.get('install', 'true')).strip().lower() not in ('false', '0', 'no')
+        # "Try an example yard" (AI Designer): engine designs only, so it never uses the customer's daily AI designs
+        example = str(data.get('example', '')).strip().lower() in ('1', 'true', 'yes')
         if data.get('lot_width') is None or data.get('lot_length') is None:
             return Response({'error': 'Lot width (lot_width) and lot length (lot_length) are required fields.'},
                             status=status.HTTP_400_BAD_REQUEST)
@@ -744,7 +746,8 @@ class GenerateLayoutsView(APIView):
         # 3. Anti-abuse limit, then the cache (a cached answer costs nothing)
         key = _cache_key(budget_min, budget_max, installed, round(lot_w, 1), round(lot_l, 1), sorted(preferred),
                          sorted(keep_clear), seed, ps.updated_at, sorted(feature_qty.items()),  # new rates → new estimates
-                         sun, maintenance, new_lawn, scope, survey, sorted(plant_qty.items()), groundcover_on, sorted(picked_gc))
+                         sun, maintenance, new_lawn, scope, survey, sorted(plant_qty.items()), groundcover_on, sorted(picked_gc),
+                         example)   # an example's engine designs must not answer a real request
         cached = cache.get(key)
         if cached is not None:
             self._log(request, 'cached', zone_scan, 0, started)
@@ -762,7 +765,8 @@ class GenerateLayoutsView(APIView):
 
         # … and the AI signature design when everything allows it. Exact amounts are the engine's job (the AI
         # can't be held to them), so with amounts set all three designs are the engine's.
-        ai_status = 'disabled' if plant_qty else self._ai_status(request)   # amounts set: no AI call, no quota used
+        # Amounts set, or the "Try an example yard" run: engine designs only, no AI call, no quota used
+        ai_status = 'disabled' if plant_qty or example else self._ai_status(request)
         adjustments = 0
         if ai_status == 'ok':
             try:
@@ -840,6 +844,8 @@ class GenerateLayoutsView(APIView):
             'scope': scope if installed else None,
             'compatibility_warnings': compat_warnings,
             'site_survey': survey,
+            # What the design took from the yard photo (lined up, marks on it, what its reading found)
+            'photo_basis': site_survey.photo_facts(survey, new_lawn),
         }
         cache.set(key, payload, _CACHE_TTL)
         self._log(request, ai_status, zone_scan, adjustments, started)
@@ -888,6 +894,46 @@ def scan_zones(request):
     if error:
         return Response({'status': 'failed', 'zones': []})
     return Response({'status': 'ok', 'zones': [z for z in found if z['blocks_planting']]})
+
+
+_OBJECTS_CACHE_S = 7 * 24 * 3600   # the same photo is never scanned (or charged) twice in a week
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def photo_objects(request):
+    """
+    POST /api/photo-objects/  (multipart: image) → {status, objects: [{kind, label, box}]}
+    The AI's look at the yard photo: trees, shrubs, structures, paving, water and utilities with their boxes on
+    the picture. The browser turns them into spots in the yard with the photo's line-up and offers each one to
+    the customer to confirm. status: ok | unavailable (no AI now) | quota (today's scans used) | failed.
+    Never fails the flow: without it the photo's colour reading still suggests paving and lawn.
+    """
+    image = request.FILES.get('image')
+    if image is None:
+        return Response({'error': 'An image is required (field name: image).'}, status=status.HTTP_400_BAD_REQUEST)
+    from .file_checks import image_problem
+    problem = image_problem(image)   # never send a non-photo to Gemini
+    if problem:
+        return Response({'error': problem}, status=status.HTTP_400_BAD_REQUEST)
+    image.seek(0)
+    data = image.read()
+    key = 'photoobj:' + hashlib.sha256(data).hexdigest()
+    cached = cache.get(key)
+    if cached is not None:
+        return Response({'status': 'ok', 'objects': cached})
+    if ai_mode() == 'engine_only' or not gemini_api_key() or breaker_open():
+        return Response({'status': 'unavailable', 'objects': []})
+    if not ZoneScanThrottle().allow_request(request, None):
+        return Response({'status': 'quota', 'objects': []})
+    found, error = scan_image_objects(data, getattr(image, 'content_type', None) or 'image/jpeg')
+    if error in ('quota', 'unavailable'):
+        trip_breaker('RESOURCE_EXHAUSTED PerDay' if error == 'quota' else error)
+    if error:
+        return Response({'status': 'quota' if error == 'quota' else 'unavailable' if error in ('no_key', 'unavailable') else 'failed',
+                         'objects': []})
+    cache.set(key, found, _OBJECTS_CACHE_S)
+    return Response({'status': 'ok', 'objects': found})
 
 
 class LayoutCheckThrottle(UserRateThrottle):
@@ -955,8 +1001,9 @@ def layout_review(request):
     """
     POST /api/layout-review/  — designer's notes on a design the customer edited in the 3D view.
     Body: {plants: [{plant_id, x, z, rotation?, uid?, is_existing?}], lot_width, lot_length,
-           garden_plan?: the design's plan (beds + lawn), keep_clear_zones?: [zone ids], tidy?: bool}
-    → {notes: [{kind, items: [index], uids: [uid], message}]}; with tidy also
+           garden_plan?: the design's plan (beds + lawn), keep_clear_zones?: [zone ids], tidy?: bool,
+           tidy_uid?: one plant's uid ("Move apart": only that plant moves)}
+    → {notes: [{kind, items: [index], uids: [uid], message, short_by_uid: {uid: headline}, advice?}]}; with tidy also
       {moves: [{index, uid, x, z}], tidy_notes: [str]} and notes for the tidied layout.
     Same rules the engine follows (layout_engine.review / tidy), never blocking: the design is theirs.
     """
@@ -966,13 +1013,22 @@ def layout_review(request):
     clean, site, plan, specs = parsed
     uid_of = lambda i: clean[i].get('uid')  # noqa: E731
     body = {}
-    if str(request.data.get('tidy', '')).strip().lower() in ('true', '1', 'yes'):
-        moved, tidy_notes = engine.tidy(clean, specs, site, plan)
+    one = request.data.get('tidy_uid')
+    if one not in (None, '') or str(request.data.get('tidy', '')).strip().lower() in ('true', '1', 'yes'):
+        only = None
+        if one not in (None, ''):
+            only = {i for i, p in enumerate(clean) if p.get('uid') == str(one)}
+        if only == set():
+            moved, tidy_notes = {}, ['That plant is no longer in this design.']
+        else:
+            moved, tidy_notes = engine.tidy(clean, specs, site, plan, only=only)
         for i, (x, z) in moved.items():
             clean[i] = {**clean[i], 'x': x, 'z': z}
         body['moves'] = [{'index': i, 'uid': uid_of(i), 'x': x, 'z': z} for i, (x, z) in sorted(moved.items())]
         body['tidy_notes'] = tidy_notes
-    body['notes'] = [{**n, 'uids': [uid_of(i) for i in n['items']]} for n in engine.review(clean, specs, site, plan)]
+    body['notes'] = [{**{k: v for k, v in n.items() if k != 'short'}, 'uids': [uid_of(i) for i in n['items']],
+                      'short_by_uid': {uid_of(i): text for i, text in n.get('short', {}).items() if uid_of(i)}}
+                     for n in engine.review(clean, specs, site, plan)]
     return Response(body)
 
 

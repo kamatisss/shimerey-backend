@@ -76,6 +76,16 @@ class InventoryItem(models.Model):
                                            help_text="Metres wide about 2 years after planting. Plants only.")
     mature_spread = models.FloatField(null=True, blank=True,
                                       help_text="Metres wide when fully grown, in a home garden. Plants only.")
+    # When "fully grown" is: a banana gets there in about 2 years, a plumeria in 10–15. The 3D view's "Fully grown"
+    # card and the proposal say it, so customers don't read the fully grown garden as next year's. Plants only.
+    years_to_mature = models.PositiveSmallIntegerField(null=True, blank=True,
+                                                       help_text="About how many years after planting it is fully grown. Plants only.")
+    # Specimen size: bigger nursery stock the customer can choose per plant (installed jobs), at its own price.
+    # Same stock count as the standard size. Both set, or neither (pricing.py, the 3D views' head start).
+    specimen_price = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True,
+                                         help_text="Price of one plant in the bigger specimen size. Empty = not offered. Plants only.")
+    specimen_height = models.FloatField(null=True, blank=True,
+                                        help_text="Metres tall when planted in the specimen size. Plants only.")
 
     # Looks: how the AI Designer combines plants for a pleasing design, not just one that fits (layout_engine:
     # one flower-colour family per design, contrasting shapes side by side, each plant in the job it's good at).
@@ -202,6 +212,10 @@ class GardenDesign(models.Model):
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='draft')
     # Goes up on every change, so an approval names the exact version the customer saw (design_review.py)
     revision = models.PositiveIntegerField(default=1)
+    # A small picture of the garden for the design cards (design_preview.py): drawn by the customer's
+    # browser after a save and uploaded; preview_revision = the version it shows (older = out of date)
+    preview = models.ImageField(upload_to='design_previews/%Y/%m/', null=True, blank=True)
+    preview_revision = models.PositiveIntegerField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -398,6 +412,11 @@ class StaffProfile(models.Model):
     ]
     user = models.OneToOneField(User, on_delete=models.CASCADE, related_name='staff_profile')
     role = models.CharField(max_length=20, choices=ROLE_CHOICES, default='OFFICE_ADMIN')
+    # Field crew: the phone's last report of its offline outbox (crew_sync.py). Counts and times only.
+    sync_at = models.DateTimeField(null=True, blank=True)
+    sync_waiting = models.PositiveIntegerField(default=0)
+    sync_failed = models.PositiveIntegerField(default=0)
+    sync_oldest_at = models.DateTimeField(null=True, blank=True)
 
     def __str__(self):
         return f"{self.user.username} — {self.get_role_display()}"

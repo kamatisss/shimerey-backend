@@ -28,6 +28,7 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.throttling import ScopedRateThrottle
 
+from . import site_survey
 from .design_items import lot_items
 from .models import BusinessProfile, GardenDesign, InventoryItem
 
@@ -179,7 +180,8 @@ def _site_plan(design, rows, items_by_id, width, max_height, font, bold):
     d.add(Rect(ox, oy, pw, ph, fillColor=None, strokeColor=colors.HexColor('#047857'), strokeWidth=1.2))
 
     # Items: number by list row, size by spread (a readable minimum)
-    number = {str(r.get('plant_id')): i + 1 for i, r in enumerate(rows)}
+    # (a specimen-size plant has its own row: numbered by plant and size)
+    number = {(str(r.get('plant_id')), r.get('size') or ''): i + 1 for i, r in enumerate(rows)}
     fills = {'plant': '#16a34a', 'hardscape': '#78716c', 'furniture': '#b45309'}
     placed = lot_items(design)   # AI and Studio items alike (design_items.py)
     for p in placed:
@@ -196,14 +198,30 @@ def _site_plan(design, rows, items_by_id, width, max_height, font, bold):
             d.add(Circle(cx, cy, r, fillColor=fill, fillOpacity=0.55, strokeColor=colors.white, strokeWidth=0.6))
         else:
             d.add(Rect(cx - r, cy - r, 2 * r, 2 * r, rx=2, ry=2, fillColor=fill, fillOpacity=0.6, strokeColor=colors.white, strokeWidth=0.6))
-        if pid in number:
-            d.add(String(cx, cy - 2.6, str(number[pid]), fontName=bold, fontSize=7.5, fillColor=colors.white, textAnchor='middle'))
+        key = (pid, p.get('size') or '')
+        if key not in number:
+            key = (pid, '')
+        if key in number:
+            d.add(String(cx, cy - 2.6, str(number[key]), fontName=bold, fontSize=7.5, fillColor=colors.white, textAnchor='middle'))
 
     dark, mid = colors.HexColor('#0f172a'), colors.HexColor('#475569')
     d.add(String(ox + pw / 2, oy + ph + 8, 'BACK OF THE GARDEN', fontName=bold, fontSize=7.5, fillColor=mid, textAnchor='middle'))
     d.add(String(ox + pw / 2, oy - 13, 'HOUSE SIDE (where you stand)', fontName=bold, fontSize=7.5, fillColor=dark, textAnchor='middle'))
     d.add(String(ox + pw / 2, oy - 26, f'{lot_w:g} m wide × {lot_l:g} m deep · each square is 1 m', fontName=font, fontSize=7, fillColor=mid, textAnchor='middle'))
     return d
+
+
+def _photo_note(dims, lot_w, lot_l):
+    """'Based on your yard photo, we …' from the survey saved with the design, or None (no photo used)."""
+    raw = dims.get('siteSurvey')
+    if not raw:
+        return None
+    try:
+        survey = site_survey.parse(raw, lot_w, lot_l)
+    except (site_survey.SurveyError, ValueError, TypeError, AttributeError):
+        return None   # an old or odd saved survey never stops the proposal
+    plan = dims.get('gardenPlan') if isinstance(dims.get('gardenPlan'), dict) else {}
+    return site_survey.photo_note(survey, new_lawn=plan.get('newLawn', True) is not False)
 
 
 def build_proposal(design, user, pictures=None, credits='', now=None):
@@ -339,6 +357,9 @@ def build_proposal(design, user, pictures=None, credits='', now=None):
          'This design is a <b>plants-only</b> order: the plants and items listed, delivered by our crew, for you to plant.')
         + (f' See it in 3D and share it: <link href="{escape(site)}/d/{escape(share.token)}" color="#047857">'
            f'{escape(site.split("//")[-1])}/d/{escape(share.token)}</link>' if share else '')))
+    photo_note = _photo_note(dims, lot_w, lot_l)
+    if photo_note:
+        story += [Spacer(1, 6), P(escape(photo_note))]
 
     # ── Page 2: site plan + list ──
     story += [PageBreak(), P('Site plan', H2),
@@ -351,8 +372,9 @@ def build_proposal(design, user, pictures=None, credits='', now=None):
     for i, r in enumerate(rows, start=1):
         item = items_by_id.get(str(r.get('plant_id')))
         is_plant = category_of(r) == 'plant'
-        if item and is_plant and (item.planting_height or item.mature_height):
-            size = f'{_num(item.planting_height):g} {arrow} {_num(item.mature_height or item.real_world_size):g} m'
+        planted = item.specimen_height if item and r.get('size') == 'specimen' and item.specimen_height else (item.planting_height if item else None)
+        if item and is_plant and (planted or item.mature_height):
+            size = f'{_num(planted):g} {arrow} {_num(item.mature_height or item.real_world_size):g} m'
         elif item:
             size = f'{_num(item.real_world_size):g} m'
         else:
@@ -402,9 +424,13 @@ def build_proposal(design, user, pictures=None, credits='', now=None):
                 grows.append(f'about {item.mature_height:g} m tall')
             if item.mature_spread:
                 grows.append(f'{item.mature_spread:g} m wide')
+            when = ''
+            if grows and item.years_to_mature:   # "fully grown" is years away for some plants: say when
+                when = (' within about 2 years' if item.years_to_mature <= 2
+                        else f' in about {item.years_to_mature} years')
             care.append(P(f'• <b>{escape(item.name)}</b>: {SUN.get(item.sunlight, "Sun: ask us").lower()}, '
                           f'{WATER.get(item.water_need, "moderate").lower()} watering'
-                          + (f'. Grows to {" and ".join(grows)}.' if grows else '.'), BODY))
+                          + (f'. Grows to {" and ".join(grows)}{when}.' if grows else '.'), BODY))
         story += [Spacer(1, 6), KeepTogether(care[:3])] + care[3:]
 
     steps = ([f'<b>Book a site inspection</b> at {escape(site.split("//")[-1])}/book-service or from your account. '

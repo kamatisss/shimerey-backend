@@ -111,6 +111,8 @@ def change_order(pk, new_status, new_payment_status, is_office_admin, actor=None
             order.payment_status = new_payment_status
         order.save()
         notifications.order_status_changed(order, old_status, order.status)
+        if order.payment_status == 'Refunded' and old_payment != 'Refunded':
+            notifications.order_refunded(order)
     link = notifications.order_office_path(order.id)
     if order.status == 'Cancelled' and old_status != 'Cancelled':
         activity.record(actor, 'money' if order.payment_status == 'Paid' else 'work', 'order_cancelled',

@@ -60,6 +60,7 @@ from rest_framework import viewsets, status, generics
 from rest_framework.decorators import action, api_view, permission_classes, throttle_classes
 from rest_framework.permissions import AllowAny, IsAuthenticated, IsAdminUser, BasePermission
 from rest_framework.response import Response
+from rest_framework.parsers import MultiPartParser
 
 class IsOfficeAdmin(BasePermission):
     """
@@ -106,7 +107,7 @@ from rest_framework_simplejwt.views import TokenObtainPairView
 
 from .portfolio import create_portfolio_draft, sanitize_image
 from .file_checks import image_from_data_url, image_problem
-from . import activity, addresses, cart, cash, design_lock, design_review, field_work, inventory, notifications, offline, paymongo, project_board, work_queues
+from . import activity, addresses, cart, cash, design_lock, design_preview, design_review, field_work, inventory, notifications, offline, paymongo, project_board, work_queues
 from .emails import send_payment_request_email
 
 from .models import (
@@ -310,7 +311,23 @@ class GardenDesignViewSet(viewsets.ModelViewSet):
         blocked = design_lock.write_error(request.user, design, deleting=True)
         if blocked:
             return Response(blocked[1], status=blocked[0])
-        return super().destroy(request, *args, **kwargs)
+        picture = design.preview.name if design.preview else ''
+        response = super().destroy(request, *args, **kwargs)
+        design_preview.delete_file(picture)
+        return response
+
+    @action(detail=True, methods=['post'], parser_classes=[MultiPartParser])
+    def preview(self, request, pk=None):
+        """POST /api/designs/:id/preview/ (image, revision) → the design card's picture (design_preview.py)."""
+        design = self.get_object()
+        if not design_preview.can_set(request.user, design):
+            return Response({'detail': 'Only the owner of this design can change its picture.'}, status=status.HTTP_403_FORBIDDEN)
+        content, error = design_preview.clean_preview(request.FILES.get('image'))
+        if error:
+            return Response({'detail': error}, status=status.HTTP_400_BAD_REQUEST)
+        design_preview.save_preview(design, content, request.data.get('revision'))
+        return Response({'preview_url': design_preview.preview_url(design, request),
+                         'preview_revision': design.preview_revision})
 
     @action(detail=True, methods=['post'])
     def duplicate(self, request, pk=None):
@@ -492,8 +509,9 @@ class ServiceBookingViewSet(viewsets.ModelViewSet):
     def perform_update(self, serializer):
         booking = serializer.instance
         user = self.request.user
-        old_status, old_date = booking.status, booking.scheduled_date
-        if not (user.is_staff or user.is_superuser):
+        old_status, old_date, old_address = booking.status, booking.scheduled_date, booking.service_address
+        by_customer = not (user.is_staff or user.is_superuser)
+        if by_customer:
             for field in self.CUSTOMER_LOCKED:
                 serializer.validated_data.pop(field, None)
             if 'design' in serializer.validated_data and serializer.validated_data['design'] != booking.design                     and booking.status != 'Pending':
@@ -506,7 +524,9 @@ class ServiceBookingViewSet(viewsets.ModelViewSet):
                 raise DRFValidationError({'address': 'Work has started at this address; contact us to change it.'})
         booking = serializer.save()
         if booking.scheduled_date != old_date:
-            notifications.booking_rescheduled(booking, old_date)
+            notifications.booking_rescheduled(booking, old_date, by_customer=by_customer)
+        if by_customer and booking.service_address != old_address:
+            notifications.booking_address_changed(booking, old_address)
         if booking.status != old_status and (user.is_staff or user.is_superuser):
             notifications.booking_status_changed(booking, old_status, booking.status, user)
             if booking.status == 'Cancelled':
@@ -1489,16 +1509,38 @@ class OrderViewSet(viewsets.ReadOnlyModelViewSet):
     def destroy(self, request, *args, **kwargs):
         instance = self.get_object()
         is_staff = request.user.is_staff or request.user.is_superuser
-        if not is_staff and (instance.status != 'Pending' or instance.payment_status == 'Paid'):
-            # A paid order needs a refund from staff, not a silent delete
-            return Response({'error': 'This order can no longer be cancelled here. Please contact us.'},
-                            status=status.HTTP_400_BAD_REQUEST)
+        if not is_staff:
+            return self._customer_cancel(request, instance)
         with transaction.atomic():
             if instance.status not in ('Cancelled', 'Delivered'):
                 paymongo.release_stock(instance)
             instance.delete()
         if instance.paymongo_checkout_id:
             paymongo.expire_checkout_session(instance.paymongo_checkout_id)
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+    def _customer_cancel(self, request, instance):
+        """
+        A customer's "Cancel order": the order is kept as Cancelled (it used to be deleted, which took it
+        out of the order history, the reports and the office's view). Only an order not yet packed or paid.
+        """
+        refused = Response({'error': 'This order can no longer be cancelled here. Please contact us.'},
+                           status=status.HTTP_400_BAD_REQUEST)
+        # Locked: the PayMongo webhook may be marking this same order paid right now
+        with transaction.atomic():
+            order = Order.objects.select_for_update().get(pk=instance.pk)
+            if order.status != 'Pending' or order.payment_status == 'Paid':
+                return refused   # a paid order needs a refund from staff, not a quiet cancel
+            paymongo.release_stock(order)
+            order.status = 'Cancelled'
+            order.save(update_fields=['status'])
+            notifications.order_withdrawn(order)   # the office may be about to pack it
+        if order.paymongo_checkout_id:
+            paymongo.expire_checkout_session(order.paymongo_checkout_id)
+        activity.record(request.user, 'work', 'order_cancelled',
+                        f'{activity.name_of(request.user)} cancelled their order #{order.id} '
+                        f'(₱{order.total_price:,.2f}, {"cash on delivery" if order.payment_method == "cod" else "online, not paid"})',
+                        link=notifications.order_office_path(order.id), order=order.id, by_customer=True)
         return Response(status=status.HTTP_204_NO_CONTENT)
 
     @action(detail=True, methods=['patch'], permission_classes=[IsAuthenticated])
@@ -1725,6 +1767,7 @@ def checkout(request):
 
         if order.payment_method == 'cod':
             notifications.order_new(order)
+            notifications.order_placed(order)   # online orders are confirmed to the buyer once paid
         cart.clear_saved_cart(request.user)   # the cart became this order (on every device)
         return Response({'message': 'Order successfully placed!', 'order_id': order.id,
                          'receipt_token': order.receipt_token,
@@ -2766,6 +2809,7 @@ class ProjectTrackerViewSet(viewsets.ModelViewSet):
                         f'(balance now ₱{tracker.remaining_balance:,.2f})' + (f' — {note}' if note else ''),
                         link=notifications.booking_office_path(tracker.booking_id),
                         booking=tracker.booking_id, amount=str(amount))
+        notifications.payment_receipt(tracker.booking, amount, note, tracker.remaining_balance)
         return Response(ProjectTrackerSerializer(tracker, context={'request': request}).data)
 
     # ── GET/POST /api/projects/<id>/payment-requests/ ────────────────────────
@@ -2844,6 +2888,7 @@ class ProjectTrackerViewSet(viewsets.ModelViewSet):
         activity.record(request.user, 'money', 'payment_request_cancelled',
                         f'Cancelled the ₱{req.amount:,.2f} payment request on booking #{tracker.booking_id} — {req.label}',
                         link=notifications.booking_office_path(tracker.booking_id), booking=tracker.booking_id)
+        notifications.payment_request_withdrawn(req)
         return Response(payment_request_data(req))
 
     # ── POST /api/projects/<id>/upload-media/ ────────────────────────────────

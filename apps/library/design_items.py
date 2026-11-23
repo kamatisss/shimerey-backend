@@ -37,5 +37,6 @@ def lot_items(design):
             'x': round(_num(position.get('x')) + width / 2, 3),
             'z': round(_num(position.get('z')) + length / 2, 3),
             'rotation': round(math.degrees(_num(rotation.get('y'))), 1),
+            **({'size': item['size']} if item.get('size') else {}),   # specimen size (pricing.py)
         })
     return out

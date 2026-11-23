@@ -127,6 +127,39 @@ SAMPLE_LOOKS = {
 }
 LOOK_FIELDS = ('flower_color', 'foliage_color', 'plant_form', 'design_role')
 
+# Years after planting until the sample plants reach their fully grown size (mature_height), in a lowland
+# Philippine home garden from our usual nursery size. Shown on the 3D "Fully grown" card and in the proposal, so
+# customers don't read the fully grown view as next year's garden. Rough horticultural estimates: fast soft plants
+# ~2, shrubs 3–4, palms and trees 8–15 (Livistona is famously slow). Only filled when empty.
+SAMPLE_YEARS = {
+    'Banana': 2,                # a pseudostem is full height in about a year; the clump fills out by year 2
+    'Geranium': 2,
+    'Peace Lily': 2,
+    'Heliconia rostrata': 3,
+    'Hibiscus': 3,              # kept pruned at 1.5–2 m
+    'Codiaeum variegatum': 4,
+    'Strelitzia': 4,
+    'Bamboo': 5,                # clumping bamboo: full-height culms once the clump is established
+    'Christmas Palm': 8,
+    'Plumeria': 12,
+    'Livistona palm': 15,
+    # Groundcovers: years until the plugs close into a carpet (the 3D view fills each in at its own pace)
+    'Mani-mani (Arachis pintoi)': 1,   # runs fast: a closed carpet in about 6–9 months
+    'Bangka-bangkaan (Rhoeo)': 2,
+    'Mondo grass': 3,                  # slow clumps
+    'Asiatic jasmine': 3,              # slow to start, then runs
+}
+
+# Specimen size: bigger nursery stock a customer may choose per plant (planted by our crew), as
+# (price ₱, planted height m). Rough mid-range Quezon nursery prices for older stock; the owner sets the real
+# ones in Inventory. Only filled when the plant has no specimen size yet.
+SAMPLE_SPECIMENS = {
+    'Hibiscus': (450, 1.2),            # a bushy 2-year shrub instead of a 0.5 m pot
+    'Codiaeum variegatum': (300, 1.0),
+    'Plumeria': (2500, 3.0),           # a branched young tree instead of a 1.5 m cutting
+    'Christmas Palm': (2200, 3.5),     # a palm with a trunk already showing
+}
+
 
 class Command(BaseCommand):
     help = 'Load realistic sample catalog prices (demo only; the owner sets real prices in Inventory).'
@@ -194,6 +227,33 @@ class Command(BaseCommand):
                 if not dry:
                     item.spacing_cm = cm
                     item.save(update_fields=['spacing_cm'])
+            aged = []
+            for name, years in SAMPLE_YEARS.items():
+                item = InventoryItem.objects.filter(name=name, category='plant', years_to_mature__isnull=True).first()
+                if item is None:
+                    continue
+                aged.append((name, years))
+                if not dry:
+                    item.years_to_mature = years
+                    item.save(update_fields=['years_to_mature'])
+            if aged and not dry:
+                activity.record(None, 'stock', 'sample_years_loaded',
+                                f'Set sample "fully grown after" years for {len(aged)} plants (demo; correct them in Inventory)',
+                                link='/inventory', products=[n for n, _ in aged])
+            specimens = []
+            for name, (sp, sh) in SAMPLE_SPECIMENS.items():
+                item = InventoryItem.objects.filter(name=name, category='plant', specimen_price__isnull=True,
+                                                    specimen_height__isnull=True).first()
+                if item is None or Decimal(sp) <= item.unit_price:
+                    continue
+                specimens.append((name, sp, sh))
+                if not dry:
+                    item.specimen_price, item.specimen_height = Decimal(sp), sh
+                    item.save(update_fields=['specimen_price', 'specimen_height'])
+            if specimens and not dry:
+                activity.record(None, 'stock', 'sample_specimens_loaded',
+                                f'Set sample specimen sizes for {len(specimens)} plants (demo; correct them in Inventory)',
+                                link='/inventory', products=[n for n, _, _ in specimens])
             looked = []
             for name, values in SAMPLE_LOOKS.items():
                 item = InventoryItem.objects.filter(name=name, category='plant').first()
@@ -230,6 +290,10 @@ class Command(BaseCommand):
             self.stdout.write(f'  {name:22} ₱{old:>9,.2f} → ₱{new:>9,.2f}')
         for name, cm in spaced:
             self.stdout.write(f'  {name:22} planting distance {cm} cm (was empty)')
+        for name, years in aged:
+            self.stdout.write(f'  {name:22} fully grown after about {years} year{"" if years == 1 else "s"} (was empty)')
+        for name, sp, sh in specimens:
+            self.stdout.write(f'  {name:22} specimen size ₱{sp:,} planted at {sh:g} m (was empty)')
         for name in looked:
             self.stdout.write(f'  {name:22} looks: {", ".join(v for v in SAMPLE_LOOKS[name] if v)}')
         missing = [m for m in missing if m not in added]

@@ -5,9 +5,13 @@ A notification means "something that concerns you, or needs you, just happened".
 work queues stay the to-do list; this is the tap on the shoulder.
 
   Office (office admins + superusers)
-    order_new          COD order placed, or online order paid           (grouped: "3 new orders")
+    order_new          COD order placed, or online order paid           (grouped: "3 new orders";
+                       also emailed, one email per order, with the items, address and phone)
+    order_withdrawn    customer cancelled their COD order before it was packed
+    order_late_payment an online order was paid after it had expired (stock was released: re-check it)
     booking_new        customer booked a service                        (grouped)
     booking_cancelled  customer cancelled a booking
+    booking_changed    customer moved their booking date or changed its address
     payment_received   customer paid a project payment request online
     job_review         crew submitted a job for sign-off
     job_problem        crew reported a problem on a job (customer not home, rain, missing materials…)
@@ -15,25 +19,29 @@ work queues stay the to-do list; this is the tap on the shoulder.
   Field crew (in-app, by email and as a phone push, since they are out in the field)
     job_assigned, job_unassigned, job_rescheduled, job_sent_back, job_cancelled
     delivery_assigned, delivery_unassigned, cash_received (in-app only: the office counted their COD cash)
-  Customer
-    order_on_the_way, order_delivered, order_cancelled, crew_on_the_way (crew tapped "On my way")
-    booking_confirmed, crew_assigned, booking_rescheduled, booking_cancelled, booking_finished
-    (+ payment_request, portfolio_consent, review_reply from their own modules)
+  Customer — in-app, and by email for the moments a shopper or client expects one
+    Orders (email to the address on the order, so guest checkouts hear too; the link is the receipt page):
+      order_placed (COD), order_paid (online), order_packed (in-app only), order_on_the_way,
+      order_delivered, order_cancelled, order_expired (unpaid online order released), order_refunded
+    Bookings: booking_received, booking_confirmed, crew_assigned (in-app), booking_rescheduled,
+      booking_cancelled, booking_finished, crew_on_the_way, crew_arrived
+    Money: payment_receipt (online or recorded by the office), payment_request_withdrawn
+    (+ payment_request, portfolio_consent, review_reply, design_sent from their own modules)
 
 Every notification carries a `link`: the in-app page the bell opens.
 """
 import logging
-import threading
 from datetime import timedelta
 
 from django.conf import settings
 from django.contrib.auth.models import User
-from django.core.mail import send_mail
+from django.core.mail import EmailMessage, get_connection
 from django.db import transaction
 from django.db.models import Q
 from django.utils import timezone
 
 from . import push
+from .after_commit import run_after_commit
 from .models import BusinessProfile, Notification, ServiceBooking
 
 logger = logging.getLogger(__name__)
@@ -101,23 +109,39 @@ def business_name():
 
 def _email(users, subject, message, link):
     """Email after the database commit, off the request thread (SMTP can take seconds)."""
-    recipients = [u.email for u in users if u.email]
+    _email_addresses([u.email for u in users if u.email], subject, message, link)
+
+
+def _email_addresses(recipients, subject, message, link):
+    recipients = list(dict.fromkeys(r for r in recipients if r))
     if not recipients:
         return
     brand = business_name()
     body = f'{message}\n\nOpen it in {brand}: {settings.FRONTEND_URL}{link}\n' if link else f'{message}\n'
 
     def send():
-        for to in recipients:
+        # One SMTP connection for all recipients (one email each, so addresses stay private): on
+        # PythonAnywhere this runs inside the request, and each new connection costs a second or two
+        try:
+            connection = get_connection(fail_silently=False)
+            connection.open()
+        except Exception:   # a mail problem must never break the action that triggered it
+            logger.exception('Notification email: could not connect to the mail server')
+            return
+        try:
+            for to in recipients:
+                try:
+                    EmailMessage(f'{brand}: {subject}', body, settings.DEFAULT_FROM_EMAIL, [to],
+                                 connection=connection).send()
+                except Exception:
+                    logger.exception('Notification email to %s failed', to)
+        finally:
             try:
-                send_mail(f'{brand}: {subject}', body, settings.DEFAULT_FROM_EMAIL, [to])
-            except Exception:   # a mail problem must never break the action that triggered it
-                logger.exception('Notification email to %s failed', to)
+                connection.close()
+            except Exception:  # noqa: BLE001
+                pass
 
-    if getattr(settings, 'NOTIFY_EMAIL_ASYNC', True):
-        transaction.on_commit(lambda: threading.Thread(target=send, daemon=True).start())
-    else:
-        transaction.on_commit(send)
+    run_after_commit(send)   # a thread where the server runs them; in the request on PythonAnywhere
 
 
 def notify(users, kind, message, link='', alert=None):
@@ -163,9 +187,20 @@ def notify_grouped(users, kind, one, many, link_one, link_many):
 
 def order_new(order):
     how = 'cash on delivery' if order.payment_method == 'cod' else 'paid online'
+    office = list(office_users())
+    # Also by email (one per order, never grouped): the owner is not always in the app, and an order
+    # should not wait. The email carries what packing needs, so it can be acted on from the phone.
+    items = '\n'.join(f'  {oi.quantity} × {oi.item.name if oi.item_id else "item no longer in the catalog"}'
+                      for oi in order.items.select_related('item'))
+    _email(office, f'New order #{order.id}: ₱{order.total_price:,.2f}, {how}',
+           f'New order #{order.id} from {order.customer_name}: ₱{order.total_price:,.2f}, {how}.\n\n'
+           + (f'Items:\n{items}\n\n' if items else '')
+           + f'Deliver to: {order.customer_address or "address on the order"}\n'
+           + (f'Phone: {order.customer_phone}\n' if order.customer_phone else ''),
+           order_office_path(order.id))
     with transaction.atomic():
         notify_grouped(
-            office_users(), 'order_new',
+            office, 'order_new',
             one=f'New order #{order.id} from {order.customer_name}: ₱{order.total_price:,.2f}, {how}.',
             many=lambda n: f'{n} new orders to pack. Latest: #{order.id} from {order.customer_name} (₱{order.total_price:,.2f}, {how}).',
             link_one=lambda u: _office_link(u, order_office_path(order.id)),
@@ -173,9 +208,31 @@ def order_new(order):
         )
 
 
+def order_withdrawn(order):
+    """The customer cancelled their own COD order before it was packed (it stays in the list as Cancelled)."""
+    if order.payment_method != 'cod':
+        return   # an unpaid online order never reached the office
+    notify(office_users(), 'order_withdrawn',
+           f'{order.customer_name} cancelled order #{order.id} (₱{order.total_price:,.2f}, cash on delivery). '
+           "Don't pack it: the items are back in stock.",
+           link=lambda u: _office_link(u, order_office_path(order.id)))
+
+
+def order_late_payment(order):
+    """PayMongo confirmed payment for an order that had expired or been cancelled, so its stock was released."""
+    notify(office_users(), 'order_late_payment',
+           f'Order #{order.id} ({order.customer_name}, ₱{order.total_price:,.2f}) was paid after it had expired or been cancelled, '
+           'so its items were put back in stock. Check the stock before packing it, or refund it in PayMongo.',
+           link=lambda u: _office_link(u, order_office_path(order.id)))
+
+
 def booking_new(booking):
     who = _name(booking.user)
     when = _fmt_date(booking.scheduled_date)
+    notify([booking.user], 'booking_received',
+           f'We received your request for {_service(booking)} on {when} (booking #{booking.id}). '
+           "We'll confirm it soon and let you know.",
+           link=MY_BOOKINGS, alert=f'Booking request #{booking.id} received')
     with transaction.atomic():
         notify_grouped(
             office_users(), 'booking_new',
@@ -198,11 +255,32 @@ def booking_cancelled_by_customer(booking):
            'You no longer need to go.', link=crew_job_link(booking), alert=f'Job #{booking.id} cancelled')
 
 
-def payment_received(req):
+def payment_received(req, balance=None):
     booking = req.project.booking
     notify(office_users(), 'payment_received',
            f'{_name(booking.user)} paid ₱{req.amount:,.2f} online for booking #{booking.id} ({req.label}).',
            link=lambda u: _office_link(u, booking_office_path(booking.id)))
+    payment_receipt(booking, req.amount, req.label, req.project.remaining_balance if balance is None else balance)
+
+
+def payment_receipt(booking, amount, what, balance):
+    """The customer's receipt for a project payment, paid online or recorded by the office."""
+    if not booking.user:
+        return
+    notify([booking.user], 'payment_receipt',
+           f'We received your ₱{amount:,.2f} payment for booking #{booking.id}' + (f' ({what})' if what else '')
+           + (f'. Remaining balance: ₱{balance:,.2f}.' if balance > 0 else '. Your project is fully paid.')
+           + ' Thank you!',
+           link=MY_BOOKINGS, alert=f'Payment received: ₱{amount:,.2f}')
+
+
+def payment_request_withdrawn(req):
+    booking = req.project.booking
+    if not booking.user:
+        return
+    notify([booking.user], 'payment_request_withdrawn',
+           f'The ₱{req.amount:,.2f} payment request ({req.label}) for booking #{booking.id} was withdrawn. '
+           "You don't need to pay it.", link=MY_BOOKINGS)
 
 
 def job_review(booking, crew_user):
@@ -271,13 +349,30 @@ def crew_changed(booking, added, removed):
                link=MY_BOOKINGS)
 
 
-def booking_rescheduled(booking, old_date):
+def booking_rescheduled(booking, old_date, by_customer=False):
     msg = (f'Booking #{booking.id} ({_service(booking)}) moved from {_fmt_date(old_date)} '
            f'to {_fmt_date(booking.scheduled_date)}.')
     notify(booking.assigned_crew.all(), 'job_rescheduled', msg, link=crew_job_link(booking),
            alert=f'Booking #{booking.id} moved to {_fmt_date(booking.scheduled_date)}')
-    if booking.user:
-        notify([booking.user], 'booking_rescheduled', f'Your {msg[0].lower()}{msg[1:]}', link=MY_BOOKINGS)
+    if by_customer:
+        # The office plans crews and materials around the date: they must hear when the customer moves it
+        notify(office_users(), 'booking_changed', f'{_name(booking.user)} moved booking #{booking.id} '
+               f'({_service(booking)}) from {_fmt_date(old_date)} to {_fmt_date(booking.scheduled_date)}.',
+               link=lambda u: _office_link(u, booking_office_path(booking.id)))
+    elif booking.user:
+        notify([booking.user], 'booking_rescheduled', f'Your {msg[0].lower()}{msg[1:]}', link=MY_BOOKINGS,
+               alert=f'Booking #{booking.id} moved to {_fmt_date(booking.scheduled_date)}')
+
+
+def booking_address_changed(booking, old_address):
+    """The customer changed where the work happens (allowed until work starts)."""
+    msg = (f'{_name(booking.user)} changed the address of booking #{booking.id} ({_service(booking)}) '
+           f'to {booking.service_address or "a new pin"}' + (f' (was {old_address})' if old_address else '') + '.')
+    notify(office_users(), 'booking_changed', msg,
+           link=lambda u: _office_link(u, booking_office_path(booking.id)))
+    notify(booking.assigned_crew.all(), 'job_rescheduled',
+           f'The address for booking #{booking.id} changed to {booking.service_address or "a new pin"}.',
+           link=crew_job_link(booking), alert=f'New address for booking #{booking.id}')
 
 
 def booking_status_changed(booking, old, new, actor, note=''):
@@ -287,14 +382,19 @@ def booking_status_changed(booking, old, new, actor, note=''):
     when = _fmt_date(booking.scheduled_date)
     if new == 'Preparing' and old == 'Pending':
         notify(customer, 'booking_confirmed', f'Your {_service(booking)} booking #{booking.id} is confirmed for {when}.',
-               link=MY_BOOKINGS)
+               link=MY_BOOKINGS, alert=f'Booking #{booking.id} confirmed for {when}')
+    elif new == 'Finished' and old != 'Finished':
+        notify(customer, 'booking_finished',
+               f'Your {_service(booking)} project (booking #{booking.id}) is complete. Thank you for choosing '
+               f'{business_name()}!', link=MY_BOOKINGS, alert=f'Your project #{booking.id} is complete')
     elif new == 'Installing' and old == 'For Review':
         notify(crew, 'job_sent_back',
                f'Booking #{booking.id} was sent back for more work' + (f': {note}' if note else '.'),
                link=crew_job_link(booking), alert=f'Booking #{booking.id} needs more work')
     elif new == 'Cancelled':
         notify(customer, 'booking_cancelled', f'Your booking #{booking.id} ({_service(booking)} on {when}) was cancelled'
-               + (f': {note}' if note else '. Contact us if you have questions.'), link=MY_BOOKINGS)
+               + (f': {note}' if note else '. Contact us if you have questions.'), link=MY_BOOKINGS,
+               alert=f'Booking #{booking.id} cancelled')
         notify(crew, 'job_cancelled', f'Booking #{booking.id} ({_service(booking)} on {when}) was cancelled. '
                'You no longer need to go.', link=crew_job_link(booking), alert=f'Job #{booking.id} cancelled')
 
@@ -312,19 +412,71 @@ def delivery_changed(order, new_crew, old_crew):
 
 # ── Customer order events ──────────────────────────────────────────────────
 
+def order_receipt_link(order):
+    """The order's receipt page: opens for the buyer, and for a guest through the token in the link."""
+    if not order.receipt_token:
+        return MY_ORDERS
+    return f'/order-success?order_id={order.id}&token={order.receipt_token}'
+
+
+def _tell_buyer(order, kind, message, subject=None):
+    """
+    In the buyer's bell when they have an account, and (with a subject) by email to the address
+    typed at checkout: guest checkouts have no bell, and the email is where shoppers look.
+    """
+    if order.user_id:
+        notify([order.user], kind, message, link=MY_ORDERS)
+    if subject:
+        _email_addresses([order.customer_email], f'{subject} (order #{order.id})', message, order_receipt_link(order))
+
+
+def _cash_note(order):
+    unpaid_cod = order.payment_method == 'cod' and order.payment_status != 'Paid'
+    return f' Please prepare ₱{order.total_price:,.2f} cash.' if unpaid_cod else ''
+
+
+def order_placed(order):
+    """A COD order was placed: the buyer's confirmation (online orders are confirmed when paid)."""
+    _tell_buyer(order, 'order_placed',
+                f"We received your order #{order.id}: ₱{order.total_price:,.2f}, cash on delivery. "
+                "We'll let you know when it's on the way.", subject='Order received')
+
+
+def order_paid(order):
+    _tell_buyer(order, 'order_paid',
+                f"Payment received for your order #{order.id}: ₱{order.total_price:,.2f}. "
+                "We're preparing it now and will let you know when it's on the way.", subject='Payment received')
+
+
+def order_expired(order, minutes):
+    _tell_buyer(order, 'order_expired',
+                f'Your order #{order.id} was cancelled because the online payment was not completed within '
+                f'{minutes} minutes. You were not charged. You can order again any time.', subject='Order cancelled')
+
+
+def order_refunded(order):
+    _tell_buyer(order, 'order_refunded',
+                f'We sent the ₱{order.total_price:,.2f} refund for your cancelled order #{order.id}. '
+                'It can take a few days to show in your account.', subject='Refund sent')
+
+
 def order_status_changed(order, old, new):
-    if not order.user_id or old == new:
+    if old == new:
         return
     msg = {
-        'Out for Delivery': f'Your order #{order.id} is on its way.'
-                            + (f' Please prepare ₱{order.total_price:,.2f} cash.' if order.payment_method == 'cod' and order.payment_status != 'Paid' else ''),
+        'Shipped': f"Your order #{order.id} is packed and ready for delivery.",
+        'Out for Delivery': f'Your order #{order.id} is on its way.' + _cash_note(order),
         'Delivered': f'Your order #{order.id} was delivered. Thank you for shopping with us!',
         'Cancelled': f'Your order #{order.id} was cancelled.'
                      + (' Your online payment will be refunded.' if order.payment_status in ('Paid', 'Refunded') and order.payment_method == 'online' else ''),
     }.get(new)
     if msg:
-        kind = {'Out for Delivery': 'order_on_the_way', 'Delivered': 'order_delivered', 'Cancelled': 'order_cancelled'}[new]
-        notify([order.user], kind, msg, link=MY_ORDERS)
+        kind = {'Shipped': 'order_packed', 'Out for Delivery': 'order_on_the_way', 'Delivered': 'order_delivered',
+                'Cancelled': 'order_cancelled'}[new]
+        # Packed is a small step: the bell only. The rest are the emails a shopper expects.
+        subject = {'Out for Delivery': 'Your order is on its way', 'Delivered': 'Order delivered',
+                   'Cancelled': 'Order cancelled'}.get(new)
+        _tell_buyer(order, kind, msg, subject)
 
 
 # ─── Final design (design_review.py) ─────────────────────────────────────────

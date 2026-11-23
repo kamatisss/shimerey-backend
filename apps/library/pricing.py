@@ -125,6 +125,50 @@ def installed_price(ps, item, scope=MAKEOVER):
     return int(item.unit_price + labour_rate(ps, layer_of(item)) + compost_for(ps, item, scope))
 
 
+# ─── Specimen size ────────────────────────────────────────────────────────────
+# A customer may have a plant planted as a SPECIMEN: bigger nursery stock at InventoryItem.specimen_price,
+# planted by our crew (installed jobs only; same stock count). In a count of items, a specimen line's key is
+# "<id>:specimen" (line_key); a plain "<id>" is the standard size. A specimen key on an item that no longer
+# offers the size is priced as standard.
+SPECIMEN = 'specimen'
+
+
+def line_key(pid, size=''):
+    return f'{pid}:{SPECIMEN}' if size == SPECIMEN else str(pid)
+
+
+def split_key(key):
+    """'12:specimen' → ('12', 'specimen'); '12' → ('12', '')."""
+    pid, _, size = str(key).partition(':')
+    return pid, (SPECIMEN if size == SPECIMEN else '')
+
+
+def offers_specimen(item):
+    return (item.category == 'plant' and not getattr(item, 'is_groundcover', False)
+            and bool(getattr(item, 'specimen_price', None)) and bool(getattr(item, 'specimen_height', None)))
+
+
+def size_of(item, size):
+    """The size actually sold: 'specimen' only when the item offers it."""
+    return SPECIMEN if size == SPECIMEN and offers_specimen(item) else ''
+
+
+def unit_price_for(item, size=''):
+    return item.specimen_price if size_of(item, size) else item.unit_price
+
+
+def layer_for(item, size=''):
+    """Labour size class: a specimen is planted at its own (bigger) size, so it may cost a taller class."""
+    if not size_of(item, size):
+        return layer_of(item)
+    height = max(float(item.real_world_size or 1.0), float(item.specimen_height))
+    return PlantSpec('', '', 0, 0, height, spacing_for(height)).layer
+
+
+def line_name(item, size=''):
+    return f'{item.name} — specimen size' if size_of(item, size) else item.name
+
+
 CATEGORY_ORDER = {'plant': 0, 'hardscape': 1, 'furniture': 2}
 
 
@@ -148,17 +192,21 @@ def project_estimate(counts, items_by_id, area_sqm, ps=None, lawn_sqm=0, new_law
     plants = labour = compost = Decimal(0)
     holes = 0
     plant_lines = []
-    for pid, qty in counts.items():
-        item = items_by_id.get(str(pid))
+    for key, qty in counts.items():
+        pid, size = split_key(key)
+        item = items_by_id.get(pid)
         if item is None or qty <= 0:
             continue
-        plants += item.unit_price * qty
-        labour += labour_rate(ps, layer_of(item)) * qty
+        size = size_of(item, size)
+        unit = unit_price_for(item, size)
+        plants += unit * qty
+        labour += labour_rate(ps, layer_for(item, size)) * qty
         compost += compost_for(ps, item, scope) * qty
         gc = getattr(item, 'is_groundcover', False)
         holes += qty if item.category == 'plant' and not gc else 0
-        plant_lines.append({'plant_id': str(item.id), 'name': item.name, 'quantity': qty, 'category': item.category,
-                            'unit_price': _peso(item.unit_price), 'subtotal': _peso(item.unit_price * qty),
+        plant_lines.append({'plant_id': str(item.id), 'name': line_name(item, size), 'quantity': qty, 'category': item.category,
+                            'unit_price': _peso(unit), 'subtotal': _peso(unit * qty),
+                            **({'size': SPECIMEN} if size else {}),
                             **({'unit': 'm²', 'groundcover': True} if gc else {})})
     d = lambda v: Decimal(str(round(v, 2)))  # noqa: E731
     lines = [
@@ -208,11 +256,16 @@ def project_estimate(counts, items_by_id, area_sqm, ps=None, lawn_sqm=0, new_law
 
 
 def plants_only_estimate(counts, items_by_id, ps=None):
-    """'I'll plant them myself': catalog prices + shop delivery, no labour or site work."""
+    """'I'll plant them myself': catalog prices + shop delivery, no labour or site work.
+    Specimens are planted by our crew only, so here every plant is the standard size."""
     ps = ps or PricingSettings.current()
     plants = Decimal(0)
     plant_lines = []
-    for pid, qty in counts.items():
+    standard = {}
+    for key, qty in counts.items():
+        pid = split_key(key)[0]
+        standard[pid] = standard.get(pid, 0) + qty
+    for pid, qty in standard.items():
         item = items_by_id.get(str(pid))
         if item is None or qty <= 0:
             continue
@@ -461,7 +514,7 @@ def pricing_estimate(request):
     """Installed-price estimate for a list of catalog items on a garden of area_sqm."""
     raw = request.data.get('items')
     if not isinstance(raw, list) or len(raw) > 500:
-        return Response({'error': 'items must be a list of {product_id, quantity}.'}, status=status.HTTP_400_BAD_REQUEST)
+        return Response({'error': 'items must be a list of {product_id, quantity, size?}.'}, status=status.HTTP_400_BAD_REQUEST)
     counts = {}
     for entry in raw:
         try:
@@ -470,7 +523,8 @@ def pricing_estimate(request):
             return Response({'error': 'Each item needs a numeric product_id and quantity.'}, status=status.HTTP_400_BAD_REQUEST)
         if not 1 <= qty <= 999:
             return Response({'error': 'Quantities must be between 1 and 999.'}, status=status.HTTP_400_BAD_REQUEST)
-        counts[pid] = counts.get(pid, 0) + qty
+        key = line_key(pid, entry.get('size') if isinstance(entry, dict) else '')   # specimen size: its own line
+        counts[key] = counts.get(key, 0) + qty
     try:
         area = float(request.data.get('area_sqm', 0))
         if not 0 <= area <= 40000:
@@ -491,7 +545,7 @@ def pricing_estimate(request):
     scope = request.data.get('scope') or MAKEOVER
     if scope not in SCOPES:
         return Response({'error': f"scope must be one of {', '.join(SCOPES)}."}, status=status.HTTP_400_BAD_REQUEST)
-    items = {str(i.id): i for i in InventoryItem.objects.filter(id__in=counts.keys())}
+    items = {str(i.id): i for i in InventoryItem.objects.filter(id__in={split_key(k)[0] for k in counts})}
     if not installed:
         return Response(plants_only_estimate(counts, items))
     return Response(project_estimate(counts, items, area, lawn_sqm=lawn, new_lawn=new_lawn, scope=scope))
